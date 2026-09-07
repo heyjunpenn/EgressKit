@@ -1,0 +1,25 @@
+{
+  "name": "egresskit",
+  "version": "0.0.0",
+  "private": true,
+  "description": "One proxy endpoint, many managed exits.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.24.0",
+  "scripts": {
+    "build": "turbo run build",
+    "check": "turbo run check",
+    "lint": "turbo run lint",
+    "lint:root": "biome lint package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json",
+    "prepare": "husky",
+    "verify": "turbo run lint check"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.12",
+    "husky": "9.1.7",
+    "turbo": "2.10.12",
+    "typescript": "7.0.2"
+  }
+}

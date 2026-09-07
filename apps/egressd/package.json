@@ -1,0 +1,14 @@
+{
+  "name": "@egresskit/egressd",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc --noEmit false --outDir dist",
+    "check": "tsc --noEmit",
+    "lint": "biome lint ."
+  }
+}
