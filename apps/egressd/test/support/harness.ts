@@ -109,13 +109,6 @@ export async function startSimulatedMihomoListener(
             method: incoming.method,
           },
           (upstreamResponse) => {
-            try {
-              faults.trigger("after-target-connect");
-            } catch {
-              upstreamResponse.destroy();
-              response.destroy();
-              return;
-            }
             response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
             upstreamResponse.pipe(response);
           },
@@ -125,6 +118,15 @@ export async function startSimulatedMihomoListener(
             response.writeHead(502);
           }
           response.end();
+        });
+        upstream.on("socket", (socket) => {
+          socket.prependOnceListener("connect", () => {
+            try {
+              faults.trigger("after-target-connect");
+            } catch (error) {
+              socket.destroy(error as Error);
+            }
+          });
         });
         incoming.pipe(upstream);
       } catch {

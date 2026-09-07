@@ -18,10 +18,18 @@ function parsePort(value: string | undefined): number {
 
 export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   const listener = environment.EGRESSKIT_MIHOMO_HTTP_LISTENER;
+  const mihomoListener = listener === undefined ? undefined : new URL(listener);
+  if (mihomoListener && (mihomoListener.protocol !== "http:" || !isLoopback(mihomoListener.hostname))) {
+    throw new Error("EGRESSKIT_MIHOMO_HTTP_LISTENER must be an HTTP URL using a loopback host");
+  }
 
   return {
     host: environment.EGRESSKIT_HOST ?? "127.0.0.1",
     port: parsePort(environment.EGRESSKIT_PORT),
-    ...(listener === undefined ? {} : { mihomoListener: new URL(listener) }),
+    ...(mihomoListener === undefined ? {} : { mihomoListener }),
   };
+}
+
+function isLoopback(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
 }

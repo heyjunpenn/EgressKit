@@ -23,7 +23,7 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
 });
 
 test("egressd starts from EGRESSKIT_ configuration and shuts down on SIGTERM", async () => {
-  const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts"], {
+  const child = spawn(process.execPath, ["dist/cli.js"], {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
@@ -129,6 +129,42 @@ test("a connection failure can be injected before the target is reached", async 
   t.after(() => target.close());
   const faults = new ConnectionFaultPlan();
   faults.failNext("before-target-connect");
+  const mihomo = await startSimulatedMihomoListener(faults);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  const responseStatus = await new Promise<number>((resolve, reject) => {
+    const proxyRequest = request(
+      {
+        host: daemon.address.host,
+        method: "GET",
+        path: `http://${target.host}:${target.port}/must-not-arrive`,
+        port: daemon.address.port,
+      },
+      (proxyResponse) => {
+        proxyResponse.resume();
+        proxyResponse.on("end", () => resolve(proxyResponse.statusCode ?? 0));
+      },
+    );
+    proxyRequest.on("error", reject);
+    proxyRequest.end();
+  });
+
+  assert.equal(responseStatus, 502);
+  assert.equal(observedRequests.length, 0);
+});
+
+test("a connection failure can be injected immediately after the target connection", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const faults = new ConnectionFaultPlan();
+  faults.failNext("after-target-connect");
   const mihomo = await startSimulatedMihomoListener(faults);
   t.after(() => mihomo.close());
   const daemon = await startEgressd({

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
-    "egressd": "dist/src/cli.js"
+    "egressd": "dist/cli.js"
   },
   "engines": {
     "node": ">=22"
@@ -13,7 +13,7 @@
     "build": "tsc --project tsconfig.build.json --noEmit false --outDir dist",
     "check": "tsc --noEmit",
     "lint": "biome lint .",
-    "test": "node --import tsx --test test/**/*.test.ts"
+    "test": "pnpm run build && node --import tsx --test test/**/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "24.3.1",
