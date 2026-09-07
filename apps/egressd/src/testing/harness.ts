@@ -1,5 +1,9 @@
 import { createServer, type IncomingHttpHeaders, request, type Server } from "node:http";
-import { connect, createServer as createTcpServer, type Server as TcpServer } from "node:net";
+import { connect, type Server as TcpServer, type Socket as TcpSocket } from "node:net";
+import { connect as connectTls, createServer as createTlsServer, type TLSSocket } from "node:tls";
+
+const TEST_PSK = Buffer.from("0123456789abcdef0123456789abcdef", "hex");
+const TEST_PSK_CIPHER = "PSK-AES128-CBC-SHA256";
 
 export type ConnectionPhase = "before-target-connect" | "after-target-connect";
 
@@ -167,16 +171,32 @@ export async function startSimulatedMihomoListener(
   return listen(server);
 }
 
-export async function startTcpTarget(receivedPayloads: string[]): Promise<RunningHttpFixture> {
+export async function startHttpsTarget(receivedRequests: string[]): Promise<RunningHttpFixture> {
   return listen(
-    createTcpServer((socket) => {
-      socket.on("data", (payload) => {
-        const text = payload.toString();
-        receivedPayloads.push(text);
-        socket.write(`observed:${text}`);
-      });
-    }),
+    createTlsServer(
+      {
+        ciphers: TEST_PSK_CIPHER,
+        maxVersion: "TLSv1.2",
+        pskCallback: () => TEST_PSK,
+      },
+      (socket) => {
+        socket.on("data", (payload) => {
+          receivedRequests.push(payload.toString());
+          socket.end("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nobserved");
+        });
+      },
+    ),
   );
+}
+
+export function connectTestTls(socket: TcpSocket): TLSSocket {
+  return connectTls({
+    socket,
+    ciphers: TEST_PSK_CIPHER,
+    maxVersion: "TLSv1.2",
+    pskCallback: () => ({ identity: "egresskit-test", psk: TEST_PSK }),
+    rejectUnauthorized: false,
+  });
 }
 
 function appendVia(current: string | string[] | undefined, value: string): string {

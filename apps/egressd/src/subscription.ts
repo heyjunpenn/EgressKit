@@ -101,6 +101,12 @@ function normalizeVlessNode(candidate: Record<string, unknown>): NormalizedVless
   if (candidate.flow !== undefined && network !== "tcp") {
     throw new Error(`VLESS node ${name}: flow requires the tcp transport`);
   }
+  if (
+    candidate.flow !== undefined &&
+    (candidate.flow !== "xtls-rprx-vision" || candidate.tls !== true)
+  ) {
+    throw new Error(`VLESS node ${name}: flow must be xtls-rprx-vision with tls`);
+  }
   if (candidate["reality-opts"] !== undefined && candidate.tls !== true) {
     throw new Error(`VLESS node ${name}: reality-opts requires tls`);
   }
@@ -166,6 +172,12 @@ function optionalWsOptions(value: unknown): Pick<NormalizedVlessNode, "ws-opts">
   if (!isRecord(value)) {
     throw new Error("VLESS ws-opts must be an object");
   }
+  if (value.path !== undefined && typeof value.path !== "string") {
+    throw new Error("VLESS ws-opts path must be a string");
+  }
+  if (value.headers !== undefined && !isRecord(value.headers)) {
+    throw new Error("VLESS ws-opts headers must be an object");
+  }
   if (
     isRecord(value.headers) &&
     Object.values(value.headers).some((header) => typeof header !== "string")
@@ -218,6 +230,9 @@ function optionalRealityOptions(value: unknown): Pick<NormalizedVlessNode, "real
     throw new Error("VLESS reality-opts requires public-key");
   }
   const shortId = value["short-id"];
+  if (shortId !== undefined && typeof shortId !== "string") {
+    throw new Error("VLESS reality short-id must be a string");
+  }
   return {
     "reality-opts": {
       "public-key": publicKey,

@@ -15,6 +15,7 @@ export interface MihomoRuntime {
 }
 
 export interface EgressdOptions {
+  adminToken?: string;
   host: string;
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
@@ -53,6 +54,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       throw new Error("subscription contains no VLESS nodes");
     }
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
+    for (const node of revision.nodes) {
+      const listener = listeners.get(node.name);
+      if (!listener || !isLoopbackHttpListener(listener)) {
+        throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
+      }
+    }
     const selected = listeners.get(revision.nodes[0]?.name ?? "");
     if (!selected) {
       throw new Error("Mihomo runtime did not start the imported listener");
@@ -69,11 +76,26 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     }
 
     if (incoming.method === "POST" && incoming.url === "/subscriptions/local") {
+      if (
+        !options.adminToken ||
+        incoming.headers.authorization !== `Bearer ${options.adminToken}`
+      ) {
+        response.writeHead(401, { "www-authenticate": "Bearer" });
+        response.end();
+        return;
+      }
       readBody(incoming)
         .then(importLocalSubscription)
         .then((revision) => {
           response.writeHead(201, { "content-type": "application/json" });
-          response.end(JSON.stringify(revision));
+          response.end(
+            JSON.stringify({
+              nodes: revision.mihomoConfig.listeners.map((listener) => ({
+                name: listener.proxy,
+                listener: { host: listener.listen, port: listener.port },
+              })),
+            }),
+          );
         })
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
@@ -156,6 +178,15 @@ function readBody(incoming: IncomingMessage): Promise<string> {
   });
 }
 
+function isLoopbackHttpListener(listener: URL): boolean {
+  return (
+    listener.protocol === "http:" &&
+    (listener.hostname === "localhost" ||
+      listener.hostname === "[::1]" ||
+      /^127(?:\.\d{1,3}){3}$/.test(listener.hostname))
+  );
+}
+
 function handleConnect(
   incoming: IncomingMessage,
   clientSocket: Duplex,
@@ -169,6 +200,7 @@ function handleConnect(
 
   const listenerPort = Number(mihomoListener.port || 80);
   const listenerSocket = connect(listenerPort, mihomoListener.hostname);
+  let tunnelEstablished = false;
   listenerSocket.on("connect", () => {
     listenerSocket.write(
       `CONNECT ${incoming.url} HTTP/1.1\r\nHost: ${incoming.url}\r\nVia: 1.1 egresskit\r\n\r\n`,
@@ -196,6 +228,7 @@ function handleConnect(
       return;
     }
 
+    tunnelEstablished = true;
     if (head.length > 0) {
       listenerSocket.write(head);
     }
@@ -208,10 +241,16 @@ function handleConnect(
   listenerSocket.on("data", receiveResponseHead);
   listenerSocket.on("error", () => {
     if (!clientSocket.destroyed) {
-      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      if (tunnelEstablished) {
+        clientSocket.destroy();
+      } else {
+        clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      }
     }
   });
   clientSocket.on("error", () => listenerSocket.destroy());
+  clientSocket.once("close", () => listenerSocket.destroy());
+  listenerSocket.once("close", () => clientSocket.destroy());
 }
 
 function isAbsoluteHttpUrl(value: string | undefined): value is string {

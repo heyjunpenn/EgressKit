@@ -8,10 +8,11 @@ import { test } from "node:test";
 import { startEgressd } from "./daemon.js";
 import {
   ConnectionFaultPlan,
+  connectTestTls,
   ManualClock,
+  startHttpsTarget,
   startSimulatedMihomoListener,
   startTargetServer,
-  startTcpTarget,
 } from "./testing/harness.js";
 
 test("/live reports Node process liveness without a Mihomo listener", async (t) => {
@@ -24,12 +25,16 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
   assert.deepEqual(await response.json(), { status: "live" });
 });
 
-test("egressd starts from EGRESSKIT_ configuration and shuts down on SIGTERM", async () => {
+test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) => {
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
   const child = spawn(process.execPath, ["dist/cli.js"], {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
       EGRESSKIT_HOST: "127.0.0.1",
+      EGRESSKIT_ADMIN_TOKEN: "cli-admin-token",
+      EGRESSKIT_MIHOMO_HTTP_LISTENER: `http://${mihomo.host}:${mihomo.port}`,
       EGRESSKIT_PORT: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -61,6 +66,16 @@ test("egressd starts from EGRESSKIT_ configuration and shuts down on SIGTERM", a
 
     const response = await fetch(`http://${started.host}:${started.port}/live`);
     assert.equal(response.status, 200);
+
+    const imported = await fetch(`http://${started.host}:${started.port}/subscriptions/local`, {
+      method: "POST",
+      headers: { authorization: "Bearer cli-admin-token" },
+      body: `proxies:
+  - { name: cli-node, type: vless, server: proxy.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+`,
+    });
+    assert.equal(imported.status, 201);
+    assert.doesNotMatch(await imported.text(), /11111111-1111-4111-8111-111111111111/);
 
     child.kill("SIGTERM");
     const [exitCode, signal] = (await once(child, "exit")) as [
@@ -201,14 +216,15 @@ test("a connection failure can be injected immediately after the target connecti
 });
 
 test("CONNECT reaches the target through the selected simulated Mihomo listener", async (t) => {
-  const receivedPayloads: string[] = [];
-  const target = await startTcpTarget(receivedPayloads);
+  const receivedRequests: string[] = [];
+  const target = await startHttpsTarget(receivedRequests);
   t.after(() => target.close());
   const observedConnectTargets: string[] = [];
   const mihomo = await startSimulatedMihomoListener(undefined, observedConnectTargets);
   t.after(() => mihomo.close());
   const appliedConfigs: unknown[] = [];
   const daemon = await startEgressd({
+    adminToken: "test-admin-token",
     host: "127.0.0.1",
     port: 0,
     mihomoRuntime: {
@@ -223,7 +239,10 @@ test("CONNECT reaches the target through the selected simulated Mihomo listener"
     `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
     {
       method: "POST",
-      headers: { "content-type": "application/yaml" },
+      headers: {
+        authorization: "Bearer test-admin-token",
+        "content-type": "application/yaml",
+      },
       body: `proxies:
   - name: primary
     type: vless
@@ -246,24 +265,30 @@ test("CONNECT reaches the target through the selected simulated Mihomo listener"
     });
     socket.on("data", (chunk) => {
       received += chunk.toString();
-      if (received.endsWith("\r\n\r\n")) {
-        socket.write("hello-through-connect");
-      }
-      if (received.includes("observed:hello-through-connect")) {
-        socket.end();
-        resolve(received);
+      if (received.includes("\r\n\r\n")) {
+        socket.removeAllListeners("data");
+        const tlsSocket = connectTestTls(socket);
+        let httpsResponse = "";
+        tlsSocket.on("secureConnect", () => {
+          tlsSocket.write(
+            `GET /secure HTTP/1.1\r\nHost: ${targetAuthority}\r\nConnection: close\r\n\r\n`,
+          );
+        });
+        tlsSocket.on("data", (data) => {
+          httpsResponse += data.toString();
+        });
+        tlsSocket.on("end", () => resolve(`${received}${httpsResponse}`));
+        tlsSocket.on("error", reject);
       }
     });
     socket.on("error", reject);
-    socket.on("end", () => {
-      if (!received.includes("observed:hello-through-connect")) {
-        reject(new Error(`CONNECT tunnel ended early: ${received}`));
-      }
-    });
   });
 
   assert.match(response, /^HTTP\/1\.1 200 Connection Established/);
+  assert.match(response, /HTTP\/1\.1 200 OK[\s\S]*observed$/);
   assert.equal(appliedConfigs.length, 1);
   assert.deepEqual(observedConnectTargets, [targetAuthority]);
-  assert.deepEqual(receivedPayloads, ["hello-through-connect"]);
+  assert.deepEqual(receivedRequests, [
+    `GET /secure HTTP/1.1\r\nHost: ${targetAuthority}\r\nConnection: close\r\n\r\n`,
+  ]);
 });

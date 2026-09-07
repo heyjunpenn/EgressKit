@@ -1,4 +1,5 @@
 export interface EgressdConfig {
+  adminToken?: string;
   host: string;
   port: number;
   mihomoListener?: URL;
@@ -27,6 +28,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   }
 
   return {
+    ...(environment.EGRESSKIT_ADMIN_TOKEN === undefined
+      ? {}
+      : { adminToken: environment.EGRESSKIT_ADMIN_TOKEN }),
     host: environment.EGRESSKIT_HOST ?? "127.0.0.1",
     port: parsePort(environment.EGRESSKIT_PORT),
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
