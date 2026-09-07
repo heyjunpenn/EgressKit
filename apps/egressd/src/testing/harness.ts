@@ -1,4 +1,5 @@
 import { createServer, type IncomingHttpHeaders, request, type Server } from "node:http";
+import { connect, createServer as createTcpServer, type Server as TcpServer } from "node:net";
 
 export type ConnectionPhase = "before-target-connect" | "after-target-connect";
 
@@ -51,7 +52,7 @@ export class ConnectionFaultPlan {
   }
 }
 
-function listen(server: Server): Promise<RunningHttpFixture> {
+function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -92,47 +93,88 @@ export async function startTargetServer(
 
 export async function startSimulatedMihomoListener(
   faults = new ConnectionFaultPlan(),
+  observedConnectTargets: string[] = [],
 ): Promise<RunningHttpFixture> {
-  return listen(
-    createServer((incoming, response) => {
-      try {
-        faults.trigger("before-target-connect");
-        const target = new URL(incoming.url ?? "");
-        const upstream = request(
-          target,
-          {
-            headers: {
-              ...incoming.headers,
-              host: target.host,
-              via: appendVia(incoming.headers.via, "1.1 simulated-mihomo"),
-            },
-            method: incoming.method,
+  const server = createServer((incoming, response) => {
+    try {
+      faults.trigger("before-target-connect");
+      const target = new URL(incoming.url ?? "");
+      const upstream = request(
+        target,
+        {
+          headers: {
+            ...incoming.headers,
+            host: target.host,
+            via: appendVia(incoming.headers.via, "1.1 simulated-mihomo"),
           },
-          (upstreamResponse) => {
-            response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-            upstreamResponse.pipe(response);
-          },
-        );
-        upstream.on("error", () => {
-          if (!response.headersSent) {
-            response.writeHead(502);
-          }
-          response.end();
-        });
-        upstream.on("socket", (socket) => {
-          socket.prependOnceListener("connect", () => {
-            try {
-              faults.trigger("after-target-connect");
-            } catch (error) {
-              socket.destroy(error as Error);
-            }
-          });
-        });
-        incoming.pipe(upstream);
-      } catch {
-        response.writeHead(502);
+          method: incoming.method,
+        },
+        (upstreamResponse) => {
+          response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+          upstreamResponse.pipe(response);
+        },
+      );
+      upstream.on("error", () => {
+        if (!response.headersSent) {
+          response.writeHead(502);
+        }
         response.end();
+      });
+      upstream.on("socket", (socket) => {
+        socket.prependOnceListener("connect", () => {
+          try {
+            faults.trigger("after-target-connect");
+          } catch (error) {
+            socket.destroy(error as Error);
+          }
+        });
+      });
+      incoming.pipe(upstream);
+    } catch {
+      response.writeHead(502);
+      response.end();
+    }
+  });
+  server.on("connect", (incoming, clientSocket, head) => {
+    try {
+      faults.trigger("before-target-connect");
+      const [host, portText] = (incoming.url ?? "").split(":");
+      const port = Number(portText);
+      if (!host || !Number.isInteger(port)) {
+        clientSocket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
       }
+      const targetSocket = connect(port, host);
+      targetSocket.prependOnceListener("connect", () => {
+        try {
+          faults.trigger("after-target-connect");
+          observedConnectTargets.push(`${host}:${port}`);
+          clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          if (head.length > 0) {
+            targetSocket.write(head);
+          }
+          clientSocket.pipe(targetSocket);
+          targetSocket.pipe(clientSocket);
+        } catch (error) {
+          targetSocket.destroy(error as Error);
+        }
+      });
+      targetSocket.on("error", () => clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"));
+    } catch {
+      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    }
+  });
+  return listen(server);
+}
+
+export async function startTcpTarget(receivedPayloads: string[]): Promise<RunningHttpFixture> {
+  return listen(
+    createTcpServer((socket) => {
+      socket.on("data", (payload) => {
+        const text = payload.toString();
+        receivedPayloads.push(text);
+        socket.write(`observed:${text}`);
+      });
     }),
   );
 }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { request } from "node:http";
+import { connect } from "node:net";
 import { test } from "node:test";
 
 import { startEgressd } from "./daemon.js";
@@ -10,6 +11,7 @@ import {
   ManualClock,
   startSimulatedMihomoListener,
   startTargetServer,
+  startTcpTarget,
 } from "./testing/harness.js";
 
 test("/live reports Node process liveness without a Mihomo listener", async (t) => {
@@ -196,4 +198,72 @@ test("a connection failure can be injected immediately after the target connecti
 
   assert.equal(responseStatus, 502);
   assert.equal(observedRequests.length, 0);
+});
+
+test("CONNECT reaches the target through the selected simulated Mihomo listener", async (t) => {
+  const receivedPayloads: string[] = [];
+  const target = await startTcpTarget(receivedPayloads);
+  t.after(() => target.close());
+  const observedConnectTargets: string[] = [];
+  const mihomo = await startSimulatedMihomoListener(undefined, observedConnectTargets);
+  t.after(() => mihomo.close());
+  const appliedConfigs: unknown[] = [];
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoRuntime: {
+      apply: async (config) => {
+        appliedConfigs.push(config);
+        return new Map([["primary", new URL(`http://${mihomo.host}:${mihomo.port}`)]]);
+      },
+    },
+  });
+  t.after(() => daemon.close());
+  const importResponse = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/yaml" },
+      body: `proxies:
+  - name: primary
+    type: vless
+    server: proxy.example.com
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
+    tls: true
+`,
+    },
+  );
+  assert.equal(importResponse.status, 201);
+
+  const targetAuthority = `${target.host}:${target.port}`;
+  const response = await new Promise<string>((resolve, reject) => {
+    const socket = connect(daemon.address.port, daemon.address.host);
+    let received = "";
+    socket.on("connect", () => {
+      socket.write(`CONNECT ${targetAuthority} HTTP/1.1\r\nHost: ${targetAuthority}\r\n\r\n`);
+    });
+    socket.on("data", (chunk) => {
+      received += chunk.toString();
+      if (received.endsWith("\r\n\r\n")) {
+        socket.write("hello-through-connect");
+      }
+      if (received.includes("observed:hello-through-connect")) {
+        socket.end();
+        resolve(received);
+      }
+    });
+    socket.on("error", reject);
+    socket.on("end", () => {
+      if (!received.includes("observed:hello-through-connect")) {
+        reject(new Error(`CONNECT tunnel ended early: ${received}`));
+      }
+    });
+  });
+
+  assert.match(response, /^HTTP\/1\.1 200 Connection Established/);
+  assert.equal(appliedConfigs.length, 1);
+  assert.deepEqual(observedConnectTargets, [targetAuthority]);
+  assert.deepEqual(receivedPayloads, ["hello-through-connect"]);
 });

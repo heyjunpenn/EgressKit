@@ -20,5 +20,8 @@
   "devDependencies": {
     "@types/node": "24.3.1",
     "tsx": "4.20.5"
+  },
+  "dependencies": {
+    "yaml": "2.8.1"
   }
 }
