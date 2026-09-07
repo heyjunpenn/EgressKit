@@ -4,13 +4,13 @@ import { once } from "node:events";
 import { request } from "node:http";
 import { test } from "node:test";
 
-import { startEgressd } from "../src/daemon.js";
+import { startEgressd } from "./daemon.js";
 import {
   ConnectionFaultPlan,
   ManualClock,
   startSimulatedMihomoListener,
   startTargetServer,
-} from "./support/harness.js";
+} from "./testing/harness.js";
 
 test("/live reports Node process liveness without a Mihomo listener", async (t) => {
   const daemon = await startEgressd({ host: "127.0.0.1", port: 0 });
@@ -61,7 +61,10 @@ test("egressd starts from EGRESSKIT_ configuration and shuts down on SIGTERM", a
     assert.equal(response.status, 200);
 
     child.kill("SIGTERM");
-    const [exitCode, signal] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
+    const [exitCode, signal] = (await once(child, "exit")) as [
+      number | null,
+      NodeJS.Signals | null,
+    ];
     assert.equal(signal, null);
     assert.equal(exitCode, 0, Buffer.concat(errors).toString());
   } finally {

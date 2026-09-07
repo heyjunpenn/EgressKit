@@ -19,7 +19,10 @@ function parsePort(value: string | undefined): number {
 export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   const listener = environment.EGRESSKIT_MIHOMO_HTTP_LISTENER;
   const mihomoListener = listener === undefined ? undefined : new URL(listener);
-  if (mihomoListener && (mihomoListener.protocol !== "http:" || !isLoopback(mihomoListener.hostname))) {
+  if (
+    mihomoListener &&
+    (mihomoListener.protocol !== "http:" || !isLoopback(mihomoListener.hostname))
+  ) {
     throw new Error("EGRESSKIT_MIHOMO_HTTP_LISTENER must be an HTTP URL using a loopback host");
   }
 

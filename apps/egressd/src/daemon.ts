@@ -1,4 +1,4 @@
-import { createServer, request, type IncomingHttpHeaders, type Server } from "node:http";
+import { createServer, type IncomingHttpHeaders, request, type Server } from "node:http";
 
 export interface EgressdOptions {
   host: string;

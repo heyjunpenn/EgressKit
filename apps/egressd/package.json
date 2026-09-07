@@ -11,9 +11,11 @@
   },
   "scripts": {
     "build": "tsc --project tsconfig.build.json --noEmit false --outDir dist",
-    "check": "tsc --noEmit",
-    "lint": "biome lint .",
-    "test": "pnpm run build && node --import tsx --test test/**/*.test.ts"
+    "check": "pnpm typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "pnpm run build && node --import tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "24.3.1",
