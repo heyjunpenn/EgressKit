@@ -13,6 +13,10 @@
       "dependsOn": ["^lint", "//#lint:root"],
       "outputs": []
     },
+    "test": {
+      "dependsOn": ["^test"],
+      "outputs": []
+    },
     "//#lint:root": {
       "outputs": []
     }

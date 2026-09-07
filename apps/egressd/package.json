@@ -3,12 +3,20 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "egressd": "dist/src/cli.js"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc --noEmit false --outDir dist",
+    "build": "tsc --project tsconfig.build.json --noEmit false --outDir dist",
     "check": "tsc --noEmit",
-    "lint": "biome lint ."
+    "lint": "biome lint .",
+    "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.1",
+    "tsx": "4.20.5"
   }
 }

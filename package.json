@@ -14,6 +14,7 @@
     "lint": "turbo run lint",
     "lint:root": "biome lint package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json",
     "prepare": "husky",
+    "test": "turbo run test",
     "verify": "turbo run lint check"
   },
   "devDependencies": {
