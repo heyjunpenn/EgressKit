@@ -3,12 +3,22 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "egressd": "dist/cli.js"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc --noEmit false --outDir dist",
-    "check": "tsc --noEmit",
-    "lint": "biome lint ."
+    "build": "tsc --project tsconfig.build.json --noEmit false --outDir dist",
+    "check": "pnpm typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "pnpm run build && node --import tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.1",
+    "tsx": "4.20.5"
   }
 }

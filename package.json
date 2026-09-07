@@ -10,11 +10,14 @@
   "packageManager": "pnpm@10.24.0",
   "scripts": {
     "build": "turbo run build",
-    "check": "turbo run check",
+    "check": "pnpm typecheck",
     "lint": "turbo run lint",
-    "lint:root": "biome lint package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json",
+    "lint:fix": "turbo run lint:fix",
+    "lint:root": "biome check package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json",
     "prepare": "husky",
-    "verify": "turbo run lint check"
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",
