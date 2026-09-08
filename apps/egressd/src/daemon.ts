@@ -165,11 +165,22 @@ interface RuntimeConfigurationState {
   status: "failed" | "not-ready" | "ready";
 }
 
-function closeServer(server: Server): Promise<void> {
+function trackServerSockets(server: Server): Set<Socket> {
+  const sockets = new Set<Socket>();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  return sockets;
+}
+
+function closeServer(server: Server, sockets: ReadonlySet<Socket>): Promise<void> {
   return new Promise((resolve, reject) => {
     const forceCloseTimer = setTimeout(() => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
       server.closeAllConnections();
-      resolve();
     }, 1_000);
     server.close((error) => {
       clearTimeout(forceCloseTimer);
@@ -183,8 +194,11 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
-function closeServerIfListening(server: Server | undefined): Promise<void> {
-  return server?.listening ? closeServer(server) : Promise.resolve();
+function closeServerIfListening(
+  server: Server | undefined,
+  sockets: ReadonlySet<Socket>,
+): Promise<void> {
+  return server?.listening ? closeServer(server, sockets) : Promise.resolve();
 }
 
 async function prepareControlSocketPath(path: string): Promise<void> {
@@ -1116,12 +1130,16 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const controlServer = options.controlSocketPath
     ? createServer(createRequestHandler(true))
     : undefined;
+  const serverSockets = trackServerSockets(server);
+  const controlServerSockets = controlServer
+    ? trackServerSockets(controlServer)
+    : new Set<Socket>();
 
   const closeStartupResources = async () => {
     stopWatchingRuntime();
     await remoteOperations?.close();
     await crashRecovery?.close();
-    await closeServerIfListening(controlServer);
+    await closeServerIfListening(controlServer, controlServerSockets);
     await closeRuntimeAndState();
   };
   server.on("connect", (incoming, clientSocket, head) => {
@@ -1170,7 +1188,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
 
   const address = server.address();
   if (!address || typeof address === "string") {
-    await closeServer(server);
+    await closeServer(server, serverSockets);
     await closeStartupResources();
     throw new Error("egressd did not bind a TCP address");
   }
@@ -1221,7 +1239,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
       const operationsClosing = remoteOperations?.close();
       try {
-        await Promise.all([closeServer(server), closeServerIfListening(controlServer)]);
+        await Promise.all([
+          closeServer(server, serverSockets),
+          closeServerIfListening(controlServer, controlServerSockets),
+        ]);
         await operationsClosing;
         if (recoveryClosing) {
           await waitForBoundedCompletion(recoveryClosing, 1_000);

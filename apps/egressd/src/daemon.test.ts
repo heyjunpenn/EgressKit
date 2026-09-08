@@ -42,6 +42,19 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
   assert.deepEqual(await response.json(), { status: "live" });
 });
 
+test("daemon shutdown closes an idle HTTP keep-alive connection", async () => {
+  const daemon = await startEgressd({ host: "127.0.0.1", port: 0 });
+  const client = connect(daemon.address.port, daemon.address.host);
+  await once(client, "connect");
+  client.write("GET /live HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+  await once(client, "data");
+  const clientClosed = once(client, "close");
+
+  await daemon.close();
+  await clientClosed;
+  assert.equal(client.destroyed, true);
+});
+
 test("daemon probes exits through their listeners and exposes manual health control", async (t) => {
   const targetRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(targetRequests);
@@ -989,6 +1002,33 @@ test("an upstream failure after CONNECT 200 only closes the tunnel", {
     (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
     200,
   );
+});
+
+test("daemon shutdown closes an established CONNECT tunnel before reporting completion", {
+  timeout: 3_000,
+}, async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
+  });
+
+  const client = connect(daemon.address.port, daemon.address.host);
+  await once(client, "connect");
+  client.write(
+    `CONNECT ${target.host}:${target.port} HTTP/1.1\r\nHost: ${target.host}:${target.port}\r\n\r\n`,
+  );
+  await once(client, "data");
+  const clientClosed = once(client, "close");
+
+  await daemon.close();
+  await clientClosed;
+  assert.equal(client.destroyed, true);
 });
 
 test("CONNECT requires the same standard Basic proxy credentials", {
