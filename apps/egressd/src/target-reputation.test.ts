@@ -38,3 +38,23 @@ test("target reputation accepts only bounded actionable feedback", () => {
     /ttlMs must be between/,
   );
 });
+
+test("expired one-time targets are globally reclaimed within a hard capacity", () => {
+  let now = 0;
+  const reputation = new TargetReputation({ maximumEntries: 2, now: () => now });
+  reputation.record({ nodeId: "one", outcome: 403, target: "one.example", ttlMs: 1 });
+  reputation.record({ nodeId: "two", outcome: 403, target: "two.example", ttlMs: 1 });
+
+  now = 2;
+  reputation.record({ nodeId: "three", outcome: 429, target: "three.example" });
+  reputation.record({ nodeId: "four", outcome: "risk", target: "four.example" });
+
+  assert.deepEqual([...reputation.excludedNodeIds("three.example")], ["three"]);
+  assert.deepEqual([...reputation.excludedNodeIds("four.example")], ["four"]);
+  reputation.record({ nodeId: "five", outcome: 403, target: "five.example" });
+  assert.equal(
+    reputation.excludedNodeIds("three.example").size +
+      reputation.excludedNodeIds("four.example").size,
+    1,
+  );
+});

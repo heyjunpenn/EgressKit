@@ -2278,6 +2278,7 @@ test("authorized target feedback is opt-in, temporary, and scoped without leakin
   const logs: unknown[] = [];
   const { daemon } = await startTwoExitDaemon(t, undefined, {
     log: (event) => logs.push(event),
+    proxyAuthentication: { tokens: ["proxy-secret"] },
     stateDirectory,
     targetReputationEnabled: true,
   });
@@ -2285,6 +2286,13 @@ test("authorized target feedback is opt-in, temporary, and scoped without leakin
   const target = await startTargetServer(targetRequests);
   t.after(() => target.close());
   const targetUrl = `http://${target.host}:${target.port}/scoped`;
+  const strictAuthorization = basicProxyAuthorization("strict.reputation", "proxy-secret");
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": strictAuthorization,
+    }),
+    200,
+  );
   const feedbackEndpoint = `http://${daemon.address.host}:${daemon.address.port}/reputation/feedback`;
   const response = await fetch(feedbackEndpoint, {
     body: JSON.stringify({ nodeId: "local:first", outcome: 403, target: targetUrl, ttlMs: 60_000 }),
@@ -2308,9 +2316,23 @@ test("authorized target feedback is opt-in, temporary, and scoped without leakin
   }).then((item) => item.text());
   assert.doesNotMatch(resultText, /sensitive\.target\.example/);
 
-  const proxied = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "");
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": strictAuthorization,
+    }),
+    502,
+  );
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("node.local%3Afirst", "proxy-secret"),
+    }),
+    502,
+  );
+  const proxied = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", {
+    "proxy-authorization": basicProxyAuthorization("rotate", "proxy-secret"),
+  });
   assert.equal(proxied.status, 200);
-  assert.equal(targetRequests[0]?.headers["x-egresskit-test-exit"], "second");
+  assert.equal(targetRequests.at(-1)?.headers["x-egresskit-test-exit"], "second");
   const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
     headers: { authorization: "Bearer test-admin-token" },
   }).then((item) => item.text());

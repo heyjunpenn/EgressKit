@@ -398,10 +398,20 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return softStickySessions.acquire(route.sessionKey, excludedIds);
     }
     if (route.mode === "strict") {
-      return softStickySessions.acquireStrict(route.sessionKey);
+      const lease = softStickySessions.acquireStrict(route.sessionKey);
+      if (lease && excludedIds.has(lease.candidate.id)) {
+        lease.release();
+        return undefined;
+      }
+      return lease;
     }
     if (route.mode === "node") {
-      return scheduler.acquireBySelector(route.selector);
+      const lease = scheduler.acquireBySelector(route.selector);
+      if (lease && excludedIds.has(lease.candidate.id)) {
+        lease.release();
+        return undefined;
+      }
+      return lease;
     }
     return "not-implemented" as const;
   };
