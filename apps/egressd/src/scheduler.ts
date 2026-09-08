@@ -156,9 +156,14 @@ export class RotateScheduler {
 function lease(state: CandidateState): SchedulerLease {
   state.leasedConnections += 1;
   let released = false;
+  let outcomeReported = false;
   return {
     candidate: state.candidate,
     reportConnectionFailure: () => {
+      if (outcomeReported) {
+        return;
+      }
+      outcomeReported = true;
       state.candidate = {
         ...state.candidate,
         consecutiveFailures: state.candidate.consecutiveFailures + 1,
@@ -166,6 +171,10 @@ function lease(state: CandidateState): SchedulerLease {
       };
     },
     reportConnectionSuccess: (latencyMs) => {
+      if (outcomeReported) {
+        return;
+      }
+      outcomeReported = true;
       state.candidate = {
         ...state.candidate,
         consecutiveFailures: 0,

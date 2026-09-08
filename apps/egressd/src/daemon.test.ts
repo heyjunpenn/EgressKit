@@ -553,6 +553,37 @@ test("soft sticky retries a different listener before sending HTTP and keeps the
   );
 });
 
+test("HTTP listener transport failure is recorded without replay and egressd stays live", async (t) => {
+  const outcomes: unknown[] = [];
+  const resetting = await startResettingHttpListener();
+  t.after(() => resetting.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    checkMihomoListener: async () => undefined,
+    host: "127.0.0.1",
+    onConnectionOutcome: (outcome) => outcomes.push(outcome),
+    port: 0,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([["first", new URL(`http://${resetting.host}:${resetting.port}`)]]),
+    },
+  });
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first"]), 201);
+
+  assert.equal(
+    await sendProxyRequest(daemon.address, "http://target.example/never-replay", "POST", "once"),
+    502,
+  );
+  assert.equal(resetting.requests, 1);
+  assert.deepEqual(outcomes, [{ nodeId: "local:first", result: "failure" }]);
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
+  );
+});
+
 test("rotate retries a different listener before CONNECT 200", { timeout: 2_000 }, async (t) => {
   const target = await startHttpsTarget([]);
   t.after(() => target.close());
@@ -700,12 +731,14 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
   });
   t.after(() => timeoutListener.close());
   const timeoutFallbackSelections: string[] = [];
+  const timeoutOutcomes: unknown[] = [];
   const timeoutFallback = await startSimulatedMihomoListener(undefined, timeoutFallbackSelections);
   t.after(() => timeoutFallback.close());
   const timeoutDaemon = await startEgressd({
     adminToken: "test-admin-token",
     checkMihomoListener: async () => undefined,
     host: "127.0.0.1",
+    onConnectionOutcome: (outcome) => timeoutOutcomes.push(outcome),
     port: 0,
     preconnectTimeoutMs: 20,
     proxyAuthentication: false,
@@ -725,6 +758,10 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
   );
   assert.equal(timeoutConnections, 1);
   assert.deepEqual(timeoutFallbackSelections, [`${target.host}:${target.port}`]);
+  assert.deepEqual(
+    timeoutOutcomes.map((outcome) => (outcome as { result: string }).result),
+    ["failure", "success"],
+  );
   await timeoutDaemon.close();
 
   let cancelledConnections = 0;
@@ -733,6 +770,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
   });
   t.after(() => cancelledListener.close());
   const cancellationFallbackSelections: string[] = [];
+  const cancellationOutcomes: unknown[] = [];
   const cancellationFallback = await startSimulatedMihomoListener(
     undefined,
     cancellationFallbackSelections,
@@ -742,6 +780,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
     adminToken: "test-admin-token",
     checkMihomoListener: async () => undefined,
     host: "127.0.0.1",
+    onConnectionOutcome: (outcome) => cancellationOutcomes.push(outcome),
     port: 0,
     preconnectTimeoutMs: 100,
     proxyAuthentication: false,
@@ -762,11 +801,14 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
   while (cancelledConnections < 1) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
-  cancelled.destroy();
-  await once(cancelled, "close");
+  await new Promise<void>((resolve) => {
+    cancelled.once("close", () => resolve());
+    cancelled.destroy();
+  });
   await new Promise((resolve) => setTimeout(resolve, 120));
   assert.equal(cancelledConnections, 1);
   assert.deepEqual(cancellationFallbackSelections, []);
+  assert.deepEqual(cancellationOutcomes, []);
 });
 
 test("an upstream failure after CONNECT 200 only closes the tunnel", {
@@ -803,6 +845,10 @@ test("an upstream failure after CONNECT 200 only closes the tunnel", {
 
   assert.equal(received, "HTTP/1.1 200 Connection Established\r\n\r\n");
   assert.deepEqual(connectionEvents, ["opened", "closed"]);
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
+  );
 });
 
 test("CONNECT requires the same standard Basic proxy credentials", {
@@ -1458,6 +1504,49 @@ async function startHangingTcpListener(onConnection: () => void): Promise<{
       }),
     host: "127.0.0.1",
     port: address.port,
+  };
+}
+
+async function startResettingHttpListener(): Promise<{
+  close(): Promise<void>;
+  host: string;
+  port: number;
+  readonly requests: number;
+}> {
+  const sockets = new Set<Socket>();
+  let requests = 0;
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.once("data", () => {
+      requests += 1;
+      socket.resetAndDestroy();
+    });
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("resetting listener did not bind a TCP address");
+  }
+  return {
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+    host: "127.0.0.1",
+    port: address.port,
+    get requests() {
+      return requests;
+    },
   };
 }
 

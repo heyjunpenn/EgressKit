@@ -59,6 +59,7 @@ export interface EgressdOptions {
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
   minimumSubscriptionNodes?: number;
+  onConnectionOutcome?: (outcome: ConnectionOutcome) => void;
   port: number;
   preconnectAttempts?: number;
   preconnectTimeoutMs?: number;
@@ -73,6 +74,12 @@ export interface EgressdOptions {
   sessionMaximumActiveSessions?: number;
   sessionMaximumConcurrentConnections?: number;
   stateDirectory?: string;
+}
+
+export interface ConnectionOutcome {
+  latencyMs?: number;
+  nodeId: string;
+  result: "failure" | "success";
 }
 
 export interface EgressdLogEvent {
@@ -181,7 +188,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     route: ProxyRoute,
     signal: AbortSignal,
     confirmConnection?: (socket: Socket) => Promise<void>,
-  ): Promise<{ lease: SchedulerLease; socket: Socket } | "not-implemented" | undefined> => {
+  ): Promise<
+    { latencyMs: number; lease: SchedulerLease; socket: Socket } | "not-implemented" | undefined
+  > => {
     const attemptedIds = new Set<string>();
     const maximumAttempts = isFallbackRoute(route) ? (options.preconnectAttempts ?? 3) : 1;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
@@ -189,11 +198,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (lease === "not-implemented" || lease === undefined) {
         return lease;
       }
-      attemptedIds.add(lease.candidate.id);
+      const observedLease = observeConnectionOutcome(lease, options.onConnectionOutcome);
+      attemptedIds.add(observedLease.candidate.id);
       const startedAt = Date.now();
       try {
         const socket = await connectMihomoListener(
-          lease.candidate.listener,
+          observedLease.candidate.listener,
           options.preconnectTimeoutMs ?? 10_000,
           signal,
         );
@@ -203,13 +213,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           socket.destroy();
           throw error;
         }
-        lease.reportConnectionSuccess(Date.now() - startedAt);
-        return { lease, socket };
+        return { lease: observedLease, latencyMs: Date.now() - startedAt, socket };
       } catch (error) {
         if (!(error instanceof ClientCancelledError)) {
-          lease.reportConnectionFailure();
+          observedLease.reportConnectionFailure();
         }
-        lease.release();
+        observedLease.release();
         if (error instanceof ClientCancelledError) {
           throw error;
         }
@@ -714,7 +723,7 @@ function checkListenerReady(listener: URL): Promise<void> {
   });
 }
 
-type PreconnectedRoute = { lease: SchedulerLease; socket: Socket };
+type PreconnectedRoute = { latencyMs: number; lease: SchedulerLease; socket: Socket };
 type PreconnectedRouteAcquirer = (
   route: ProxyRoute,
   signal: AbortSignal,
@@ -757,7 +766,13 @@ async function forwardHttpProxyRequest(
     return;
   }
 
-  const { lease, socket } = connected;
+  const { latencyMs, lease, socket } = connected;
+  let clientCancelled = false;
+  const markClientCancelled = () => {
+    clientCancelled = true;
+  };
+  incoming.once("aborted", markClientCancelled);
+  response.once("close", markClientCancelled);
   const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
   const upstream = request(
     {
@@ -773,12 +788,16 @@ async function forwardHttpProxyRequest(
       port: Number(lease.candidate.listener.port || 80),
     },
     (upstreamResponse) => {
+      lease.reportConnectionSuccess(latencyMs);
       upstreamResponse.once("close", lease.release);
       response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
       upstreamResponse.pipe(response);
     },
   );
   upstream.on("error", () => {
+    if (!clientCancelled) {
+      lease.reportConnectionFailure();
+    }
     lease.release();
     if (!response.headersSent) {
       response.writeHead(502);
@@ -800,6 +819,13 @@ async function forwardConnectRequest(
   const controller = new AbortController();
   const cancel = () => controller.abort(new ClientCancelledError());
   clientSocket.once("close", cancel);
+  clientSocket.once("end", cancel);
+  clientSocket.once("error", cancel);
+  const stopWatchingForCancellation = () => {
+    clientSocket.off("close", cancel);
+    clientSocket.off("end", cancel);
+    clientSocket.off("error", cancel);
+  };
   let connected: PreconnectedRoute | "not-implemented" | undefined;
   let handshake: ConnectHandshake | undefined;
   try {
@@ -812,8 +838,9 @@ async function forwardConnectRequest(
       );
     });
   } catch (error) {
-    clientSocket.off("close", cancel);
+    stopWatchingForCancellation();
     if (error instanceof ClientCancelledError) {
+      clientSocket.destroy();
       return;
     }
     clientSocket.end(
@@ -823,7 +850,7 @@ async function forwardConnectRequest(
     );
     return;
   }
-  clientSocket.off("close", cancel);
+  stopWatchingForCancellation();
   if (connected === "not-implemented") {
     clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
     return;
@@ -838,6 +865,7 @@ async function forwardConnectRequest(
     clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
     return;
   }
+  connected.lease.reportConnectionSuccess(connected.latencyMs);
   clientSocket.once("close", connected.lease.release);
   clientSocket.write(handshake.header);
   if (head.length > 0) {
@@ -849,11 +877,46 @@ async function forwardConnectRequest(
   clientSocket.pipe(connected.socket);
   connected.socket.pipe(clientSocket);
   clientSocket.on("error", () => connected.socket.destroy());
+  connected.socket.on("error", () => clientSocket.destroy());
   clientSocket.once("close", () => connected.socket.destroy());
   connected.socket.once("close", () => clientSocket.destroy());
 }
 
 class ClientCancelledError extends Error {}
+
+function observeConnectionOutcome(
+  lease: SchedulerLease,
+  observer: EgressdOptions["onConnectionOutcome"],
+): SchedulerLease {
+  let reported = false;
+  const notify = (outcome: ConnectionOutcome) => {
+    try {
+      observer?.(outcome);
+    } catch {
+      // Observability hooks must not affect proxy traffic.
+    }
+  };
+  return {
+    candidate: lease.candidate,
+    release: lease.release,
+    reportConnectionFailure: () => {
+      if (reported) {
+        return;
+      }
+      reported = true;
+      lease.reportConnectionFailure();
+      notify({ nodeId: lease.candidate.id, result: "failure" });
+    },
+    reportConnectionSuccess: (latencyMs) => {
+      if (reported) {
+        return;
+      }
+      reported = true;
+      lease.reportConnectionSuccess(latencyMs);
+      notify({ latencyMs, nodeId: lease.candidate.id, result: "success" });
+    },
+  };
+}
 
 function connectMihomoListener(
   listener: URL,
