@@ -24,6 +24,17 @@ test("proxy authentication is enabled by default", () => {
 
 test("proxy authentication can only be disabled safely on loopback", () => {
   assert.equal(loadConfig({ EGRESSKIT_PROXY_AUTH: "disabled" }).proxyAuthentication, false);
+  assert.equal(
+    loadConfig({ EGRESSKIT_HOST: "::1", EGRESSKIT_PROXY_AUTH: "disabled" }).proxyAuthentication,
+    false,
+  );
+  assert.equal(
+    loadConfig({
+      EGRESSKIT_HOST: "0:0:0:0:0:0:0:1",
+      EGRESSKIT_PROXY_AUTH: "disabled",
+    }).proxyAuthentication,
+    false,
+  );
   assert.throws(
     () =>
       loadConfig({

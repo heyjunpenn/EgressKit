@@ -1,10 +1,13 @@
+import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
+import type { ProxyAuthentication } from "./proxy-auth.js";
+
 export interface EgressdConfig {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: true;
   host: string;
   port: number;
   mihomoListener?: URL;
-  proxyAuthentication: false | { tokens: readonly string[] };
+  proxyAuthentication: ProxyAuthentication;
 }
 
 function parsePort(value: string | undefined): number {
@@ -23,10 +26,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   const host = environment.EGRESSKIT_HOST ?? "127.0.0.1";
   const listener = environment.EGRESSKIT_MIHOMO_HTTP_LISTENER;
   const mihomoListener = listener === undefined ? undefined : new URL(listener);
-  if (
-    mihomoListener &&
-    (mihomoListener.protocol !== "http:" || !isLoopback(mihomoListener.hostname))
-  ) {
+  if (mihomoListener && !isLoopbackHttpUrl(mihomoListener)) {
     throw new Error("EGRESSKIT_MIHOMO_HTTP_LISTENER must be an HTTP URL using a loopback host");
   }
 
@@ -36,7 +36,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   }
   const allowUnsafeUnauthenticatedProxy =
     environment.EGRESSKIT_ALLOW_UNSAFE_UNAUTHENTICATED_PROXY === "true";
-  if (proxyAuthSetting === "disabled" && !isLoopback(host) && !allowUnsafeUnauthenticatedProxy) {
+  if (
+    proxyAuthSetting === "disabled" &&
+    !isLoopbackHost(host) &&
+    !allowUnsafeUnauthenticatedProxy
+  ) {
     throw new Error("refusing to disable proxy authentication on a non-loopback host");
   }
   const proxyToken = environment.EGRESSKIT_PROXY_TOKEN;
@@ -57,8 +61,4 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
         ? false
         : { tokens: proxyToken === undefined ? [] : [proxyToken] },
   };
-}
-
-function isLoopback(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
 }
