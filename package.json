@@ -17,6 +17,7 @@
     "prepare": "husky",
     "test": "pnpm --filter @egresskit/egressd test && node --test .github/workflows/*.test.mjs apps/egressd/*.test.mjs docker/*.test.mjs docs/*.test.mjs release/*.test.mjs scripts/*.test.mjs",
     "test:live:vless": "node scripts/live-vless.mjs",
+    "test:scale": "pnpm --filter @egresskit/egressd build && node scripts/scale-reliability.mjs",
     "typecheck": "turbo run typecheck",
     "verify": "pnpm lint && pnpm typecheck && pnpm test"
   },

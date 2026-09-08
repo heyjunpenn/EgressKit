@@ -1,0 +1,53 @@
+{
+  "measurements": {
+    "activeListeners": {
+      "measured": 100,
+      "passed": true,
+      "target": 100
+    },
+    "activeSessions": {
+      "measured": 10000,
+      "passed": true,
+      "target": 10000
+    },
+    "concurrentConnects": {
+      "measured": 1000,
+      "passed": true,
+      "target": 1000
+    },
+    "gatewayAddedConnectP95Ms": {
+      "measured": 0.308,
+      "passed": true,
+      "targetMaximum": 20
+    },
+    "subscriptionNodes": {
+      "measured": 500,
+      "passed": true,
+      "target": 500
+    },
+    "soakReliability": {
+      "measuredSuccessRate": 0.95053,
+      "passed": false,
+      "target": "zero CONNECT failures with every required soak seam observed"
+    }
+  },
+  "raw": {
+    "directConnectP95Ms": 0.252,
+    "gatewayConnectP95Ms": 0.534,
+    "soak": {
+      "connectAttempts": 9056,
+      "connectFailures": 448,
+      "connectFailureReasons": {
+        "HTTP_502": 448
+      },
+      "drainingCycles": 3,
+      "sqliteWalReads": 283,
+      "subscriptionUpdates": 3,
+      "mihomoRestarts": 3
+    },
+    "soakElapsedSeconds": 60.069,
+    "soakSeconds": 60,
+    "sqliteJournalMode": "wal",
+    "subscriptionParseMs": 37.581
+  }
+}
