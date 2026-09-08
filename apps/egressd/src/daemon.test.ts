@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
@@ -353,7 +354,7 @@ test("HTTP proxy requests require valid standard Basic proxy credentials", async
   );
 });
 
-test("routing modes that are not implemented never silently degrade to rotate", async (t) => {
+test("strict and explicit-node modes that are not implemented never silently degrade to rotate", async (t) => {
   const observedRequests: string[] = [];
   const observedConnects: string[] = [];
   const mihomo = await startSimulatedMihomoListener(undefined, observedConnects, observedRequests);
@@ -366,7 +367,7 @@ test("routing modes that are not implemented never silently degrade to rotate", 
   });
   t.after(() => daemon.close());
 
-  for (const username of ["sticky.session-a", "strict.session-b", "node.exit-alias"]) {
+  for (const username of ["strict.session-b", "node.exit-alias"]) {
     const response = await sendProxyRequestResponse(
       daemon.address,
       "http://example.test/must-not-rotate",
@@ -379,7 +380,7 @@ test("routing modes that are not implemented never silently degrade to rotate", 
   const connectResponse = await sendConnectRequest(
     daemon.address,
     "example.test:443",
-    basicProxyAuthorization("sticky.session-a", "proxy-secret"),
+    basicProxyAuthorization("strict.session-a", "proxy-secret"),
   );
   assert.match(connectResponse, /^HTTP\/1\.1 501 Not Implemented/);
   assert.equal(observedRequests.length, 0);
@@ -643,13 +644,188 @@ test("new CONNECT tunnels rotate while requests inside one tunnel keep the same 
   assert.match(received, /GET \/three HTTP\/1\.1/);
 });
 
+test("concurrent first soft-sticky requests share one binding and obey the connection cap", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-sticky-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  let releaseResponses = (): void => undefined;
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponses = resolve;
+  });
+  const target = await startTargetServer(observedRequests, {
+    beforeResponse: () => responseGate,
+  });
+  t.after(() => target.close());
+  const { daemon } = await startTwoExitDaemon(t, undefined, {
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    sessionMaximumConcurrentConnections: 2,
+    stateDirectory,
+  });
+  const headers = {
+    "proxy-authorization": basicProxyAuthorization("sticky.shared-session", "proxy-secret"),
+  };
+  const targetUrl = `http://${target.host}:${target.port}/sticky`;
+
+  const first = sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", headers);
+  const second = sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", headers);
+  await Promise.race([
+    (async () => {
+      while (observedRequests.length < 2) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("sticky requests did not reach one bound exit")), 250),
+    ),
+  ]);
+  const rejected = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", headers);
+  assert.equal(rejected.status, 429);
+  releaseResponses();
+  assert.deepEqual(
+    (await Promise.all([first, second])).map(({ status }) => status),
+    [200, 200],
+  );
+  assert.deepEqual(
+    observedRequests.map((entry) => entry.headers["x-egresskit-test-exit"]),
+    ["first", "first"],
+  );
+});
+
+test("soft sticky rebinds new connections without migrating an existing tunnel", {
+  timeout: 2_000,
+}, async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-sticky-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const targetConnections: string[] = [];
+  const target = await startHttpsTarget([], targetConnections);
+  t.after(() => target.close());
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const httpTarget = await startTargetServer(observedRequests);
+  t.after(() => httpTarget.close());
+  const { daemon, firstSelections, secondSelections } = await startTwoExitDaemon(t, undefined, {
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    stateDirectory,
+  });
+  const authorization = basicProxyAuthorization("sticky.failover-session", "proxy-secret");
+  const tunnel = await openConnectTunnel(
+    daemon.address,
+    `${target.host}:${target.port}`,
+    authorization,
+  );
+  t.after(() => tunnel.destroy());
+  assert.deepEqual(firstSelections, [`${target.host}:${target.port}`]);
+
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+  assert.equal(tunnel.destroyed, false);
+  assert.deepEqual(targetConnections, ["opened"]);
+
+  const response = await sendProxyRequestResponse(
+    daemon.address,
+    `http://${httpTarget.host}:${httpTarget.port}/rebound`,
+    "GET",
+    "",
+    { "proxy-authorization": authorization },
+  );
+  assert.equal(response.status, 200);
+  assert.equal(observedRequests[0]?.headers["x-egresskit-test-exit"], "second");
+  assert.equal(firstSelections.length, 1);
+  assert.equal(secondSelections.length, 0);
+  assert.equal(tunnel.destroyed, false);
+  tunnel.destroy();
+  await once(tunnel, "close");
+});
+
+test("soft sticky persists only an HMAC identity and expires absolute and idle sessions", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-sticky-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const clock = new ManualClock(10_000);
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const { daemon } = await startTwoExitDaemon(t, undefined, {
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    sessionAbsoluteTtlMs: 1_000,
+    sessionClock: clock,
+    sessionIdleTimeoutMs: 500,
+    sessionMaximumActiveSessions: 1,
+    stateDirectory,
+  });
+  const targetUrl = `http://${target.host}:${target.port}/limits`;
+
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.secret-session", "proxy-secret"),
+    }),
+    200,
+  );
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.other-session", "proxy-secret"),
+    }),
+    429,
+  );
+  clock.advanceBy(501);
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.other-session", "proxy-secret"),
+    }),
+    200,
+  );
+  clock.advanceBy(400);
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.other-session", "proxy-secret"),
+    }),
+    200,
+  );
+  clock.advanceBy(400);
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.other-session", "proxy-secret"),
+    }),
+    200,
+  );
+  clock.advanceBy(201);
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("sticky.secret-session", "proxy-secret"),
+    }),
+    200,
+  );
+
+  await daemon.close();
+  const state = await openControlState(stateDirectory);
+  const identity = createHmac("sha256", state.loadOrCreateSessionHmacKey())
+    .update("secret-session")
+    .digest("hex");
+  assert.match(identity, /^[a-f0-9]{64}$/);
+  assert.equal(state.getSessionBinding(identity)?.logicalNodeId, "local:first");
+  await state.close();
+  const database = await readFile(join(stateDirectory, "control.sqlite"));
+  assert.equal(database.includes(Buffer.from("secret-session")), false);
+  assert.equal(database.includes(Buffer.from("other-session")), false);
+});
+
 function sendProxyRequest(
   proxy: { host: string; port: number },
   target: string,
   method: string,
   body: string,
+  headers: Record<string, string> = {},
 ): Promise<number> {
-  return sendProxyRequestResponse(proxy, target, method, body).then(({ status }) => status);
+  return sendProxyRequestResponse(proxy, target, method, body, headers).then(
+    ({ status }) => status,
+  );
 }
 
 function sendProxyRequestResponse(
@@ -714,6 +890,31 @@ function sendConnectRequest(
   });
 }
 
+function openConnectTunnel(
+  proxy: { host: string; port: number },
+  authority: string,
+  proxyAuthorization: string,
+): Promise<import("node:net").Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(proxy.port, proxy.host);
+    let response = "";
+    socket.on("connect", () =>
+      socket.write(
+        `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: ${proxyAuthorization}\r\n\r\n`,
+      ),
+    );
+    socket.on("data", (chunk) => {
+      response += chunk.toString();
+      if (response.includes("\r\n\r\n")) {
+        socket.removeAllListeners("data");
+        assert.match(response, /^HTTP\/1\.1 200 Connection Established/);
+        resolve(socket);
+      }
+    });
+    socket.on("error", reject);
+  });
+}
+
 function sendHttpsPayloadThroughProxy(
   proxy: { host: string; port: number },
   authority: string,
@@ -745,6 +946,7 @@ function sendHttpsPayloadThroughProxy(
 async function startTwoExitDaemon(
   t: TestContext,
   schedulerSignals?: Parameters<typeof startEgressd>[0]["schedulerSignals"],
+  overrides: Partial<Parameters<typeof startEgressd>[0]> = {},
 ): Promise<{
   daemon: Awaited<ReturnType<typeof startEgressd>>;
   firstSelections: string[];
@@ -762,6 +964,7 @@ async function startTwoExitDaemon(
     port: 0,
     proxyAuthentication: false,
     ...(schedulerSignals === undefined ? {} : { schedulerSignals }),
+    ...overrides,
     mihomoRuntime: {
       apply: async () =>
         new Map([

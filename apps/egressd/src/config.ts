@@ -12,6 +12,10 @@ export interface EgressdConfig {
   mihomoListener?: URL;
   minimumSubscriptionNodes?: number;
   proxyAuthentication: ProxyAuthentication;
+  sessionAbsoluteTtlMs?: number;
+  sessionIdleTimeoutMs?: number;
+  sessionMaximumActiveSessions?: number;
+  sessionMaximumConcurrentConnections?: number;
   stateDirectory: string;
 }
 
@@ -75,6 +79,22 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     "EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES",
     environment.EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES,
   );
+  const sessionAbsoluteTtlMs = parsePositiveInteger(
+    "EGRESSKIT_SESSION_ABSOLUTE_TTL_MS",
+    environment.EGRESSKIT_SESSION_ABSOLUTE_TTL_MS,
+  );
+  const sessionIdleTimeoutMs = parsePositiveInteger(
+    "EGRESSKIT_SESSION_IDLE_TIMEOUT_MS",
+    environment.EGRESSKIT_SESSION_IDLE_TIMEOUT_MS,
+  );
+  const sessionMaximumConcurrentConnections = parsePositiveInteger(
+    "EGRESSKIT_SESSION_MAX_CONCURRENT_CONNECTIONS",
+    environment.EGRESSKIT_SESSION_MAX_CONCURRENT_CONNECTIONS,
+  );
+  const sessionMaximumActiveSessions = parsePositiveInteger(
+    "EGRESSKIT_MAX_ACTIVE_SESSIONS",
+    environment.EGRESSKIT_MAX_ACTIVE_SESSIONS,
+  );
 
   return {
     ...(environment.EGRESSKIT_ADMIN_TOKEN === undefined
@@ -90,5 +110,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
       proxyAuthSetting === "disabled"
         ? false
         : { tokens: proxyToken === undefined ? [] : [proxyToken] },
+    ...(sessionAbsoluteTtlMs === undefined ? {} : { sessionAbsoluteTtlMs }),
+    ...(sessionIdleTimeoutMs === undefined ? {} : { sessionIdleTimeoutMs }),
+    ...(sessionMaximumActiveSessions === undefined ? {} : { sessionMaximumActiveSessions }),
+    ...(sessionMaximumConcurrentConnections === undefined
+      ? {}
+      : { sessionMaximumConcurrentConnections }),
   };
 }
