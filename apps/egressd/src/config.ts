@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import type { ProxyAuthentication } from "./proxy-auth.js";
 
@@ -8,6 +11,7 @@ export interface EgressdConfig {
   port: number;
   mihomoListener?: URL;
   proxyAuthentication: ProxyAuthentication;
+  stateDirectory: string;
 }
 
 function parsePort(value: string | undefined): number {
@@ -47,6 +51,14 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   if (proxyToken === "") {
     throw new Error("EGRESSKIT_PROXY_TOKEN must not be empty");
   }
+  if (environment.EGRESSKIT_STATE_DIRECTORY === "") {
+    throw new Error("EGRESSKIT_STATE_DIRECTORY must not be empty");
+  }
+  const stateDirectory =
+    environment.EGRESSKIT_STATE_DIRECTORY ??
+    (environment.XDG_STATE_HOME
+      ? join(environment.XDG_STATE_HOME, "egresskit")
+      : join(homedir(), ".local", "state", "egresskit"));
 
   return {
     ...(environment.EGRESSKIT_ADMIN_TOKEN === undefined
@@ -55,6 +67,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     ...(allowUnsafeUnauthenticatedProxy ? { allowUnsafeUnauthenticatedProxy: true as const } : {}),
     host,
     port: parsePort(environment.EGRESSKIT_PORT),
+    stateDirectory,
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
     proxyAuthentication:
       proxyAuthSetting === "disabled"
