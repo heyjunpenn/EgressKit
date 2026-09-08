@@ -27,6 +27,17 @@ export interface PersistedActiveRevision {
   source: SubscriptionIdentity;
 }
 
+export interface PreparedNodeRevision {
+  imported: ImportedVlessRevision;
+  nodes: PersistedNodeGeneration[];
+}
+
+export interface PersistedListenerLease {
+  generation: string;
+  listenerPort: number;
+  logicalId: string;
+}
+
 export type SubscriptionRevisionStatus =
   | "saved"
   | "downloaded"
@@ -98,7 +109,19 @@ export interface ControlState extends SessionBindingStore {
   getNodeAliases(): ReadonlyMap<string, string>;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
+  listDrainingListenerLeases(): PersistedListenerLease[];
   loadActiveRevision(): PersistedActiveRevision | undefined;
+  prepareNodeRevision(
+    sourceId: string,
+    imported: ImportedVlessRevision,
+    now?: number,
+  ): PreparedNodeRevision;
+  releaseNodeGeneration(
+    logicalId: string,
+    generation: string,
+    listenerPort: number,
+    reusableAfter: number,
+  ): boolean;
   saveActiveRevision(input: {
     imported: ImportedVlessRevision;
     operationId?: string;
@@ -171,8 +194,13 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
+    listDrainingListenerLeases: () => listDrainingListenerLeases(controlDatabase),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
+    prepareNodeRevision: (sourceId, imported, now) =>
+      prepareNodeRevision(controlDatabase, sourceId, imported, now),
+    releaseNodeGeneration: (logicalId, generation, listenerPort, reusableAfter) =>
+      releaseNodeGeneration(controlDatabase, logicalId, generation, listenerPort, reusableAfter),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
     saveNodeAlias: (logicalNodeId, alias) => saveNodeAlias(controlDatabase, logicalNodeId, alias),
     saveValidatedRevision: (subscriptionRevisionId, imported) =>
@@ -428,6 +456,13 @@ function migrate(database: DatabaseSync): void {
       alias TEXT PRIMARY KEY,
       logical_id TEXT NOT NULL UNIQUE
     );
+    CREATE TABLE IF NOT EXISTS listener_port_leases (
+      listener_port INTEGER PRIMARY KEY,
+      logical_id TEXT NOT NULL,
+      generation TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('active', 'draining', 'quarantined')),
+      reusable_after INTEGER
+    );
   `);
   ensureColumn(database, "subscription_revisions", "mihomo_config_json", "TEXT");
   ensureColumn(
@@ -451,13 +486,19 @@ function migrate(database: DatabaseSync): void {
       revision_id INTEGER NOT NULL REFERENCES subscription_revisions(id),
       kind TEXT NOT NULL DEFAULT 'refresh'
     );
+    INSERT OR IGNORE INTO listener_port_leases
+      (listener_port, logical_id, generation, status, reusable_after)
+      SELECT ng.listener_port, ng.logical_id, ng.generation, 'active', NULL
+      FROM runtime_revisions rr
+      JOIN node_generations ng ON ng.revision_id = rr.subscription_revision_id
+      WHERE rr.status = 'active';
     INSERT INTO revision_events (revision_id, status, created_at)
       SELECT sr.id, sr.lifecycle_status, sr.created_at
       FROM subscription_revisions sr
       WHERE NOT EXISTS (
         SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
       );
-    PRAGMA user_version = 5;
+    PRAGMA user_version = 6;
   `);
   ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
 }
@@ -1011,6 +1052,22 @@ function saveActiveRevision(
       );
     }
     database
+      .prepare("UPDATE listener_port_leases SET status = 'draining' WHERE status = 'active'")
+      .run();
+    const activatePort = database.prepare(
+      `INSERT INTO listener_port_leases
+         (listener_port, logical_id, generation, status, reusable_after)
+       VALUES (?, ?, ?, 'active', NULL)
+       ON CONFLICT(listener_port) DO UPDATE SET
+         logical_id = excluded.logical_id,
+         generation = excluded.generation,
+         status = 'active',
+         reusable_after = NULL`,
+    );
+    for (const node of nodes) {
+      activatePort.run(node.listenerPort, node.logicalId, node.generation);
+    }
+    database
       .prepare("UPDATE runtime_revisions SET status = 'superseded' WHERE status = 'active'")
       .run();
     const insertedRuntime = database
@@ -1047,6 +1104,122 @@ function saveActiveRevision(
     database.exec("ROLLBACK");
     throw error;
   }
+}
+
+function prepareNodeRevision(
+  database: DatabaseSync,
+  sourceId: string,
+  imported: ImportedVlessRevision,
+  now = Date.now(),
+): PreparedNodeRevision {
+  const leases = database
+    .prepare(
+      `SELECT listener_port, logical_id, generation, status, reusable_after
+       FROM listener_port_leases ORDER BY listener_port`,
+    )
+    .all() as Array<{
+    generation: string;
+    listener_port: number;
+    logical_id: string;
+    reusable_after: number | null;
+    status: "active" | "draining" | "quarantined";
+  }>;
+  const firstListenerPort = Math.min(...imported.mihomoConfig.listeners.map(({ port }) => port));
+  const unavailable = new Set(
+    leases
+      .filter(
+        ({ reusable_after: reusableAfter, status }) =>
+          status !== "quarantined" || reusableAfter === null || reusableAfter > now,
+      )
+      .map(({ listener_port: listenerPort }) => listenerPort),
+  );
+  const assigned = new Set<number>();
+  const nodes = imported.nodes.map((node) => {
+    const logicalId = `${sourceId}:${node.name}`;
+    const generation = nodeGeneration(node);
+    const active = leases.find(
+      (lease) =>
+        lease.logical_id === logicalId &&
+        lease.generation === generation &&
+        lease.status === "active",
+    );
+    const reusable = leases.find(
+      (lease) =>
+        lease.logical_id === logicalId &&
+        lease.generation === generation &&
+        lease.status === "quarantined" &&
+        lease.reusable_after !== null &&
+        lease.reusable_after <= now,
+    );
+    const prior = active ?? reusable;
+    let listenerPort = prior?.listener_port;
+    if (listenerPort === undefined || assigned.has(listenerPort)) {
+      listenerPort = firstListenerPort;
+      while (unavailable.has(listenerPort) || assigned.has(listenerPort)) {
+        listenerPort += 1;
+      }
+    }
+    if (listenerPort > 65_535) {
+      throw new Error("no internal listener port is available");
+    }
+    assigned.add(listenerPort);
+    return { generation, listenerPort, logicalId, node };
+  });
+  const ports = new Map(nodes.map(({ listenerPort, node }) => [node.name, listenerPort]));
+  return {
+    imported: {
+      mihomoConfig: {
+        listeners: imported.mihomoConfig.listeners.map((listener) => ({
+          ...listener,
+          port: ports.get(listener.proxy) as number,
+        })),
+        proxies: imported.mihomoConfig.proxies,
+      },
+      nodes: imported.nodes,
+    },
+    nodes,
+  };
+}
+
+function releaseNodeGeneration(
+  database: DatabaseSync,
+  logicalId: string,
+  generation: string,
+  listenerPort: number,
+  reusableAfter: number,
+): boolean {
+  const result = database
+    .prepare(
+      `UPDATE listener_port_leases
+       SET status = 'quarantined', reusable_after = ?
+       WHERE listener_port = ? AND logical_id = ? AND generation = ?
+         AND status IN ('active', 'draining')`,
+    )
+    .run(reusableAfter, listenerPort, logicalId, generation);
+  return result.changes > 0;
+}
+
+function listDrainingListenerLeases(database: DatabaseSync): PersistedListenerLease[] {
+  return database
+    .prepare(
+      `SELECT logical_id, generation, listener_port
+       FROM listener_port_leases
+       WHERE status = 'draining'
+       ORDER BY listener_port`,
+    )
+    .all()
+    .map((row) => {
+      const lease = row as {
+        generation: string;
+        listener_port: number;
+        logical_id: string;
+      };
+      return {
+        generation: lease.generation,
+        listenerPort: lease.listener_port,
+        logicalId: lease.logical_id,
+      };
+    });
 }
 
 function loadActiveRevision(database: DatabaseSync): PersistedActiveRevision | undefined {
@@ -1111,7 +1284,7 @@ function loadActiveRevision(database: DatabaseSync): PersistedActiveRevision | u
   };
 }
 
-function nodeGeneration(node: NormalizedVlessNode): string {
+export function nodeGeneration(node: NormalizedVlessNode): string {
   const { name: _name, ...connectionParameters } = node;
   return createHash("sha256").update(JSON.stringify(connectionParameters)).digest("hex");
 }

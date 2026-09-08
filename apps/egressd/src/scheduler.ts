@@ -4,6 +4,7 @@ export interface SchedulerCandidate {
   activeConnections: number;
   consecutiveFailures: number;
   ewmaLatencyMs: number;
+  generation: string;
   healthy: boolean;
   id: string;
   listener: URL;
@@ -12,7 +13,10 @@ export interface SchedulerCandidate {
   successRate: number;
 }
 
-export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener" | "selectors">;
+export type SchedulerSignals = Omit<
+  SchedulerCandidate,
+  "generation" | "id" | "listener" | "selectors"
+>;
 
 const DEFAULT_SCHEDULER_SIGNALS: SchedulerSignals = {
   activeConnections: 0,
@@ -28,8 +32,9 @@ export function createSchedulerCandidate(
   listener: URL,
   signals: SchedulerSignals = DEFAULT_SCHEDULER_SIGNALS,
   selectors: readonly string[] = [],
+  generation = listener.href,
 ): SchedulerCandidate {
-  return { id, listener, selectors, ...signals };
+  return { generation, id, listener, selectors, ...signals };
 }
 
 export interface SchedulerLease {
@@ -44,6 +49,7 @@ interface CandidateState {
   currentWeight: number;
   healthStatus: NodeHealthStatus;
   leasedConnections: number;
+  onDrained: ((candidate: SchedulerCandidate) => void) | undefined;
 }
 
 export function validateSelectorUniqueness(
@@ -71,32 +77,41 @@ export class RotateScheduler {
     this.replaceCandidates(candidates);
   }
 
-  replaceCandidates(candidates: readonly SchedulerCandidate[]): void {
+  replaceCandidates(
+    candidates: readonly SchedulerCandidate[],
+    onDrained?: (candidate: SchedulerCandidate) => void,
+  ): void {
     validateSelectorUniqueness(candidates);
-    const previous = new Map(this.#states.map((state) => [state.candidate.id, state]));
-    this.#states = candidates.map((candidate) => {
+    for (const candidate of candidates) {
       validateCandidate(candidate);
-      const existing = previous.get(candidate.id);
+    }
+    const previous = new Map(this.#states.map((state) => [candidateKey(state.candidate), state]));
+    const nextKeys = new Set(candidates.map(candidateKey));
+    for (const state of this.#states) {
+      if (!nextKeys.has(candidateKey(state.candidate))) {
+        beginDraining(state, onDrained);
+      }
+    }
+    this.#states = candidates.map((candidate) => {
+      const existing = previous.get(candidateKey(candidate));
       if (!existing) {
         return {
           candidate,
           currentWeight: 0,
           healthStatus: candidate.healthy ? "healthy" : "cooldown",
           leasedConnections: 0,
+          onDrained: undefined,
         };
       }
-      return {
-        candidate: {
-          ...candidate,
-          consecutiveFailures: existing.candidate.consecutiveFailures,
-          ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
-          healthy: existing.candidate.healthy,
-          successRate: existing.candidate.successRate,
-        },
-        currentWeight: existing.currentWeight,
-        healthStatus: existing.healthStatus,
-        leasedConnections: existing.leasedConnections,
+      existing.candidate = {
+        ...candidate,
+        consecutiveFailures: existing.candidate.consecutiveFailures,
+        ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
+        healthy: existing.candidate.healthy,
+        successRate: existing.candidate.successRate,
       };
+      existing.onDrained = undefined;
+      return existing;
     });
   }
 
@@ -246,9 +261,33 @@ function lease(state: CandidateState): SchedulerLease {
       if (!released) {
         released = true;
         state.leasedConnections -= 1;
+        notifyIfDrained(state);
       }
     },
   };
+}
+
+function candidateKey(
+  candidate: Pick<SchedulerCandidate, "generation" | "id" | "listener">,
+): string {
+  return `${candidate.id}\0${candidate.generation}\0${candidate.listener.href}`;
+}
+
+function beginDraining(
+  state: CandidateState,
+  onDrained: ((candidate: SchedulerCandidate) => void) | undefined,
+): void {
+  state.onDrained = onDrained;
+  notifyIfDrained(state);
+}
+
+function notifyIfDrained(state: CandidateState): void {
+  if (state.leasedConnections !== 0 || !state.onDrained) {
+    return;
+  }
+  const onDrained = state.onDrained;
+  state.onDrained = undefined;
+  onDrained(state.candidate);
 }
 
 function effectiveWeight(state: CandidateState): number {

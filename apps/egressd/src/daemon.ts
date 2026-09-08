@@ -40,14 +40,24 @@ import {
 import {
   NodeAliasConflictError,
   NodeAliasTargetNotFoundError,
+  nodeGeneration,
   openControlState,
   type PersistedNodeGeneration,
+  type PreparedNodeRevision,
   RevisionForceConflictError,
 } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
-  apply(config: ImportedVlessRevision["mihomoConfig"]): Promise<ReadonlyMap<string, URL>>;
+  apply(
+    config: ImportedVlessRevision["mihomoConfig"],
+    context: MihomoApplyContext,
+  ): Promise<ReadonlyMap<string, URL>>;
+  removeListener(listener: URL): Promise<void>;
+}
+
+export interface MihomoApplyContext {
+  preserveListeners: readonly URL[];
 }
 
 export interface EgressdOptions {
@@ -68,6 +78,7 @@ export interface EgressdOptions {
   minimumSubscriptionNodes?: number;
   onConnectionOutcome?: (outcome: ConnectionOutcome) => void;
   port: number;
+  portQuarantineMs?: number;
   preconnectAttempts?: number;
   preconnectTimeoutMs?: number;
   proxyAuthentication?: ProxyAuthentication;
@@ -105,6 +116,13 @@ export interface RunningEgressd {
   healthSnapshot(): readonly NodeHealthSnapshot[];
   importLocalSubscription(source: string): Promise<ImportedVlessRevision>;
   setNodeEnabled(id: string, enabled: boolean): boolean;
+}
+
+interface RuntimeGeneration {
+  generation: string;
+  id: string;
+  listener: URL;
+  listenerPort: number;
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -173,9 +191,24 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     );
   }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const runtimeGenerations = new Map<string, RuntimeGeneration>();
+  const retirementOperations = new Set<Promise<void>>();
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
   try {
+    if (state && options.mihomoRuntime) {
+      for (const lease of state.listDrainingListenerLeases()) {
+        await options.mihomoRuntime.removeListener(
+          new URL(`http://127.0.0.1:${lease.listenerPort}`),
+        );
+        state.releaseNodeGeneration(
+          lease.logicalId,
+          lease.generation,
+          lease.listenerPort,
+          Date.now() + (options.portQuarantineMs ?? 60_000),
+        );
+      }
+    }
     softStickySessions = new SoftStickySessions({
       ...(options.sessionAbsoluteTtlMs === undefined
         ? {}
@@ -273,14 +306,20 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     persistedNodes?: readonly PersistedNodeGeneration[],
     logicalIdPrefix = "local",
     checking?: () => void,
-  ): Promise<void> => {
-    if (!options.mihomoRuntime) {
+  ): Promise<ImportedVlessRevision> => {
+    const runtime = options.mihomoRuntime;
+    if (!runtime) {
       throw new Error("Mihomo runtime is not configured");
     }
-    const identities = revision.nodes.map((node) => ({
-      id:
-        persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
-        `${logicalIdPrefix}:${node.name}`,
+    const prepared =
+      persistedNodes === undefined
+        ? (state?.prepareNodeRevision(logicalIdPrefix, revision) ??
+          prepareTransientNodeRevision(logicalIdPrefix, revision))
+        : preparePersistedNodeRevision(revision, persistedNodes);
+    const identities = prepared.nodes.map(({ generation, listenerPort, logicalId: id, node }) => ({
+      generation,
+      id,
+      listenerPort,
       node,
     }));
     let aliases = state?.getNodeAliases() ?? new Map<string, string>();
@@ -288,9 +327,11 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       identities.map(({ id }) => ({ id })),
       [...aliases.values()],
     );
-    const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
+    const listeners = await runtime.apply(prepared.imported.mihomoConfig, {
+      preserveListeners: [...runtimeGenerations.values()].map(({ listener }) => listener),
+    });
     checking?.();
-    for (const node of revision.nodes) {
+    for (const node of prepared.imported.nodes) {
       const listener = listeners.get(node.name);
       if (!listener || !isLoopbackHttpUrl(listener)) {
         throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
@@ -302,24 +343,68 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       identities.map(({ id }) => ({ id })),
       [...aliases.values()],
     );
-    scheduler.replaceCandidates(
-      identities.map(({ id, node }) => {
-        const alias = aliases.get(id);
-        return createSchedulerCandidate(
-          id,
-          listeners.get(node.name) as URL,
-          options.schedulerSignals?.get(id),
-          alias === undefined ? [] : [alias],
-        );
-      }),
+    const activeRuntimeKeys = new Set(
+      scheduler
+        .snapshot()
+        .map(({ generation, id, listener }) => generationKey(id, generation, listener)),
     );
+    const nextRuntimeGenerations = new Map<string, RuntimeGeneration>();
+    const candidates = identities.map(({ generation, id, listenerPort, node }) => {
+      const alias = aliases.get(id);
+      const listener = listeners.get(node.name) as URL;
+      const key = generationKey(id, generation, listener);
+      if (runtimeGenerations.has(key) && !activeRuntimeKeys.has(key)) {
+        throw new Error(`Mihomo runtime reused a draining listener for ${node.name}`);
+      }
+      nextRuntimeGenerations.set(key, {
+        generation,
+        id,
+        listener,
+        listenerPort,
+      });
+      return createSchedulerCandidate(
+        id,
+        listener,
+        options.schedulerSignals?.get(id),
+        alias === undefined ? [] : [alias],
+        generation,
+      );
+    });
+    for (const [key, generation] of nextRuntimeGenerations) {
+      runtimeGenerations.set(key, generation);
+    }
+    scheduler.replaceCandidates(candidates, (drained) => {
+      const key = generationKey(drained.id, drained.generation, drained.listener);
+      const retired = runtimeGenerations.get(key);
+      if (!retired) {
+        return;
+      }
+      let removal: Promise<void>;
+      removal = runtime
+        .removeListener(retired.listener)
+        .then(() => {
+          state?.releaseNodeGeneration(
+            retired.id,
+            retired.generation,
+            retired.listenerPort,
+            Date.now() + (options.portQuarantineMs ?? 60_000),
+          );
+          if (runtimeGenerations.get(key) === retired) {
+            runtimeGenerations.delete(key);
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => retirementOperations.delete(removal));
+      retirementOperations.add(removal);
+    });
     healthController?.replaceNodes(
-      identities.map(({ id, node }) => ({
-        generation: JSON.stringify(node),
+      identities.map(({ generation, id, node }) => ({
+        generation,
         id,
         listener: listeners.get(node.name) as URL,
       })),
     );
+    return prepared.imported;
   };
 
   try {
@@ -338,13 +423,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       throw new Error("subscription contains no VLESS nodes");
     }
     await withControlPlaneLock(async () => {
-      await activateRevisionUnlocked(revision);
+      const activated = await activateRevisionUnlocked(revision);
       state?.saveActiveRevision({
-        imported: revision,
+        imported: activated,
         source: { id: "local", kind: "local", locator: "inline" },
       });
     });
-    return revision;
+    return state?.loadActiveRevision()?.imported ?? revision;
   };
 
   const remoteOperations = state
@@ -675,6 +760,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       remoteOperations?.close();
       try {
         await closeServer(server);
+        if (retirementOperations.size > 0) {
+          await waitForBoundedCompletion(
+            Promise.allSettled([...retirementOperations]).then(() => undefined),
+            1_000,
+          );
+        }
       } finally {
         await state?.close();
       }
@@ -683,6 +774,60 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     importLocalSubscription,
     setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
   };
+}
+
+function prepareTransientNodeRevision(
+  sourceId: string,
+  imported: ImportedVlessRevision,
+): PreparedNodeRevision {
+  return {
+    imported,
+    nodes: imported.nodes.map((node) => {
+      const listener = imported.mihomoConfig.listeners.find(
+        (candidate) => candidate.proxy === node.name,
+      );
+      if (!listener) {
+        throw new Error(`revision has no listener for ${node.name}`);
+      }
+      return {
+        generation: nodeGeneration(node),
+        listenerPort: listener.port,
+        logicalId: `${sourceId}:${node.name}`,
+        node,
+      };
+    }),
+  };
+}
+
+function preparePersistedNodeRevision(
+  imported: ImportedVlessRevision,
+  persistedNodes: readonly PersistedNodeGeneration[],
+): PreparedNodeRevision {
+  const nodes = imported.nodes.map((node) => {
+    const persisted = persistedNodes.find((candidate) => candidate.node.name === node.name);
+    if (!persisted) {
+      throw new Error(`persisted revision has no generation for ${node.name}`);
+    }
+    return persisted;
+  });
+  const ports = new Map(nodes.map(({ listenerPort, node }) => [node.name, listenerPort]));
+  return {
+    imported: {
+      mihomoConfig: {
+        listeners: imported.mihomoConfig.listeners.map((listener) => ({
+          ...listener,
+          port: ports.get(listener.proxy) as number,
+        })),
+        proxies: imported.mihomoConfig.proxies,
+      },
+      nodes: imported.nodes,
+    },
+    nodes,
+  };
+}
+
+function generationKey(id: string, generation: string, listener: URL): string {
+  return `${id}\0${generation}\0${listener.href}`;
 }
 
 function waitForBoundedCompletion(operation: Promise<void>, timeoutMs: number): Promise<void> {

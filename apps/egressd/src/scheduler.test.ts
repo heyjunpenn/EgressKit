@@ -8,6 +8,7 @@ function candidate(id: string, overrides: Partial<SchedulerCandidate> = {}): Sch
     activeConnections: 0,
     consecutiveFailures: 0,
     ewmaLatencyMs: 20,
+    generation: id,
     healthy: true,
     id,
     listener: new URL(`http://127.0.0.1:${id === "fast" ? 20_001 : 20_002}`),
@@ -151,4 +152,43 @@ test("active probe outcomes update scheduler reliability signals", () => {
   assert.equal(scheduler.reportHealthCheck("node", true), true);
   assert.equal(scheduler.snapshot()[0]?.consecutiveFailures, 0);
   assert.ok(Math.abs((scheduler.snapshot()[0]?.successRate ?? 0) - 0.84) < 0.000_001);
+});
+
+test("replaced generations stop new traffic and drain existing leases before removal", () => {
+  const removed: string[] = [];
+  const scheduler = new RotateScheduler([candidate("node", { generation: "old" })]);
+  const oldLease = scheduler.acquireById("node");
+  assert.equal(oldLease?.candidate.generation, "old");
+
+  scheduler.replaceCandidates([candidate("node", { generation: "old" })]);
+
+  scheduler.replaceCandidates([candidate("node", { generation: "new" })], (drained) =>
+    removed.push(drained.generation),
+  );
+
+  assert.deepEqual(removed, []);
+  const newLease = scheduler.acquireById("node");
+  assert.equal(newLease?.candidate.generation, "new");
+  newLease?.release();
+  assert.deepEqual(removed, []);
+  oldLease?.release();
+  assert.deepEqual(removed, ["old"]);
+});
+
+test("candidate validation is atomic before an active generation starts draining", () => {
+  const removed: string[] = [];
+  const scheduler = new RotateScheduler([candidate("old")]);
+
+  assert.throws(
+    () =>
+      scheduler.replaceCandidates([candidate("invalid", { manualWeight: -1 })], (drained) =>
+        removed.push(drained.id),
+      ),
+    /manualWeight must be a non-negative finite number/,
+  );
+
+  assert.deepEqual(removed, []);
+  const lease = scheduler.acquireById("old");
+  assert.equal(lease?.candidate.id, "old");
+  lease?.release();
 });
