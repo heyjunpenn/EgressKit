@@ -42,6 +42,8 @@ class TrackingScheduler {
     let released = false;
     return {
       candidate: this.#candidate,
+      reportConnectionFailure: () => undefined,
+      reportConnectionSuccess: () => undefined,
       release: () => {
         if (!released) {
           released = true;

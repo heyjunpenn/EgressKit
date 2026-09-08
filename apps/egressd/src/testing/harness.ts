@@ -176,7 +176,7 @@ export async function startSimulatedMihomoListener(
           try {
             faults.trigger("after-tunnel-established");
           } catch {
-            clientSocket.destroy();
+            (clientSocket as TcpSocket).resetAndDestroy();
             targetSocket.destroy();
             return;
           }

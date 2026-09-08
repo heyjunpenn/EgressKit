@@ -84,6 +84,32 @@ test("minimum subscription nodes is a positive configurable integer", () => {
   }
 });
 
+test("pre-connect failover attempts and timeout are configurable within hard bounds", () => {
+  assert.deepEqual(
+    loadConfig({
+      EGRESSKIT_PRECONNECT_ATTEMPTS: "4",
+      EGRESSKIT_PRECONNECT_TIMEOUT_MS: "2500",
+    }),
+    {
+      host: "127.0.0.1",
+      port: 8787,
+      preconnectAttempts: 4,
+      preconnectTimeoutMs: 2_500,
+      proxyAuthentication: { tokens: [] },
+      stateDirectory: join(homedir(), ".local", "state", "egresskit"),
+    },
+  );
+  for (const value of ["0", "11", "1.5", "many"]) {
+    assert.throws(() => loadConfig({ EGRESSKIT_PRECONNECT_ATTEMPTS: value }), /between 1 and 10/);
+  }
+  for (const value of ["0", "60001", "1.5", "many"]) {
+    assert.throws(
+      () => loadConfig({ EGRESSKIT_PRECONNECT_TIMEOUT_MS: value }),
+      /between 1 and 60000/,
+    );
+  }
+});
+
 test("session resource limits and expirations are configurable positive integers", () => {
   assert.deepEqual(
     loadConfig({

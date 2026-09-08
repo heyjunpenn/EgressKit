@@ -32,6 +32,8 @@ export function createSchedulerCandidate(
 
 export interface SchedulerLease {
   candidate: SchedulerCandidate;
+  reportConnectionFailure(): void;
+  reportConnectionSuccess(latencyMs: number): void;
   release(): void;
 }
 
@@ -74,10 +76,13 @@ export class RotateScheduler {
     });
   }
 
-  acquire(): SchedulerLease | undefined {
+  acquire(excludedIds: ReadonlySet<string> = new Set()): SchedulerLease | undefined {
     const eligible = this.#states.filter(
       ({ candidate }) =>
-        candidate.healthy && candidate.manualWeight > 0 && candidate.successRate > 0,
+        !excludedIds.has(candidate.id) &&
+        candidate.healthy &&
+        candidate.manualWeight > 0 &&
+        candidate.successRate > 0,
     );
     if (eligible.length === 0) {
       return undefined;
@@ -130,6 +135,10 @@ export class RotateScheduler {
     return this.#states.some(({ candidate }) => candidate.id === id);
   }
 
+  snapshot(): readonly SchedulerCandidate[] {
+    return this.#states.map(({ candidate }) => ({ ...candidate }));
+  }
+
   setSelectors(id: string, selectors: readonly string[]): boolean {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
     if (!state) {
@@ -147,8 +156,32 @@ export class RotateScheduler {
 function lease(state: CandidateState): SchedulerLease {
   state.leasedConnections += 1;
   let released = false;
+  let outcomeReported = false;
   return {
     candidate: state.candidate,
+    reportConnectionFailure: () => {
+      if (outcomeReported) {
+        return;
+      }
+      outcomeReported = true;
+      state.candidate = {
+        ...state.candidate,
+        consecutiveFailures: state.candidate.consecutiveFailures + 1,
+        successRate: state.candidate.successRate * 0.8,
+      };
+    },
+    reportConnectionSuccess: (latencyMs) => {
+      if (outcomeReported) {
+        return;
+      }
+      outcomeReported = true;
+      state.candidate = {
+        ...state.candidate,
+        consecutiveFailures: 0,
+        ewmaLatencyMs: state.candidate.ewmaLatencyMs * 0.8 + latencyMs * 0.2,
+        successRate: state.candidate.successRate * 0.8 + 0.2,
+      };
+    },
     release: () => {
       if (!released) {
         released = true;
