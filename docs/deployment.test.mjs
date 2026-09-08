@@ -21,4 +21,6 @@ test("deployment docs disclose the exact v1 support and state-security contract"
   assert.match(deployment, /GitHub Release/);
   assert.match(deployment, /不从 npm registry/);
   assert.match(deployment, /SBOM/);
+  assert.match(deployment, /独立[^\n]*`pnpm verify`/);
+  assert.match(deployment, /四种[^\n]*构建、打包、安装/);
 });

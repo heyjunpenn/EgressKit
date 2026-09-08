@@ -11,9 +11,9 @@
 | Linux Docker | linux/amd64 | Supported multi-architecture image |
 | Linux Docker | linux/arm64 | Supported multi-architecture image |
 
-Windows 不在 v1 的正式支持范围。发布流水线会在四种受支持的宿主组合上安装依赖、执行
-`pnpm verify`、构建 `egresskit` CLI 与 `egressd` daemon，并分别保存构建归档。Docker
-manifest 同时包含 `linux/amd64` 与 `linux/arm64`。
+Windows 不在 v1 的正式支持范围。发布流水线通过独立任务执行一次完整 `pnpm verify`。
+四种受支持的宿主组合分别执行构建、打包、安装和双入口 smoke，并保存构建归档。Docker manifest 同时包含
+`linux/amd64` 与 `linux/arm64`。正式镜像与 GitHub Release 都依赖完整质量验证成功。
 
 带版本的 GitHub Release 附件是 v1 CLI 和 daemon 归档的正式下载渠道；项目不从 npm registry
 发布。归档内部 package version 必须与 `v` 前缀 release tag 完全一致。容器镜像从同一 tag 发布到

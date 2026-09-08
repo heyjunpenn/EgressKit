@@ -27,6 +27,9 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /packages: write/);
   assert.match(workflow, /contents: write/);
   assert.match(workflow, /actionlint/);
+  assert.match(workflow, /quality:[\s\S]*?run: pnpm verify/);
+  assert.match(workflow, /needs: \[quality, docker-validation\]/);
+  assert.match(workflow, /needs: \[quality, host-artifacts, docker-publish\]/);
   assert.match(workflow, /load: true/);
   assert.match(workflow, /127\.0\.0\.1::8787/);
 });
