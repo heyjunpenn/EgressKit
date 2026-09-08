@@ -1137,15 +1137,21 @@ function prepareNodeRevision(
   const nodes = imported.nodes.map((node) => {
     const logicalId = `${sourceId}:${node.name}`;
     const generation = nodeGeneration(node);
-    const prior = leases.find(
+    const active = leases.find(
       (lease) =>
         lease.logical_id === logicalId &&
         lease.generation === generation &&
-        (lease.status === "active" ||
-          (lease.status === "quarantined" &&
-            lease.reusable_after !== null &&
-            lease.reusable_after <= now)),
+        lease.status === "active",
     );
+    const reusable = leases.find(
+      (lease) =>
+        lease.logical_id === logicalId &&
+        lease.generation === generation &&
+        lease.status === "quarantined" &&
+        lease.reusable_after !== null &&
+        lease.reusable_after <= now,
+    );
+    const prior = active ?? reusable;
     let listenerPort = prior?.listener_port;
     if (listenerPort === undefined || assigned.has(listenerPort)) {
       listenerPort = firstListenerPort;

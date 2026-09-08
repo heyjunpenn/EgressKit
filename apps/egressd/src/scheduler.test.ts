@@ -174,3 +174,21 @@ test("replaced generations stop new traffic and drain existing leases before rem
   oldLease?.release();
   assert.deepEqual(removed, ["old"]);
 });
+
+test("candidate validation is atomic before an active generation starts draining", () => {
+  const removed: string[] = [];
+  const scheduler = new RotateScheduler([candidate("old")]);
+
+  assert.throws(
+    () =>
+      scheduler.replaceCandidates([candidate("invalid", { manualWeight: -1 })], (drained) =>
+        removed.push(drained.id),
+      ),
+    /manualWeight must be a non-negative finite number/,
+  );
+
+  assert.deepEqual(removed, []);
+  const lease = scheduler.acquireById("old");
+  assert.equal(lease?.candidate.id, "old");
+  lease?.release();
+});

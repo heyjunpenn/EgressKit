@@ -82,6 +82,9 @@ export class RotateScheduler {
     onDrained?: (candidate: SchedulerCandidate) => void,
   ): void {
     validateSelectorUniqueness(candidates);
+    for (const candidate of candidates) {
+      validateCandidate(candidate);
+    }
     const previous = new Map(this.#states.map((state) => [candidateKey(state.candidate), state]));
     const nextKeys = new Set(candidates.map(candidateKey));
     for (const state of this.#states) {
@@ -90,7 +93,6 @@ export class RotateScheduler {
       }
     }
     this.#states = candidates.map((candidate) => {
-      validateCandidate(candidate);
       const existing = previous.get(candidateKey(candidate));
       if (!existing) {
         return {

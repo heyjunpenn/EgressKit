@@ -135,6 +135,7 @@ test("node generation planning keeps stable ports and quarantines retired listen
   assert.equal(reverted.nodes[0]?.listenerPort, 20_001);
   assert.equal(reverted.nodes[1]?.listenerPort, 20_003);
   assert.equal(reverted.nodes[1]?.generation, first.nodes[0]?.generation);
+  state.saveActiveRevision({ imported: reverted.imported, source });
 
   assert.equal(
     state.releaseNodeGeneration(
@@ -145,6 +146,18 @@ test("node generation planning keeps stable ports and quarantines retired listen
     ),
     true,
   );
+  const stableAfterExpiredQuarantine = state.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+`,
+      { firstListenerPort: 20_000 },
+    ),
+    100,
+  );
+  assert.equal(stableAfterExpiredQuarantine.nodes[1]?.listenerPort, 20_003);
   const thirdSource = `proxies:
   - { name: third, type: vless, server: three.example.com, port: 443, uuid: 33333333-3333-4333-8333-333333333333 }
 `;
