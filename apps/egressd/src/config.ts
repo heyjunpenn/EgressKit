@@ -7,6 +7,7 @@ import type { ProxyAuthentication } from "./proxy-auth.js";
 export interface EgressdConfig {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: true;
+  controlSocketPath: string;
   healthCheckConcurrency?: number;
   healthCheckIntervalMs?: number;
   healthCheckJitterMs?: number;
@@ -169,6 +170,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
       ? {}
       : { adminToken: environment.EGRESSKIT_ADMIN_TOKEN }),
     ...(allowUnsafeUnauthenticatedProxy ? { allowUnsafeUnauthenticatedProxy: true as const } : {}),
+    controlSocketPath: environment.EGRESSKIT_CONTROL_SOCKET ?? join(stateDirectory, "egressd.sock"),
     host,
     ...(healthCheckConcurrency === undefined ? {} : { healthCheckConcurrency }),
     ...(healthCheckIntervalMs === undefined ? {} : { healthCheckIntervalMs }),

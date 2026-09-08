@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
+    "egresskit": "dist/control-cli-bin.js",
     "egressd": "dist/cli.js"
   },
   "engines": {
