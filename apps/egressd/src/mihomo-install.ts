@@ -87,10 +87,16 @@ export async function installMihomo(options: {
       `Mihomo download failed with HTTP ${response.status}`,
     );
   }
-  const archive = await readBoundedResponse(
-    response,
-    options.maximumArchiveBytes ?? MAXIMUM_ARCHIVE_BYTES,
-  );
+  let archive: Buffer;
+  try {
+    archive = await readBoundedResponse(
+      response,
+      options.maximumArchiveBytes ?? MAXIMUM_ARCHIVE_BYTES,
+    );
+  } catch (error) {
+    if (error instanceof MihomoInstallError) throw error;
+    throw new MihomoInstallError("download-failed", "Mihomo download failed");
+  }
   const actual = createHash("sha256").update(archive).digest("hex");
   if (actual !== asset.sha256) {
     throw new MihomoInstallError("checksum-failed", "Mihomo SHA-256 verification failed");
