@@ -16,6 +16,7 @@ export interface EgressdConfig {
   host: string;
   port: number;
   mihomoListener?: URL;
+  mihomoBinary?: string;
   minimumSubscriptionNodes?: number;
   preconnectAttempts?: number;
   preconnectTimeoutMs?: number;
@@ -80,6 +81,9 @@ function parsePort(value: string | undefined): number {
 export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   const host = environment.EGRESSKIT_HOST ?? "127.0.0.1";
   const listener = environment.EGRESSKIT_MIHOMO_HTTP_LISTENER;
+  if (environment.EGRESSKIT_MIHOMO_BINARY === "") {
+    throw new Error("EGRESSKIT_MIHOMO_BINARY must not be empty");
+  }
   const mihomoListener = listener === undefined ? undefined : new URL(listener);
   if (mihomoListener && !isLoopbackHttpUrl(mihomoListener)) {
     throw new Error("EGRESSKIT_MIHOMO_HTTP_LISTENER must be an HTTP URL using a loopback host");
@@ -189,6 +193,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     stateDirectory,
     ...(targetReputationSetting === "enabled" ? { targetReputationEnabled: true as const } : {}),
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
+    ...(environment.EGRESSKIT_MIHOMO_BINARY === undefined
+      ? {}
+      : { mihomoBinary: environment.EGRESSKIT_MIHOMO_BINARY }),
     proxyAuthentication:
       proxyAuthSetting === "disabled"
         ? false

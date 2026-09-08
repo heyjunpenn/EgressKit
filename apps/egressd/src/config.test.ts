@@ -16,6 +16,11 @@ test("the simulated Mihomo listener must use a loopback host", () => {
   );
 });
 
+test("an existing Mihomo binary path is passed through explicitly", () => {
+  assert.equal(loadConfig({ EGRESSKIT_MIHOMO_BINARY: "/opt/mihomo" }).mihomoBinary, "/opt/mihomo");
+  assert.throws(() => loadConfig({ EGRESSKIT_MIHOMO_BINARY: "" }), /must not be empty/);
+});
+
 test("proxy authentication is enabled by default", () => {
   assert.deepEqual(loadConfig({}), {
     controlSocketPath: join(homedir(), ".local", "state", "egresskit", "egressd.sock"),
