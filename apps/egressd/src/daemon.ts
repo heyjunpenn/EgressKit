@@ -31,6 +31,7 @@ export interface MihomoRuntime {
 export interface EgressdOptions {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: boolean;
+  checkMihomoListener?: (listener: URL) => Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   host: string;
   log?: (event: EgressdLogEvent) => void;
@@ -112,6 +113,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (!listener || !isLoopbackHttpUrl(listener)) {
         throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
       }
+      await (options.checkMihomoListener ?? checkListenerReady)(listener);
     }
     scheduler.replaceCandidates(
       revision.nodes.map((node) => {
@@ -152,6 +154,22 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
 
   let shuttingDown = false;
   const remoteFetches = new Set<AbortController>();
+  let remoteOperationQueue = Promise.resolve();
+  const downloadRemoteSubscription = async (locator: string): Promise<string> => {
+    const controller = new AbortController();
+    remoteFetches.add(controller);
+    try {
+      const response = await (options.fetchSubscription ?? fetch)(locator, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new SafeOperationError(`remote subscription returned HTTP ${response.status}`);
+      }
+      return await readRemoteSubscription(response, controller);
+    } finally {
+      remoteFetches.delete(controller);
+    }
+  };
   const processRemoteOperation = async (
     operationId: string,
     subscriptionId: string,
@@ -167,18 +185,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
       stage = "fetching";
       state.transitionOperation(operationId, stage);
-      const controller = new AbortController();
-      remoteFetches.add(controller);
-      const response = await (options.fetchSubscription ?? fetch)(subscription.locator, {
-        signal: controller.signal,
-      }).finally(() => remoteFetches.delete(controller));
-      if (shuttingDown) {
-        return;
-      }
-      if (!response.ok) {
-        throw new Error(`remote subscription returned HTTP ${response.status}`);
-      }
-      const source = await response.text();
+      const source = await downloadRemoteSubscription(subscription.locator);
       if (shuttingDown) {
         return;
       }
@@ -206,20 +213,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       state.transitionOperation(operationId, "succeeded");
     } catch (error) {
       if (!shuttingDown) {
-        state.failOperation(
-          operationId,
-          stage,
-          redactSecretUrl(
-            error instanceof Error ? error.message : String(error),
-            state.getSubscription(subscriptionId)?.locator,
-          ),
-        );
+        state.failOperation(operationId, stage, operationFailureReason(stage, error));
       }
     }
   };
 
   const queueRemoteOperation = (operationId: string, subscriptionId: string): void => {
-    setImmediate(() => void processRemoteOperation(operationId, subscriptionId));
+    setImmediate(() => {
+      remoteOperationQueue = remoteOperationQueue
+        .then(() => processRemoteOperation(operationId, subscriptionId))
+        .catch(() => undefined);
+    });
   };
 
   const server = createServer((incoming, response) => {
@@ -496,8 +500,79 @@ function writeJson(
   response.end(JSON.stringify(body));
 }
 
-function redactSecretUrl(message: string, locator: string | undefined): string {
-  return locator ? message.replaceAll(locator, "[redacted subscription URL]") : message;
+class SafeOperationError extends Error {}
+
+function operationFailureReason(stage: OperationProcessingStage, error: unknown): string {
+  if (error instanceof SafeOperationError) {
+    return error.message;
+  }
+  switch (stage) {
+    case "queued":
+      return "remote operation could not start";
+    case "fetching":
+      return "remote subscription request failed";
+    case "parsing":
+      return "remote subscription is not valid YAML";
+    case "validating":
+      return "remote subscription failed validation";
+    case "applying":
+      return "Mihomo runtime rejected the subscription";
+    case "checking":
+      return "Mihomo listener readiness check failed";
+  }
+}
+
+async function readRemoteSubscription(
+  response: Response,
+  controller: AbortController,
+): Promise<string> {
+  const maximumBytes = 1024 * 1024;
+  if (!response.body) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      size += value.byteLength;
+      if (size > maximumBytes) {
+        await reader.cancel();
+        controller.abort();
+        throw new SafeOperationError("remote subscription exceeds 1 MiB");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(
+    chunks.map((chunk) => Buffer.from(chunk)),
+    size,
+  ).toString("utf8");
+}
+
+function checkListenerReady(listener: URL): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(Number(listener.port || 80), listener.hostname);
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Mihomo listener readiness timed out"));
+    }, 1_000);
+    socket.once("connect", () => {
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
 }
 
 function handleConnect(
