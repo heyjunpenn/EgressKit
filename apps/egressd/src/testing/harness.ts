@@ -62,6 +62,11 @@ export class ConnectionFaultPlan {
 
 function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
   return new Promise((resolve, reject) => {
+    const sockets = new Set<TcpSocket>();
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       server.off("error", reject);
@@ -76,6 +81,9 @@ function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
         close: () =>
           new Promise<void>((closeResolve, closeReject) => {
             server.close((error) => (error ? closeReject(error) : closeResolve()));
+            for (const socket of sockets) {
+              socket.destroy();
+            }
           }),
       });
     });

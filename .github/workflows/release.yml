@@ -1,0 +1,183 @@
+name: Release artifacts
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm verify
+
+  host-artifacts:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-x64
+            runner: macos-15-intel
+          - name: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @egresskit/egressd build
+      - name: Stamp tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node release/set-package-version.mjs "$GITHUB_REF_NAME" apps/egressd/package.json
+      - name: Assemble CLI and daemon archive
+        shell: bash
+        run: |
+          test -f apps/egressd/dist/control-cli-bin.js
+          test -f apps/egressd/dist/cli.js
+          pnpm --filter @egresskit/egressd pack --pack-destination release
+          mv release/egresskit-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
+      - name: Install and invoke both packaged commands
+        shell: bash
+        run: |
+          install_dir=$(mktemp -d)
+          trap 'rm -rf "$install_dir"' EXIT
+          archive="$GITHUB_WORKSPACE/release/egresskit-${{ matrix.name }}.tgz"
+          pnpm --dir "$install_dir" add "$archive"
+          if "$install_dir/node_modules/.bin/egresskit" runtime install --destination 2>"$install_dir/egresskit.stderr"; then
+            exit 1
+          fi
+          grep -F -- '--destination requires a path' "$install_dir/egresskit.stderr"
+          if env EGRESSKIT_ADMIN_TOKEN=validation-admin EGRESSKIT_HOST=127.0.0.1 \
+            EGRESSKIT_PROXY_TOKEN= "$install_dir/node_modules/.bin/egressd" 2>"$install_dir/egressd.stderr"; then
+            exit 1
+          fi
+          grep -F -- 'EGRESSKIT_PROXY_TOKEN must not be empty' "$install_dir/egressd.stderr"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: egresskit-${{ matrix.name }}
+          path: release/egresskit-${{ matrix.name }}.tgz
+
+  docker-validation:
+    name: docker-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            platform: linux/amd64
+          - name: arm64
+            platform: linux/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: egresskit:validation-${{ matrix.name }}
+      - name: Probe runtime and container boundary
+        shell: bash
+        run: |
+          image="egresskit:validation-${{ matrix.name }}"
+          docker run --rm --entrypoint mihomo "$image" -v | grep -F 'Mihomo Meta v1.19.30'
+          docker run --rm --entrypoint sh "$image" -c \
+            'test -r /usr/share/licenses/egresskit/LICENSE && test -r /usr/share/licenses/egresskit/THIRD_PARTY_NOTICES.md && test -r /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt'
+          container=$(docker run --detach --publish 127.0.0.1::8787 \
+            --env EGRESSKIT_ADMIN_TOKEN=validation-admin \
+            --env EGRESSKIT_PROXY_TOKEN=validation-proxy \
+            "$image")
+          trap 'docker rm --force "$container" >/dev/null' EXIT
+          port=$(docker port "$container" 8787/tcp | sed 's/.*://')
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent "http://127.0.0.1:${port}/live" | grep -F '"status":"live"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$container"
+          exit 1
+
+  docker-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, docker-validation]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/heyjunpenn/egresskit
+          tags: type=ref,event=tag
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: mode=max
+          sbom: true
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, host-artifacts, docker-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: egresskit-*
+          path: release-assets
+          merge-multiple: true
+      - name: Attach archives to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/*.tgz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/*.tgz --verify-tag --generate-notes
+          fi

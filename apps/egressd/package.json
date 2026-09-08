@@ -3,6 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/heyjunpenn/EgressKit.git"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses"
+  ],
   "bin": {
     "egresskit": "dist/control-cli-bin.js",
     "egressd": "dist/cli.js"
@@ -11,11 +22,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc --project tsconfig.build.json --noEmit false --outDir dist",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc --project tsconfig.build.json --noEmit false --outDir dist",
     "check": "pnpm typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "test": "pnpm run build && node --import tsx --test src/*.test.ts",
+    "test": "pnpm run build && node run-tests.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

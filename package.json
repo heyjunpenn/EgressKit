@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "One proxy endpoint, many managed exits.",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
   },
@@ -13,9 +13,9 @@
     "check": "pnpm typecheck",
     "lint": "turbo run lint",
     "lint:fix": "turbo run lint:fix",
-    "lint:root": "biome check package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json",
+    "lint:root": "biome check package.json pnpm-workspace.yaml turbo.json biome.json tsconfig.base.json .github/workflows/release.test.mjs docker/Dockerfile.test.mjs docs/deployment.test.mjs release",
     "prepare": "husky",
-    "test": "turbo run test",
+    "test": "pnpm --filter @egresskit/egressd test && node --test .github/workflows/*.test.mjs apps/egressd/*.test.mjs docker/*.test.mjs docs/*.test.mjs release/*.test.mjs",
     "typecheck": "turbo run typecheck",
     "verify": "pnpm lint && pnpm typecheck && pnpm test"
   },
