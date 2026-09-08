@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   closeAll,
+  closeInOrder,
   countOpenTunnels,
   percentile,
   runBenchmark,
@@ -68,6 +69,38 @@ test("cleanup attempts every resource and reports all failures", async () => {
     (error) => error instanceof AggregateError && error.errors.length === 2,
   );
   assert.deepEqual(attempted, ["first", "second"]);
+});
+
+test("cleanup phases wait for owners before removing their directory", async () => {
+  const events = [];
+  let releaseOwner;
+  const ownerClosed = new Promise((resolve) => {
+    releaseOwner = resolve;
+  });
+  const cleanup = closeInOrder([
+    [
+      async () => {
+        events.push("owner-start");
+        await ownerClosed;
+        events.push("owner-end");
+        throw new Error("owner failed");
+      },
+    ],
+    [
+      async () => {
+        events.push("directory");
+        throw new Error("directory failed");
+      },
+    ],
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["owner-start"]);
+  releaseOwner();
+  await assert.rejects(
+    cleanup,
+    (error) => error instanceof AggregateError && error.errors.length === 2,
+  );
+  assert.deepEqual(events, ["owner-start", "owner-end", "directory"]);
 });
 
 test("soak duration rejects zero, negative, non-numeric, and short runs", async () => {

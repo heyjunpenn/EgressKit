@@ -52,6 +52,19 @@ export async function closeAll(cleanups) {
   if (errors.length > 0) throw new AggregateError(errors, "benchmark cleanup failed");
 }
 
+export async function closeInOrder(phases) {
+  const errors = [];
+  for (const phase of phases) {
+    try {
+      await closeAll(phase);
+    } catch (error) {
+      if (error instanceof AggregateError) errors.push(...error.errors);
+      else errors.push(error);
+    }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "benchmark phased cleanup failed");
+}
+
 const yamlForNodes = (count, revision = 0) =>
   `proxies:\n${Array.from({ length: count }, (_, index) => {
     const suffix = String(index + revision * count)
@@ -378,11 +391,13 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
     };
     return result;
   } finally {
-    await closeAll([
-      ...(database ? [async () => database.close()] : []),
-      ...(daemon ? [async () => daemon.close()] : []),
-      ...listeners.map((listener) => async () => listener.close()),
-      async () => rm(temporaryDirectory, { force: true, recursive: true }),
+    await closeInOrder([
+      [
+        ...(database ? [async () => database.close()] : []),
+        ...(daemon ? [async () => daemon.close()] : []),
+        ...listeners.map((listener) => async () => listener.close()),
+      ],
+      [async () => rm(temporaryDirectory, { force: true, recursive: true })],
     ]);
   }
 }
