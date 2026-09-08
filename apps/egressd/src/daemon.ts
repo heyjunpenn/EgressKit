@@ -1,3 +1,4 @@
+import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -7,8 +8,9 @@ import {
   type ServerResponse,
 } from "node:http";
 import { connect, type Socket } from "node:net";
+import { dirname } from "node:path";
 import type { Duplex } from "node:stream";
-
+import { redactSubscriptionUrl } from "./control-cli.js";
 import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
 import { MihomoCrashRecovery, type MihomoRecoveryClock } from "./mihomo-recovery.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
@@ -68,6 +70,7 @@ export interface MihomoApplyContext {
 export interface EgressdOptions {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: boolean;
+  controlSocketPath?: string;
   checkMihomoListener?: (listener: URL) => Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   healthCheckConcurrency?: number;
@@ -118,6 +121,7 @@ export interface RunningEgressd {
     host: string;
     port: number;
   };
+  controlSocketPath?: string;
   close(): Promise<void>;
   healthSnapshot(): readonly NodeHealthSnapshot[];
   importLocalSubscription(source: string): Promise<ImportedVlessRevision>;
@@ -147,6 +151,50 @@ function closeServer(server: Server): Promise<void> {
       }
       resolve();
     });
+  });
+}
+
+function closeServerIfListening(server: Server | undefined): Promise<void> {
+  return server?.listening ? closeServer(server) : Promise.resolve();
+}
+
+async function prepareControlSocketPath(path: string): Promise<void> {
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  if (!before.isSocket()) {
+    throw addressInUseError(path);
+  }
+  await new Promise<void>((resolve, reject) => {
+    const socket = connect(path);
+    socket.once("connect", () => {
+      socket.destroy();
+      reject(addressInUseError(path));
+    });
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED") {
+        resolve();
+        return;
+      }
+      reject(error);
+    });
+  });
+  const after = await lstat(path);
+  if (!after.isSocket() || after.dev !== before.dev || after.ino !== before.ino) {
+    throw addressInUseError(path);
+  }
+  await rm(path);
+}
+
+function addressInUseError(path: string): Error {
+  return Object.assign(new Error(`EADDRINUSE: control socket path is already in use: ${path}`), {
+    code: "EADDRINUSE",
   });
 }
 
@@ -567,246 +615,286 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       })
     : undefined;
 
-  const server = createServer((incoming, response) => {
-    if (incoming.method === "GET" && incoming.url === "/live") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ status: "live" }));
-      return;
-    }
+  const createRequestHandler =
+    (localControl: boolean) => (incoming: IncomingMessage, response: ServerResponse) => {
+      if (localControl && !isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (incoming.method === "GET" && incoming.url === "/live") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "live" }));
+        return;
+      }
 
-    if (incoming.method === "GET" && incoming.url === "/ready") {
-      const ready =
-        runtimeAvailable &&
-        runtimeConfiguration.status === "ready" &&
-        scheduler.snapshot().length > 0;
-      writeJson(response, ready ? 200 : 503, { status: ready ? "ready" : "not-ready" });
-      return;
-    }
+      if (incoming.method === "GET" && incoming.url === "/ready") {
+        const ready =
+          runtimeAvailable &&
+          runtimeConfiguration.status === "ready" &&
+          scheduler.snapshot().length > 0;
+        writeJson(response, ready ? 200 : 503, { status: ready ? "ready" : "not-ready" });
+        return;
+      }
 
-    if (incoming.method === "POST" && incoming.url === "/subscriptions/local") {
-      if (
-        !options.adminToken ||
-        incoming.headers.authorization !== `Bearer ${options.adminToken}`
-      ) {
-        response.writeHead(401, { "www-authenticate": "Bearer" });
+      if (incoming.method === "POST" && incoming.url === "/subscriptions/local") {
+        if (
+          !options.adminToken ||
+          incoming.headers.authorization !== `Bearer ${options.adminToken}`
+        ) {
+          response.writeHead(401, { "www-authenticate": "Bearer" });
+          response.end();
+          return;
+        }
+        readBody(incoming)
+          .then(importLocalSubscription)
+          .then((revision) => {
+            response.writeHead(201, { "content-type": "application/json" });
+            response.end(
+              JSON.stringify({
+                nodes: revision.mihomoConfig.listeners.map((listener) => ({
+                  name: listener.proxy,
+                  listener: { host: listener.listen, port: listener.port },
+                })),
+              }),
+            );
+          })
+          .catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            const status = message.includes("runtime") || message.includes("listener") ? 503 : 422;
+            response.writeHead(status, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: message }));
+          });
+        return;
+      }
+
+      if (incoming.method === "POST" && incoming.url === "/subscriptions/remote") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        readBody(incoming)
+          .then((body) => parseRemoteSubscriptionRequest(body))
+          .then((url) => state.createRemoteSubscription(url))
+          .then((created) => {
+            writeJson(response, 202, {
+              operationId: created.operationId,
+              revisionId: created.subscriptionRevisionId,
+              status: "queued",
+              subscriptionId: created.subscriptionId,
+            });
+            remoteOperations?.enqueue(created.operationId, created.subscriptionId);
+          })
+          .catch((error: unknown) => {
+            writeJson(response, 422, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        return;
+      }
+
+      const subscriptionMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)$/);
+      if (incoming.method === "GET" && subscriptionMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        const subscription = state?.getSubscription(subscriptionMatch[1] as string);
+        if (!subscription) {
+          writeJson(response, 404, { error: "subscription not found" });
+          return;
+        }
+        writeJson(response, 200, {
+          kind: subscription.kind,
+          subscriptionId: subscription.id,
+          ...(subscription.kind === "remote"
+            ? {
+                url: localControl
+                  ? subscription.locator
+                  : redactSubscriptionUrl(subscription.locator),
+              }
+            : {}),
+        });
+        return;
+      }
+
+      const operationMatch = incoming.url?.match(/^\/operations\/([^/]+)$/);
+      if (incoming.method === "GET" && operationMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        const operation = state?.getOperation(operationMatch[1] as string);
+        if (!operation) {
+          writeJson(response, 404, { error: "operation not found" });
+          return;
+        }
+        writeJson(response, 200, {
+          ...(operation.failure ? { failure: operation.failure } : {}),
+          history: operation.history,
+          operationId: operation.id,
+          ...(operation.subscriptionRevisionId === undefined
+            ? {}
+            : { revisionId: operation.subscriptionRevisionId }),
+          status: operation.status,
+          subscriptionId: operation.subscriptionId,
+        });
+        return;
+      }
+
+      const revisionMatch = incoming.url?.match(/^\/revisions\/(\d+)$/);
+      if (incoming.method === "GET" && revisionMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        const revision = state?.getRevision(Number(revisionMatch[1]));
+        if (!revision) {
+          writeJson(response, 404, { error: "revision not found" });
+          return;
+        }
+        writeJson(response, 200, {
+          forced: revision.forced,
+          history: revision.history,
+          nodeCount: revision.nodeCount,
+          revisionId: revision.subscriptionRevisionId,
+          status: revision.status,
+          subscriptionId: revision.subscriptionId,
+          ...(revision.suspiciousReason === undefined
+            ? {}
+            : { suspiciousReason: revision.suspiciousReason }),
+        });
+        return;
+      }
+
+      const nodeAliasMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/alias$/);
+      if (incoming.method === "PUT" && nodeAliasMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        readBody(incoming)
+          .then(parseNodeAliasRequest)
+          .then((alias) =>
+            withControlPlaneLock(() => {
+              const logicalNodeId = decodeNodeLogicalId(nodeAliasMatch[1] as string);
+              if (!scheduler.hasCandidate(logicalNodeId)) {
+                throw new NodeAliasTargetNotFoundError(`active node not found: ${logicalNodeId}`);
+              }
+              state.saveNodeAlias(logicalNodeId, alias);
+              if (!scheduler.setSelectors(logicalNodeId, [alias])) {
+                throw new Error(`active node disappeared while saving alias: ${logicalNodeId}`);
+              }
+              writeJson(response, 200, { alias, nodeId: logicalNodeId });
+            }),
+          )
+          .catch((error: unknown) => {
+            const status =
+              error instanceof NodeAliasConflictError
+                ? 409
+                : error instanceof NodeAliasTargetNotFoundError
+                  ? 404
+                  : error instanceof NodeAliasRequestError
+                    ? 422
+                    : 500;
+            writeJson(response, status, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        return;
+      }
+
+      const forceRevisionMatch = incoming.url?.match(/^\/revisions\/(\d+)\/force$/);
+      if (incoming.method === "POST" && forceRevisionMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state || !remoteOperations) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        try {
+          const operation = state.createForceOperation(Number(forceRevisionMatch[1]));
+          writeJson(response, 202, {
+            operationId: operation.id,
+            revisionId: operation.subscriptionRevisionId,
+            status: operation.status,
+            subscriptionId: operation.subscriptionId,
+          });
+          remoteOperations.enqueueForce(operation.id, operation.subscriptionRevisionId as number);
+        } catch (error) {
+          writeJson(response, error instanceof RevisionForceConflictError ? 409 : 404, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
+      const refreshMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)\/refresh$/);
+      if (incoming.method === "POST" && refreshMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        try {
+          const operation = state.createRefreshOperation(refreshMatch[1] as string);
+          writeJson(response, 202, {
+            operationId: operation.id,
+            revisionId: operation.subscriptionRevisionId,
+            status: operation.status,
+            subscriptionId: operation.subscriptionId,
+          });
+          remoteOperations?.enqueue(operation.id, operation.subscriptionId);
+        } catch (error) {
+          writeJson(response, 404, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
+      if (localControl) {
+        writeJson(response, 404, { error: "management route not found" });
+        return;
+      }
+
+      const route = authorizeProxyRequest(
+        incoming.headers["proxy-authorization"],
+        options.proxyAuthentication,
+      );
+      if (route === undefined) {
+        rejectHttpProxyAuthentication(response);
+        return;
+      }
+      if (!isAbsoluteHttpUrl(incoming.url)) {
+        response.writeHead(400);
         response.end();
         return;
       }
-      readBody(incoming)
-        .then(importLocalSubscription)
-        .then((revision) => {
-          response.writeHead(201, { "content-type": "application/json" });
-          response.end(
-            JSON.stringify({
-              nodes: revision.mihomoConfig.listeners.map((listener) => ({
-                name: listener.proxy,
-                listener: { host: listener.listen, port: listener.port },
-              })),
-            }),
-          );
-        })
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          const status = message.includes("runtime") || message.includes("listener") ? 503 : 422;
-          response.writeHead(status, { "content-type": "application/json" });
-          response.end(JSON.stringify({ error: message }));
-        });
-      return;
-    }
-
-    if (incoming.method === "POST" && incoming.url === "/subscriptions/remote") {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      if (!state) {
-        writeJson(response, 503, { error: "durable control state is not configured" });
-        return;
-      }
-      readBody(incoming)
-        .then((body) => parseRemoteSubscriptionRequest(body))
-        .then((url) => state.createRemoteSubscription(url))
-        .then((created) => {
-          writeJson(response, 202, {
-            operationId: created.operationId,
-            revisionId: created.subscriptionRevisionId,
-            status: "queued",
-            subscriptionId: created.subscriptionId,
-          });
-          remoteOperations?.enqueue(created.operationId, created.subscriptionId);
-        })
-        .catch((error: unknown) => {
-          writeJson(response, 422, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      return;
-    }
-
-    const operationMatch = incoming.url?.match(/^\/operations\/([^/]+)$/);
-    if (incoming.method === "GET" && operationMatch) {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      const operation = state?.getOperation(operationMatch[1] as string);
-      if (!operation) {
-        writeJson(response, 404, { error: "operation not found" });
-        return;
-      }
-      writeJson(response, 200, {
-        ...(operation.failure ? { failure: operation.failure } : {}),
-        history: operation.history,
-        operationId: operation.id,
-        ...(operation.subscriptionRevisionId === undefined
-          ? {}
-          : { revisionId: operation.subscriptionRevisionId }),
-        status: operation.status,
-        subscriptionId: operation.subscriptionId,
-      });
-      return;
-    }
-
-    const revisionMatch = incoming.url?.match(/^\/revisions\/(\d+)$/);
-    if (incoming.method === "GET" && revisionMatch) {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      const revision = state?.getRevision(Number(revisionMatch[1]));
-      if (!revision) {
-        writeJson(response, 404, { error: "revision not found" });
-        return;
-      }
-      writeJson(response, 200, {
-        forced: revision.forced,
-        history: revision.history,
-        nodeCount: revision.nodeCount,
-        revisionId: revision.subscriptionRevisionId,
-        status: revision.status,
-        subscriptionId: revision.subscriptionId,
-        ...(revision.suspiciousReason === undefined
-          ? {}
-          : { suspiciousReason: revision.suspiciousReason }),
-      });
-      return;
-    }
-
-    const nodeAliasMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/alias$/);
-    if (incoming.method === "PUT" && nodeAliasMatch) {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      if (!state) {
-        writeJson(response, 503, { error: "durable control state is not configured" });
-        return;
-      }
-      readBody(incoming)
-        .then(parseNodeAliasRequest)
-        .then((alias) =>
-          withControlPlaneLock(() => {
-            const logicalNodeId = decodeNodeLogicalId(nodeAliasMatch[1] as string);
-            if (!scheduler.hasCandidate(logicalNodeId)) {
-              throw new NodeAliasTargetNotFoundError(`active node not found: ${logicalNodeId}`);
-            }
-            state.saveNodeAlias(logicalNodeId, alias);
-            if (!scheduler.setSelectors(logicalNodeId, [alias])) {
-              throw new Error(`active node disappeared while saving alias: ${logicalNodeId}`);
-            }
-            writeJson(response, 200, { alias, nodeId: logicalNodeId });
-          }),
-        )
-        .catch((error: unknown) => {
-          const status =
-            error instanceof NodeAliasConflictError
-              ? 409
-              : error instanceof NodeAliasTargetNotFoundError
-                ? 404
-                : error instanceof NodeAliasRequestError
-                  ? 422
-                  : 500;
-          writeJson(response, status, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      return;
-    }
-
-    const forceRevisionMatch = incoming.url?.match(/^\/revisions\/(\d+)\/force$/);
-    if (incoming.method === "POST" && forceRevisionMatch) {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      if (!state || !remoteOperations) {
-        writeJson(response, 503, { error: "durable control state is not configured" });
-        return;
-      }
-      try {
-        const operation = state.createForceOperation(Number(forceRevisionMatch[1]));
-        writeJson(response, 202, {
-          operationId: operation.id,
-          revisionId: operation.subscriptionRevisionId,
-          status: operation.status,
-          subscriptionId: operation.subscriptionId,
-        });
-        remoteOperations.enqueueForce(operation.id, operation.subscriptionRevisionId as number);
-      } catch (error) {
-        writeJson(response, error instanceof RevisionForceConflictError ? 409 : 404, {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      return;
-    }
-
-    const refreshMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)\/refresh$/);
-    if (incoming.method === "POST" && refreshMatch) {
-      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
-        rejectAdminAuthentication(response);
-        return;
-      }
-      if (!state) {
-        writeJson(response, 503, { error: "durable control state is not configured" });
-        return;
-      }
-      try {
-        const operation = state.createRefreshOperation(refreshMatch[1] as string);
-        writeJson(response, 202, {
-          operationId: operation.id,
-          revisionId: operation.subscriptionRevisionId,
-          status: operation.status,
-          subscriptionId: operation.subscriptionId,
-        });
-        remoteOperations?.enqueue(operation.id, operation.subscriptionId);
-      } catch (error) {
-        writeJson(response, 404, {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      return;
-    }
-
-    const route = authorizeProxyRequest(
-      incoming.headers["proxy-authorization"],
-      options.proxyAuthentication,
-    );
-    if (route === undefined) {
-      rejectHttpProxyAuthentication(response);
-      return;
-    }
-    if (!isAbsoluteHttpUrl(incoming.url)) {
-      response.writeHead(400);
-      response.end();
-      return;
-    }
-    void forwardHttpProxyRequest(incoming, response, route, acquirePreconnectedRoute);
-  });
+      void forwardHttpProxyRequest(incoming, response, route, acquirePreconnectedRoute);
+    };
+  const server = createServer(createRequestHandler(false));
+  const controlServer = options.controlSocketPath
+    ? createServer(createRequestHandler(true))
+    : undefined;
 
   const closeStartupResources = async () => {
     stopWatchingRuntime();
     await remoteOperations?.close();
     await crashRecovery?.close();
+    await closeServerIfListening(controlServer);
     await closeRuntimeAndState();
   };
   server.on("connect", (incoming, clientSocket, head) => {
@@ -829,6 +917,18 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   });
 
   try {
+    if (controlServer && options.controlSocketPath) {
+      await mkdir(dirname(options.controlSocketPath), { mode: 0o700, recursive: true });
+      await prepareControlSocketPath(options.controlSocketPath);
+      await new Promise<void>((resolve, reject) => {
+        controlServer.once("error", reject);
+        controlServer.listen(options.controlSocketPath, () => {
+          controlServer.off("error", reject);
+          resolve();
+        });
+      });
+      await chmod(options.controlSocketPath, 0o600);
+    }
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(options.port, options.host, () => {
@@ -875,6 +975,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   let closed = false;
   return {
     address: { host: options.host, port: address.port },
+    ...(options.controlSocketPath === undefined
+      ? {}
+      : { controlSocketPath: options.controlSocketPath }),
     close: async () => {
       if (closed) {
         return;
@@ -891,7 +994,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
       const operationsClosing = remoteOperations?.close();
       try {
-        await closeServer(server);
+        await Promise.all([closeServer(server), closeServerIfListening(controlServer)]);
         await operationsClosing;
         if (recoveryClosing) {
           await waitForBoundedCompletion(recoveryClosing, 1_000);
@@ -1035,7 +1138,12 @@ function parseRemoteSubscriptionRequest(body: string): string {
   if (typeof document.url !== "string") {
     throw new Error("remote subscription URL is required");
   }
-  const url = new URL(document.url);
+  let url: URL;
+  try {
+    url = new URL(document.url);
+  } catch {
+    throw new Error("remote subscription URL must be valid");
+  }
   if (url.protocol !== "https:") {
     throw new Error("remote subscription URL must use HTTPS");
   }

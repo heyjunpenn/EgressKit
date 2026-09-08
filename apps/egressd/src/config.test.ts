@@ -18,6 +18,7 @@ test("the simulated Mihomo listener must use a loopback host", () => {
 
 test("proxy authentication is enabled by default", () => {
   assert.deepEqual(loadConfig({}), {
+    controlSocketPath: join(homedir(), ".local", "state", "egresskit", "egressd.sock"),
     host: "127.0.0.1",
     port: 8787,
     proxyAuthentication: { tokens: [] },
@@ -91,6 +92,7 @@ test("pre-connect failover attempts and timeout are configurable within hard bou
       EGRESSKIT_PRECONNECT_TIMEOUT_MS: "2500",
     }),
     {
+      controlSocketPath: join(homedir(), ".local", "state", "egresskit", "egressd.sock"),
       host: "127.0.0.1",
       port: 8787,
       preconnectAttempts: 4,
@@ -119,6 +121,7 @@ test("session resource limits and expirations are configurable positive integers
       EGRESSKIT_SESSION_MAX_CONCURRENT_CONNECTIONS: "50",
     }),
     {
+      controlSocketPath: join(homedir(), ".local", "state", "egresskit", "egressd.sock"),
       host: "127.0.0.1",
       port: 8787,
       proxyAuthentication: { tokens: [] },
