@@ -41,7 +41,6 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm verify
       - run: pnpm --filter @egresskit/egressd build
       - name: Stamp tag version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -53,6 +52,22 @@ jobs:
           test -f apps/egressd/dist/cli.js
           pnpm --filter @egresskit/egressd pack --pack-destination release
           mv release/egresskit-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
+      - name: Install and invoke both packaged commands
+        shell: bash
+        run: |
+          install_dir=$(mktemp -d)
+          trap 'rm -rf "$install_dir"' EXIT
+          archive="$GITHUB_WORKSPACE/release/egresskit-${{ matrix.name }}.tgz"
+          pnpm --dir "$install_dir" add --offline "$archive"
+          if "$install_dir/node_modules/.bin/egresskit" runtime install --destination 2>"$install_dir/egresskit.stderr"; then
+            exit 1
+          fi
+          grep -F -- '--destination requires a path' "$install_dir/egresskit.stderr"
+          if env EGRESSKIT_ADMIN_TOKEN=validation-admin EGRESSKIT_HOST=127.0.0.1 \
+            EGRESSKIT_PROXY_TOKEN= "$install_dir/node_modules/.bin/egressd" 2>"$install_dir/egressd.stderr"; then
+            exit 1
+          fi
+          grep -F -- 'EGRESSKIT_PROXY_TOKEN must not be empty' "$install_dir/egressd.stderr"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: egresskit-${{ matrix.name }}

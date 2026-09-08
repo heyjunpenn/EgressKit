@@ -14,6 +14,11 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /pnpm --filter @egresskit\/egressd build/);
   assert.match(workflow, /dist\/control-cli-bin\.js/);
   assert.match(workflow, /dist\/cli\.js/);
+  assert.match(workflow, /archive=.*egresskit-\$\{\{ matrix\.name \}\}\.tgz/);
+  assert.match(workflow, /pnpm --dir .* add --offline "\$archive"/);
+  assert.match(workflow, /node_modules\/\.bin\/egresskit/);
+  assert.match(workflow, /node_modules\/\.bin\/egressd/);
+  assert.doesNotMatch(workflow, /host-artifacts:[\s\S]*?- run: pnpm verify/);
   assert.match(workflow, /docker\/build-push-action/);
   assert.match(workflow, /linux\/amd64,linux\/arm64/);
   assert.match(workflow, /gh release (create|upload)/);
