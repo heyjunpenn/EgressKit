@@ -130,7 +130,7 @@ test("a hung source times out without permanently blocking later operations", as
   let requestNumber = 0;
   const fixture = await startSubscriptionFixture(t, (response) => {
     requestNumber += 1;
-    if (requestNumber === 1) {
+    if (requestNumber <= 3) {
       response.writeHead(200);
       response.flushHeaders();
       return undefined;
@@ -144,6 +144,10 @@ test("a hung source times out without permanently blocking later operations", as
     host: "127.0.0.1",
     mihomoRuntime: successfulRuntime([]),
     port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async () => undefined,
+    },
     remoteSubscriptionTimeoutMs: 20,
     stateDirectory,
   });
@@ -163,6 +167,259 @@ test("a hung source times out without permanently blocking later operations", as
   ]);
   assert.equal(timedOut.body.failure?.reason, "remote subscription request timed out");
   assert.equal(succeeded.body.status, "succeeded");
+  assert.equal(requestNumber, 4);
+});
+
+test("temporary subscription failures retry with bounded exponential backoff", async (t) => {
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    await t.test(String(status), async (subtest) => {
+      const stateDirectory = await temporaryStateDirectory(subtest);
+      const delays: number[] = [];
+      let requests = 0;
+      const fixture = await startSubscriptionFixture(subtest, () => {
+        requests += 1;
+        return requests < 3
+          ? { body: "temporarily unavailable", status }
+          : { body: VALID_SUBSCRIPTION, status: 200 };
+      });
+      const daemon = await startEgressd({
+        adminToken: "admin-token",
+        checkMihomoListener: async () => undefined,
+        fetchSubscription: async (_url, options) => fetch(fixture, options),
+        host: "127.0.0.1",
+        mihomoRuntime: successfulRuntime([]),
+        port: 0,
+        remoteOperationClock: {
+          now: () => 0,
+          sleep: async (milliseconds) => {
+            delays.push(milliseconds);
+          },
+        },
+        stateDirectory,
+      });
+      subtest.after(() => daemon.close());
+
+      const created = await adminJson(daemon.address, "/subscriptions/remote", {
+        body: { url: `https://provider.example/retry-${status}` },
+        method: "POST",
+      });
+      const operation = await waitForTerminalOperation(
+        daemon.address,
+        created.body.operationId as string,
+      );
+
+      assert.equal(operation.body.status, "succeeded");
+      assert.equal(requests, 3);
+      assert.deepEqual(delays, [1_000, 2_000]);
+    });
+  }
+});
+
+test("retrying hanging error responses releases every response body", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let cancelledBodies = 0;
+  let requests = 0;
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async () => {
+      requests += 1;
+      return new Response(
+        new ReadableStream({
+          cancel: () => {
+            cancelledBodies += 1;
+          },
+        }),
+        { status: 503 },
+      );
+    },
+    host: "127.0.0.1",
+    port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async () => undefined,
+    },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/hanging-503" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+  await daemon.close();
+
+  assert.equal(operation.body.status, "failed");
+  assert.equal(requests, 3);
+  assert.equal(cancelledBodies, 3);
+});
+
+test("network failures retry only up to the operation attempt limit", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const delays: number[] = [];
+  let requests = 0;
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async () => {
+      requests += 1;
+      throw new TypeError("getaddrinfo ENOTFOUND secret.provider.example");
+    },
+    host: "127.0.0.1",
+    port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/dns-failure?token=secret" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+
+  assert.equal(operation.body.status, "failed");
+  assert.equal(operation.body.failure?.stage, "fetching");
+  assert.equal(operation.body.failure?.reason, "remote subscription request failed");
+  assert.equal(requests, 3);
+  assert.deepEqual(delays, [1_000, 2_000]);
+  assert.doesNotMatch(JSON.stringify(operation.body), /secret\.provider|token=secret/);
+});
+
+test("a bounded Retry-After overrides local backoff for 429", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const delays: number[] = [];
+  let requests = 0;
+  const fixture = await startSubscriptionFixture(t, (response) => {
+    requests += 1;
+    if (requests === 1) {
+      response.setHeader("retry-after", "7");
+      return { body: "rate limited", status: 429 };
+    }
+    if (requests === 2) {
+      response.setHeader("retry-after", "120");
+      return { body: "rate limited", status: 429 };
+    }
+    return { body: VALID_SUBSCRIPTION, status: 200 };
+  });
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (_url, options) => fetch(fixture, options),
+    host: "127.0.0.1",
+    mihomoRuntime: successfulRuntime([]),
+    port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/rate-limited" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+
+  assert.equal(operation.body.status, "succeeded");
+  assert.equal(requests, 3);
+  assert.deepEqual(delays, [7_000, 2_000]);
+});
+
+test("invalid and non-HTTPS subscription URLs are rejected without fetching", async (t) => {
+  let fetches = 0;
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async () => {
+      fetches += 1;
+      return new Response(VALID_SUBSCRIPTION);
+    },
+    host: "127.0.0.1",
+    port: 0,
+    stateDirectory: await temporaryStateDirectory(t),
+  });
+  t.after(() => daemon.close());
+
+  for (const url of ["not a URL", "http://provider.example/subscription"]) {
+    const response = await adminJson(daemon.address, "/subscriptions/remote", {
+      body: { url },
+      method: "POST",
+    });
+    assert.equal(response.status, 422);
+  }
+  assert.equal(fetches, 0);
+});
+
+test("authentication, format, and schema failures wait for manual refresh", async (t) => {
+  const cases = [
+    { expectedStage: "fetching", source: "unauthorized", status: 401 },
+    { expectedStage: "fetching", source: "forbidden", status: 403 },
+    { expectedStage: "fetching", source: "not implemented", status: 501 },
+    { expectedStage: "parsing", source: "proxies: [", status: 200 },
+    {
+      expectedStage: "validating",
+      source: "proxies: [{ name: invalid, type: vless }]",
+      status: 200,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(`${scenario.status}-${scenario.expectedStage}`, async (subtest) => {
+      const stateDirectory = await temporaryStateDirectory(subtest);
+      let requests = 0;
+      const delays: number[] = [];
+      const fixture = await startSubscriptionFixture(subtest, () => {
+        requests += 1;
+        return { body: scenario.source, status: scenario.status };
+      });
+      const daemon = await startEgressd({
+        adminToken: "admin-token",
+        fetchSubscription: async (_url, options) => fetch(fixture, options),
+        host: "127.0.0.1",
+        mihomoRuntime: successfulRuntime([]),
+        port: 0,
+        remoteOperationClock: {
+          now: () => 0,
+          sleep: async (milliseconds) => {
+            delays.push(milliseconds);
+          },
+        },
+        stateDirectory,
+      });
+      subtest.after(() => daemon.close());
+
+      const created = await adminJson(daemon.address, "/subscriptions/remote", {
+        body: { url: `https://provider.example/permanent-${scenario.expectedStage}` },
+        method: "POST",
+      });
+      const operation = await waitForTerminalOperation(
+        daemon.address,
+        created.body.operationId as string,
+      );
+
+      assert.equal(operation.body.status, "failed");
+      assert.equal(operation.body.failure?.stage, scenario.expectedStage);
+      assert.equal(requests, 1);
+      assert.deepEqual(delays, []);
+    });
+  }
 });
 
 test("a first fetch failure remains queryable without losing the original URL", async (t) => {
@@ -174,6 +431,10 @@ test("a first fetch failure remains queryable without losing the original URL", 
     host: "127.0.0.1",
     mihomoRuntime: successfulRuntime([]),
     port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async () => undefined,
+    },
     stateDirectory,
   });
   const created = await adminJson(daemon.address, "/subscriptions/remote", {
