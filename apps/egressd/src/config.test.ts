@@ -58,3 +58,11 @@ test("proxy token configures data-plane authentication", () => {
 
   assert.deepEqual(config.proxyAuthentication, { tokens: ["proxy-secret"] });
 });
+
+test("state directory configures durable daemon control state", () => {
+  assert.equal(
+    loadConfig({ EGRESSKIT_STATE_DIRECTORY: "/var/lib/egresskit" }).stateDirectory,
+    "/var/lib/egresskit",
+  );
+  assert.throws(() => loadConfig({ EGRESSKIT_STATE_DIRECTORY: "" }), /must not be empty/);
+});

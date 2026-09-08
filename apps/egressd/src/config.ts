@@ -8,6 +8,7 @@ export interface EgressdConfig {
   port: number;
   mihomoListener?: URL;
   proxyAuthentication: ProxyAuthentication;
+  stateDirectory?: string;
 }
 
 function parsePort(value: string | undefined): number {
@@ -47,6 +48,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   if (proxyToken === "") {
     throw new Error("EGRESSKIT_PROXY_TOKEN must not be empty");
   }
+  if (environment.EGRESSKIT_STATE_DIRECTORY === "") {
+    throw new Error("EGRESSKIT_STATE_DIRECTORY must not be empty");
+  }
 
   return {
     ...(environment.EGRESSKIT_ADMIN_TOKEN === undefined
@@ -55,6 +59,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     ...(allowUnsafeUnauthenticatedProxy ? { allowUnsafeUnauthenticatedProxy: true as const } : {}),
     host,
     port: parsePort(environment.EGRESSKIT_PORT),
+    ...(environment.EGRESSKIT_STATE_DIRECTORY === undefined
+      ? {}
+      : { stateDirectory: environment.EGRESSKIT_STATE_DIRECTORY }),
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
     proxyAuthentication:
       proxyAuthSetting === "disabled"

@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { connect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 
 import { startEgressd } from "./daemon.js";
@@ -53,6 +56,8 @@ test("unauthenticated non-loopback proxy listeners require an explicit warned ov
 });
 
 test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-cli-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
   const mihomo = await startSimulatedMihomoListener();
   t.after(() => mihomo.close());
   const child = spawn(process.execPath, ["dist/cli.js"], {
@@ -63,6 +68,7 @@ test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) 
       EGRESSKIT_ADMIN_TOKEN: "cli-admin-token",
       EGRESSKIT_MIHOMO_HTTP_LISTENER: `http://${mihomo.host}:${mihomo.port}`,
       EGRESSKIT_PORT: "0",
+      EGRESSKIT_STATE_DIRECTORY: stateDirectory,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -161,6 +167,73 @@ test("an HTTP proxy request reaches the target through the simulated Mihomo list
   assert.deepEqual(JSON.parse(response.body), observedRequests[0]);
   assert.equal(observedRequests[0]?.url, "/observed?through=egresskit");
   assert.equal(observedRequests[0]?.headers.via, "1.1 egresskit, 1.1 simulated-mihomo");
+});
+
+test("a restart restores the last valid revision and forwards without reimporting its source", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-daemon-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const appliedConfigs: unknown[] = [];
+  const options = {
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false as const,
+    stateDirectory,
+    mihomoRuntime: {
+      apply: async (
+        config: Parameters<
+          NonNullable<Parameters<typeof startEgressd>[0]["mihomoRuntime"]>["apply"]
+        >[0],
+      ) => {
+        appliedConfigs.push(config);
+        return new Map([["primary", new URL(`http://${mihomo.host}:${mihomo.port}`)]]);
+      },
+    },
+  };
+  const first = await startEgressd(options);
+  const imported = await fetch(
+    `http://${first.address.host}:${first.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: primary, type: vless, server: proxy.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+  await first.close();
+
+  const restored = await startEgressd(options);
+  t.after(() => restored.close());
+  const response = await sendProxyRequestResponse(
+    restored.address,
+    `http://${target.host}:${target.port}/restored`,
+    "GET",
+    "",
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(observedRequests[0]?.url, "/restored");
+  assert.equal(appliedConfigs.length, 2);
+  assert.deepEqual(appliedConfigs[1], appliedConfigs[0]);
+});
+
+test("a second daemon cannot own the same state directory", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-daemon-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const first = await startEgressd({ host: "127.0.0.1", port: 0, stateDirectory });
+  t.after(() => first.close());
+
+  await assert.rejects(
+    startEgressd({ host: "127.0.0.1", port: 0, stateDirectory }),
+    /already owned by another daemon/,
+  );
 });
 
 test("HTTP proxy requests require valid standard Basic proxy credentials", async (t) => {

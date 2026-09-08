@@ -16,6 +16,7 @@ import {
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
+import { openControlState, type PersistedNodeGeneration } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -32,6 +33,7 @@ export interface EgressdOptions {
   port: number;
   proxyAuthentication?: ProxyAuthentication;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
+  stateDirectory?: string;
 }
 
 export interface EgressdLogEvent {
@@ -86,13 +88,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ]
       : [],
   );
-  const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
+  const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+
+  const activateRevision = async (
+    revision: ImportedVlessRevision,
+    persistedNodes?: readonly PersistedNodeGeneration[],
+  ): Promise<void> => {
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
-    }
-    const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
-    if (revision.nodes.length === 0) {
-      throw new Error("subscription contains no VLESS nodes");
     }
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
     for (const node of revision.nodes) {
@@ -103,7 +106,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     }
     scheduler.replaceCandidates(
       revision.nodes.map((node) => {
-        const id = localLogicalNodeId(node.name);
+        const id =
+          persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
+          localLogicalNodeId(node.name);
         return createSchedulerCandidate(
           id,
           listeners.get(node.name) as URL,
@@ -111,6 +116,28 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         );
       }),
     );
+  };
+
+  try {
+    const restored = state?.loadActiveRevision();
+    if (restored) {
+      await activateRevision(restored.imported, restored.nodes);
+    }
+  } catch (error) {
+    await state?.close();
+    throw error;
+  }
+
+  const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
+    const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
+    if (revision.nodes.length === 0) {
+      throw new Error("subscription contains no VLESS nodes");
+    }
+    await activateRevision(revision);
+    state?.saveActiveRevision({
+      imported: revision,
+      source: { id: "local", kind: "local", locator: "inline" },
+    });
     return revision;
   };
 
@@ -227,23 +254,40 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     handleConnect(incoming, clientSocket, head, lease.candidate.listener);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.port, options.host, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(options.port, options.host, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    await state?.close();
+    throw error;
+  }
 
   const address = server.address();
   if (!address || typeof address === "string") {
     await closeServer(server);
+    await state?.close();
     throw new Error("egressd did not bind a TCP address");
   }
 
+  let closed = false;
   return {
     address: { host: options.host, port: address.port },
-    close: () => closeServer(server),
+    close: async () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      try {
+        await closeServer(server);
+      } finally {
+        await state?.close();
+      }
+    },
     importLocalSubscription,
   };
 }
