@@ -167,13 +167,19 @@ interface RuntimeConfigurationState {
 
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
+    const forceCloseTimer = setTimeout(() => {
+      server.closeAllConnections();
+      resolve();
+    }, 1_000);
     server.close((error) => {
+      clearTimeout(forceCloseTimer);
       if (error) {
         reject(error);
         return;
       }
       resolve();
     });
+    server.closeIdleConnections();
   });
 }
 

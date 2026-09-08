@@ -15,7 +15,6 @@ import { startSimulatedMihomoListener, startTargetServer } from "./testing/harne
 
 test("HTTP redacts subscription URLs while authenticated local socket access can reveal them", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "egresskit-control-api-"));
-  t.after(() => rm(directory, { force: true, recursive: true }));
   const socketPath = join(directory, "egressd.sock");
   const daemon = await startEgressd({
     adminToken: "admin-secret",
@@ -37,7 +36,10 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
     port: 0,
     stateDirectory: join(directory, "state"),
   });
-  t.after(() => daemon.close());
+  t.after(async () => {
+    await daemon.close();
+    await rm(directory, { force: true, recursive: true });
+  });
   assert.equal((await stat(socketPath)).mode & 0o777, 0o600);
   const secretUrl = "https://provider.example/subscription?token=secret";
   const created = await socketJson(socketPath, "POST", "/subscriptions/remote", "admin-secret", {
@@ -63,7 +65,7 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
 
   const remote = await fetch(
     `http://${daemon.address.host}:${daemon.address.port}/subscriptions/${subscriptionId}`,
-    { headers: { authorization: "Bearer admin-secret" } },
+    { headers: { authorization: "Bearer admin-secret", connection: "close" } },
   );
   const remoteBody = (await remote.json()) as { url: string };
   assert.equal(remote.status, 200);
@@ -76,6 +78,7 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
       body: JSON.stringify({ url: "not-a-url-with-secret" }),
       headers: {
         authorization: "Bearer admin-secret",
+        connection: "close",
         "content-type": "application/json",
       },
       method: "POST",
@@ -87,14 +90,14 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
     `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
     {
       body: "proxies:\n  - { name: local, type: vless, server: local.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n",
-      headers: { authorization: "Bearer admin-secret" },
+      headers: { authorization: "Bearer admin-secret", connection: "close" },
       method: "POST",
     },
   );
   assert.equal(localImport.status, 201);
   const httpLocal = await fetch(
     `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
-    { headers: { authorization: "Bearer admin-secret" } },
+    { headers: { authorization: "Bearer admin-secret", connection: "close" } },
   );
   assert.deepEqual(await httpLocal.json(), { kind: "local", subscriptionId: "local" });
   assert.deepEqual(
@@ -105,14 +108,11 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
 
 test("authenticated metrics and structured logs expose signals without seeded secrets", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "egresskit-observability-"));
-  t.after(() => rm(directory, { force: true, recursive: true }));
   const events: unknown[] = [];
   const privateUuid = "123e4567-e89b-12d3-a456-426614174000";
   const secretUrl = `https://private-user:private-password@provider.example:8443/private/path?token=subscription-secret&uuid=${privateUuid}#private`;
   const target = await startTargetServer([]);
-  t.after(() => target.close());
   const mihomo = await startSimulatedMihomoListener();
-  t.after(() => mihomo.close());
   const stateDirectory = join(directory, "state");
   const daemon = await startEgressd({
     adminToken: "controller-secret",
@@ -124,14 +124,20 @@ test("authenticated metrics and structured logs expose signals without seeded se
     proxyAuthentication: { tokens: ["proxy-secret"] },
     stateDirectory,
   });
-  t.after(() => daemon.close());
 
   const unauthenticated = await fetch(
     `http://${daemon.address.host}:${daemon.address.port}/metrics`,
   );
   assert.equal(unauthenticated.status, 401);
+  await unauthenticated.body?.cancel();
   const faultDatabase = new DatabaseSync(join(stateDirectory, "control.sqlite"));
-  t.after(() => faultDatabase.close());
+  t.after(async () => {
+    faultDatabase.close();
+    await daemon.close();
+    await mihomo.close();
+    await target.close();
+    await rm(directory, { force: true, recursive: true });
+  });
   faultDatabase.exec(`
     CREATE TRIGGER reject_observed_subscription
     BEFORE INSERT ON subscriptions
