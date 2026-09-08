@@ -126,6 +126,10 @@ export class RotateScheduler {
     return lease(state);
   }
 
+  hasCandidate(id: string): boolean {
+    return this.#states.some(({ candidate }) => candidate.id === id);
+  }
+
   setSelectors(id: string, selectors: readonly string[]): boolean {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
     if (!state) {

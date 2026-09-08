@@ -888,10 +888,12 @@ test("explicit node ID and alias routing is deterministic and never mutates stic
   assert.equal(await setNodeAlias(daemon.address, "local:second", "primary"), 409);
   assert.equal(await setNodeAlias(daemon.address, "local:second", "backup"), 200);
   assert.equal(await requestThrough("node.backup"), 200);
+  assert.equal(await requestThrough("sticky.session-a"), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
   assert.equal(await requestThrough("node.local%3Afirst"), 200);
   assert.deepEqual(
     observedRequests.map((entry) => entry.headers["x-egresskit-test-exit"]),
-    ["first", "second", "first"],
+    ["first", "second", "first", "first"],
   );
   const tunnelTarget = await startHttpsTarget([]);
   t.after(() => tunnelTarget.close());
@@ -905,6 +907,8 @@ test("explicit node ID and alias routing is deterministic and never mutates stic
     /^HTTP\/1\.1 200 Connection Established/,
   );
   assert.deepEqual(secondSelections, [authority]);
+  assert.equal(await requestThrough("sticky.session-a"), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
 
   assert.equal(await importLocalNodes(daemon.address, ["first"]), 201);
   assert.equal(await requestThrough("node.backup"), 502);
@@ -918,6 +922,82 @@ test("explicit node ID and alias routing is deterministic and never mutates stic
   );
   assert.deepEqual(secondSelections, [authority]);
   assert.equal(await requestThrough("sticky.session-a"), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
+});
+
+test("alias updates serialize with revision activation and remain routable", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-alias-race-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const first = await startSimulatedMihomoListener(undefined, [], [], "first");
+  t.after(() => first.close());
+  const second = await startSimulatedMihomoListener(undefined, [], [], "second");
+  t.after(() => second.close());
+  let releaseSecondApply: (() => void) | undefined;
+  let notifySecondApply: (() => void) | undefined;
+  const secondApplyStarted = new Promise<void>((resolve) => {
+    notifySecondApply = resolve;
+  });
+  const secondApplyReleased = new Promise<void>((resolve) => {
+    releaseSecondApply = resolve;
+  });
+  let applyCount = 0;
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    stateDirectory,
+    mihomoRuntime: {
+      apply: async () => {
+        applyCount += 1;
+        if (applyCount === 2) {
+          notifySecondApply?.();
+          await secondApplyReleased;
+        }
+        return new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]);
+      },
+    },
+  });
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first"]), 201);
+
+  const importing = importLocalNodes(daemon.address, ["first", "second"]);
+  await secondApplyStarted;
+  const aliasing = setNodeAlias(daemon.address, "local:first", "primary");
+  let aliasSettled = false;
+  void aliasing.then(
+    () => {
+      aliasSettled = true;
+    },
+    () => {
+      aliasSettled = true;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const aliasSettledBeforeRelease = aliasSettled;
+  releaseSecondApply?.();
+
+  assert.equal(aliasSettledBeforeRelease, false);
+  assert.equal(await importing, 201);
+  assert.equal(await aliasing, 200);
+  assert.equal(
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/serialized-alias`,
+      "GET",
+      "",
+      {
+        "proxy-authorization": basicProxyAuthorization("node.primary", "proxy-secret"),
+      },
+    ),
+    200,
+  );
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
 });
 
