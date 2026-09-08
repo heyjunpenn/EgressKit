@@ -26,7 +26,7 @@
     "check": "pnpm typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "test": "pnpm run build && node --import tsx --test src/*.test.ts",
+    "test": "pnpm run build && node --import tsx --test --test-concurrency=1 src/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
