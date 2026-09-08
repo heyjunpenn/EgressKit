@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 
 import { startEgressd } from "./daemon.js";
+import type { SessionBindingStore } from "./session.js";
 import { openControlState } from "./state.js";
 import { importLocalVlessYaml } from "./subscription.js";
 import {
@@ -688,6 +689,47 @@ test("concurrent first soft-sticky requests share one binding and obey the conne
   assert.deepEqual(
     observedRequests.map((entry) => entry.headers["x-egresskit-test-exit"]),
     ["first", "first"],
+  );
+});
+
+test("session persistence failures return a controlled proxy error without stopping egressd", async (t) => {
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const failingStore: SessionBindingStore = {
+    countSessionBindings: () => 0,
+    deleteExpiredSessionBindings: () => {
+      throw new Error("injected session storage failure");
+    },
+    getSessionBinding: () => undefined,
+    loadOrCreateSessionHmacKey: () => Buffer.alloc(32, 1),
+    saveSessionBinding: () => undefined,
+    touchSessionBinding: () => undefined,
+  };
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    sessionBindingStore: failingStore,
+  });
+  t.after(() => daemon.close());
+  const authorization = basicProxyAuthorization("sticky.storage-failure", "proxy-secret");
+
+  const response = await sendProxyRequestResponse(
+    daemon.address,
+    "http://example.test/unavailable",
+    "GET",
+    "",
+    { "proxy-authorization": authorization },
+  );
+  assert.equal(response.status, 503);
+  assert.match(
+    await sendConnectRequest(daemon.address, "example.test:443", authorization),
+    /^HTTP\/1\.1 503 Service Unavailable/,
+  );
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
   );
 });
 

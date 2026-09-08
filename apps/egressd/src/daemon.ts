@@ -28,7 +28,12 @@ import {
   type SchedulerLease,
   type SchedulerSignals,
 } from "./scheduler.js";
-import { SessionCapacityError, type SessionClock, SoftStickySessions } from "./session.js";
+import {
+  type SessionBindingStore,
+  SessionCapacityError,
+  type SessionClock,
+  SoftStickySessions,
+} from "./session.js";
 import {
   openControlState,
   type PersistedNodeGeneration,
@@ -56,6 +61,7 @@ export interface EgressdOptions {
   remoteOperationClock?: RemoteOperationClock;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
   sessionAbsoluteTtlMs?: number;
+  sessionBindingStore?: SessionBindingStore;
   sessionClock?: SessionClock;
   sessionIdleTimeoutMs?: number;
   sessionMaximumActiveSessions?: number;
@@ -135,7 +141,11 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ? {}
         : { maximumConcurrentConnections: options.sessionMaximumConcurrentConnections }),
       scheduler,
-      ...(state === undefined ? {} : { store: state }),
+      ...(options.sessionBindingStore === undefined
+        ? state === undefined
+          ? {}
+          : { store: state }
+        : { store: options.sessionBindingStore }),
     });
   } catch (error) {
     await state?.close();
@@ -419,7 +429,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         response.end();
         return;
       }
-      throw error;
+      response.writeHead(503);
+      response.end();
+      return;
     }
     if (lease === "not-implemented") {
       response.writeHead(501);
@@ -476,7 +488,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         clientSocket.end("HTTP/1.1 429 Too Many Requests\r\n\r\n");
         return;
       }
-      throw error;
+      clientSocket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      return;
     }
     if (lease === "not-implemented") {
       clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");

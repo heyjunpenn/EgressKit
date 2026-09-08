@@ -1,6 +1,11 @@
 import { createHmac, randomBytes } from "node:crypto";
 
-import type { RotateScheduler, SchedulerLease } from "./scheduler.js";
+import type { SchedulerLease } from "./scheduler.js";
+
+export interface SessionScheduler {
+  acquire(): SchedulerLease | undefined;
+  acquireById(id: string): SchedulerLease | undefined;
+}
 
 export interface SessionClock {
   now(): number;
@@ -32,7 +37,7 @@ export interface SoftStickySessionOptions {
   idleTimeoutMs?: number;
   maximumActiveSessions?: number;
   maximumConcurrentConnections?: number;
-  scheduler: RotateScheduler;
+  scheduler: SessionScheduler;
   store?: SessionBindingStore;
 }
 
@@ -50,7 +55,7 @@ export class SoftStickySessions {
   readonly #idleTimeoutMs: number;
   readonly #maximumActiveSessions: number;
   readonly #maximumConcurrentConnections: number;
-  readonly #scheduler: RotateScheduler;
+  readonly #scheduler: SessionScheduler;
   readonly #store: SessionBindingStore;
   readonly #activeConnections = new Map<string, number>();
 
@@ -108,9 +113,19 @@ export class SoftStickySessions {
         lastUsedAt: now,
         logicalNodeId: lease.candidate.id,
       };
-      this.#store.saveSessionBinding(identity, binding);
+      try {
+        this.#store.saveSessionBinding(identity, binding);
+      } catch (error) {
+        lease.release();
+        throw error;
+      }
     } else {
-      this.#store.touchSessionBinding(identity, now);
+      try {
+        this.#store.touchSessionBinding(identity, now);
+      } catch (error) {
+        lease.release();
+        throw error;
+      }
     }
 
     this.#activeConnections.set(identity, activeConnections + 1);
@@ -122,13 +137,18 @@ export class SoftStickySessions {
           return;
         }
         released = true;
-        lease.release();
-        this.#store.touchSessionBinding(identity, this.#clock.now());
-        const remaining = (this.#activeConnections.get(identity) ?? 1) - 1;
-        if (remaining === 0) {
-          this.#activeConnections.delete(identity);
-        } else {
-          this.#activeConnections.set(identity, remaining);
+        try {
+          lease.release();
+          this.#store.touchSessionBinding(identity, this.#clock.now());
+        } catch {
+          // Releasing a connection must remain best-effort when durable state is unavailable.
+        } finally {
+          const remaining = (this.#activeConnections.get(identity) ?? 1) - 1;
+          if (remaining === 0) {
+            this.#activeConnections.delete(identity);
+          } else {
+            this.#activeConnections.set(identity, remaining);
+          }
         }
       },
     };
