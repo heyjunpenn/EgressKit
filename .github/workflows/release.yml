@@ -58,7 +58,7 @@ jobs:
           install_dir=$(mktemp -d)
           trap 'rm -rf "$install_dir"' EXIT
           archive="$GITHUB_WORKSPACE/release/egresskit-${{ matrix.name }}.tgz"
-          pnpm --dir "$install_dir" add --offline "$archive"
+          pnpm --dir "$install_dir" add "$archive"
           if "$install_dir/node_modules/.bin/egresskit" runtime install --destination 2>"$install_dir/egresskit.stderr"; then
             exit 1
           fi
