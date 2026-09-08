@@ -24,6 +24,7 @@ export interface RemoteOperationRunnerOptions {
   fetchTimeoutMs?: number;
   clock?: RemoteOperationClock;
   minimumNodes?: number;
+  runControlPlaneOperation?<Result>(operation: () => Promise<Result> | Result): Promise<Result>;
   state: ControlState;
 }
 
@@ -171,20 +172,24 @@ export class RemoteOperationRunner {
   ): Promise<void> {
     setStage("applying");
     this.#options.state.transitionOperation(operationId, "applying");
-    await this.#options.activateRevision(revision, subscription, () => {
-      if (!this.#shuttingDown) {
-        this.#options.state.markRevisionAccepted(subscriptionRevisionId, operationId);
-        setStage("checking");
+    const runControlPlaneOperation =
+      this.#options.runControlPlaneOperation ?? runControlPlaneOperationDirectly;
+    await runControlPlaneOperation(async () => {
+      await this.#options.activateRevision(revision, subscription, () => {
+        if (!this.#shuttingDown) {
+          this.#options.state.markRevisionAccepted(subscriptionRevisionId, operationId);
+          setStage("checking");
+        }
+      });
+      if (this.#shuttingDown) {
+        return;
       }
-    });
-    if (this.#shuttingDown) {
-      return;
-    }
-    this.#options.state.saveActiveRevision({
-      imported: revision,
-      operationId,
-      source: subscription,
-      subscriptionRevisionId,
+      this.#options.state.saveActiveRevision({
+        imported: revision,
+        operationId,
+        source: subscription,
+        subscriptionRevisionId,
+      });
     });
   }
 
@@ -263,6 +268,12 @@ export class RemoteOperationRunner {
       this.#controllers.delete(controller);
     }
   }
+}
+
+async function runControlPlaneOperationDirectly<Result>(
+  operation: () => Promise<Result> | Result,
+): Promise<Result> {
+  return await operation();
 }
 
 class SafeOperationError extends Error {}

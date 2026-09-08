@@ -83,6 +83,14 @@ export class SoftStickySessions {
   }
 
   acquire(sessionKey: string): SchedulerLease | undefined {
+    return this.#acquire(sessionKey, true);
+  }
+
+  acquireStrict(sessionKey: string): SchedulerLease | undefined {
+    return this.#acquire(sessionKey, false);
+  }
+
+  #acquire(sessionKey: string, rebindUnavailable: boolean): SchedulerLease | undefined {
     const identity = createHmac("sha256", this.#hmacKey).update(sessionKey).digest("hex");
     const now = this.#clock.now();
     this.#store.deleteExpiredSessionBindings(now, this.#absoluteTtlMs, this.#idleTimeoutMs, [
@@ -96,6 +104,10 @@ export class SoftStickySessions {
 
     let binding = this.#store.getSessionBinding(identity);
     let lease = binding ? this.#scheduler.acquireById(binding.logicalNodeId) : undefined;
+    if (binding && !lease && !rebindUnavailable) {
+      this.#store.touchSessionBinding(identity, now);
+      return undefined;
+    }
     if (!lease) {
       if (
         !binding &&

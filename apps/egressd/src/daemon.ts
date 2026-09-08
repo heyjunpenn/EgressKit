@@ -27,6 +27,7 @@ import {
   RotateScheduler,
   type SchedulerLease,
   type SchedulerSignals,
+  validateSelectorUniqueness,
 } from "./scheduler.js";
 import {
   type SessionBindingStore,
@@ -35,6 +36,8 @@ import {
   SoftStickySessions,
 } from "./session.js";
 import {
+  NodeAliasConflictError,
+  NodeAliasTargetNotFoundError,
   openControlState,
   type PersistedNodeGeneration,
   RevisionForceConflictError,
@@ -124,6 +127,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       : [],
   );
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
   try {
     softStickySessions = new SoftStickySessions({
@@ -159,10 +163,16 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (route.mode === "sticky") {
       return softStickySessions.acquire(route.sessionKey);
     }
+    if (route.mode === "strict") {
+      return softStickySessions.acquireStrict(route.sessionKey);
+    }
+    if (route.mode === "node") {
+      return scheduler.acquireBySelector(route.selector);
+    }
     return "not-implemented" as const;
   };
 
-  const activateRevision = async (
+  const activateRevisionUnlocked = async (
     revision: ImportedVlessRevision,
     persistedNodes?: readonly PersistedNodeGeneration[],
     logicalIdPrefix = "local",
@@ -171,6 +181,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
     }
+    const identities = revision.nodes.map((node) => ({
+      id:
+        persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
+        `${logicalIdPrefix}:${node.name}`,
+      node,
+    }));
+    let aliases = state?.getNodeAliases() ?? new Map<string, string>();
+    validateSelectorUniqueness(
+      identities.map(({ id }) => ({ id })),
+      [...aliases.values()],
+    );
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
     checking?.();
     for (const node of revision.nodes) {
@@ -180,15 +201,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
       await (options.checkMihomoListener ?? checkListenerReady)(listener);
     }
+    aliases = state?.getNodeAliases() ?? aliases;
+    validateSelectorUniqueness(
+      identities.map(({ id }) => ({ id })),
+      [...aliases.values()],
+    );
     scheduler.replaceCandidates(
-      revision.nodes.map((node) => {
-        const id =
-          persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
-          `${logicalIdPrefix}:${node.name}`;
+      identities.map(({ id, node }) => {
+        const alias = aliases.get(id);
         return createSchedulerCandidate(
           id,
           listeners.get(node.name) as URL,
           options.schedulerSignals?.get(id),
+          alias === undefined ? [] : [alias],
         );
       }),
     );
@@ -197,7 +222,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   try {
     const restored = state?.loadActiveRevision();
     if (restored) {
-      await activateRevision(restored.imported, restored.nodes);
+      await withControlPlaneLock(() => activateRevisionUnlocked(restored.imported, restored.nodes));
     }
   } catch (error) {
     await state?.close();
@@ -209,10 +234,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (revision.nodes.length === 0) {
       throw new Error("subscription contains no VLESS nodes");
     }
-    await activateRevision(revision);
-    state?.saveActiveRevision({
-      imported: revision,
-      source: { id: "local", kind: "local", locator: "inline" },
+    await withControlPlaneLock(async () => {
+      await activateRevisionUnlocked(revision);
+      state?.saveActiveRevision({
+        imported: revision,
+        source: { id: "local", kind: "local", locator: "inline" },
+      });
     });
     return revision;
   };
@@ -220,7 +247,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const remoteOperations = state
     ? new RemoteOperationRunner({
         activateRevision: (revision, subscription, checking) =>
-          activateRevision(revision, undefined, subscription.id, checking),
+          activateRevisionUnlocked(revision, undefined, subscription.id, checking),
         ...(options.fetchSubscription === undefined
           ? {}
           : { fetchSubscription: options.fetchSubscription }),
@@ -233,6 +260,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(options.minimumSubscriptionNodes === undefined
           ? {}
           : { minimumNodes: options.minimumSubscriptionNodes }),
+        runControlPlaneOperation: withControlPlaneLock,
         state,
       })
     : undefined;
@@ -350,6 +378,47 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           ? {}
           : { suspiciousReason: revision.suspiciousReason }),
       });
+      return;
+    }
+
+    const nodeAliasMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/alias$/);
+    if (incoming.method === "PUT" && nodeAliasMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      readBody(incoming)
+        .then(parseNodeAliasRequest)
+        .then((alias) =>
+          withControlPlaneLock(() => {
+            const logicalNodeId = decodeNodeLogicalId(nodeAliasMatch[1] as string);
+            if (!scheduler.hasCandidate(logicalNodeId)) {
+              throw new NodeAliasTargetNotFoundError(`active node not found: ${logicalNodeId}`);
+            }
+            state.saveNodeAlias(logicalNodeId, alias);
+            if (!scheduler.setSelectors(logicalNodeId, [alias])) {
+              throw new Error(`active node disappeared while saving alias: ${logicalNodeId}`);
+            }
+            writeJson(response, 200, { alias, nodeId: logicalNodeId });
+          }),
+        )
+        .catch((error: unknown) => {
+          const status =
+            error instanceof NodeAliasConflictError
+              ? 409
+              : error instanceof NodeAliasTargetNotFoundError
+                ? 404
+                : error instanceof NodeAliasRequestError
+                  ? 422
+                  : 500;
+          writeJson(response, status, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
       return;
     }
 
@@ -570,6 +639,58 @@ function parseRemoteSubscriptionRequest(body: string): string {
     throw new Error("remote subscription URL must use HTTPS");
   }
   return document.url;
+}
+
+function parseNodeAliasRequest(body: string): string {
+  let document: { alias?: unknown };
+  try {
+    document = JSON.parse(body) as { alias?: unknown };
+  } catch {
+    throw new NodeAliasRequestError("node alias request must be valid JSON");
+  }
+  if (
+    typeof document.alias !== "string" ||
+    document.alias.length === 0 ||
+    document.alias.length > 128 ||
+    [...document.alias].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127;
+    })
+  ) {
+    throw new NodeAliasRequestError("node alias must be between 1 and 128 printable characters");
+  }
+  return document.alias;
+}
+
+class NodeAliasRequestError extends Error {}
+
+function decodeNodeLogicalId(encoded: string): string {
+  try {
+    const logicalNodeId = decodeURIComponent(encoded);
+    if (!logicalNodeId) {
+      throw new Error("empty node ID");
+    }
+    return logicalNodeId;
+  } catch {
+    throw new NodeAliasRequestError("node ID must be valid percent-encoded text");
+  }
+}
+
+function createAsyncLock(): <Result>(operation: () => Promise<Result> | Result) => Promise<Result> {
+  let tail = Promise.resolve();
+  return async <Result>(operation: () => Promise<Result> | Result): Promise<Result> => {
+    const previous = tail;
+    let release: () => void = () => undefined;
+    tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  };
 }
 
 function isAuthorizedAdmin(incoming: IncomingMessage, adminToken: string | undefined): boolean {

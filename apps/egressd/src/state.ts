@@ -74,6 +74,9 @@ export interface SubscriptionOperation {
   subscriptionId: string;
 }
 
+export class NodeAliasConflictError extends Error {}
+export class NodeAliasTargetNotFoundError extends Error {}
+
 export interface ControlState extends SessionBindingStore {
   advanceRevision(subscriptionRevisionId: number, status: SubscriptionRevisionStatus): void;
   createForceOperation(subscriptionRevisionId: number): SubscriptionOperation;
@@ -92,6 +95,7 @@ export interface ControlState extends SessionBindingStore {
     reason: string,
   ): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
+  getNodeAliases(): ReadonlyMap<string, string>;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
@@ -101,6 +105,7 @@ export interface ControlState extends SessionBindingStore {
     source: SubscriptionIdentity;
     subscriptionRevisionId?: number;
   }): PersistedActiveRevision;
+  saveNodeAlias(logicalNodeId: string, alias: string): void;
   saveValidatedRevision(subscriptionRevisionId: number, imported: ImportedVlessRevision): void;
   markRevisionAccepted(subscriptionRevisionId: number, operationId: string): void;
   markRevisionSuspicious(subscriptionRevisionId: number, operationId: string, reason: string): void;
@@ -162,12 +167,14 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     failForceOperation: (operationId, subscriptionRevisionId, stage, reason) =>
       failForceOperation(controlDatabase, operationId, subscriptionRevisionId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
+    getNodeAliases: () => getNodeAliases(controlDatabase),
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
+    saveNodeAlias: (logicalNodeId, alias) => saveNodeAlias(controlDatabase, logicalNodeId, alias),
     saveValidatedRevision: (subscriptionRevisionId, imported) =>
       saveValidatedRevision(controlDatabase, subscriptionRevisionId, imported),
     saveSessionBinding: (identity, binding) =>
@@ -251,6 +258,48 @@ function getSessionBinding(
         logicalNodeId: row.logical_node_id,
       }
     : undefined;
+}
+
+function getNodeAliases(database: DatabaseSync): ReadonlyMap<string, string> {
+  const rows = database.prepare("SELECT logical_id, alias FROM node_aliases").all() as Array<{
+    alias: string;
+    logical_id: string;
+  }>;
+  return new Map(rows.map((row) => [row.logical_id, row.alias]));
+}
+
+function saveNodeAlias(database: DatabaseSync, logicalNodeId: string, alias: string): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const activeNode = database
+      .prepare(
+        `SELECT 1
+         FROM node_generations ng
+         JOIN runtime_revisions rr ON rr.subscription_revision_id = ng.revision_id
+         WHERE rr.status = 'active' AND ng.logical_id = ?`,
+      )
+      .get(logicalNodeId);
+    if (!activeNode) {
+      throw new NodeAliasTargetNotFoundError(`active node not found: ${logicalNodeId}`);
+    }
+    const aliasOwner = database
+      .prepare("SELECT logical_id FROM node_aliases WHERE alias = ?")
+      .get(alias) as { logical_id: string } | undefined;
+    const aliasesNodeId = database
+      .prepare("SELECT 1 FROM node_generations WHERE logical_id = ?")
+      .get(alias);
+    if ((aliasOwner && aliasOwner.logical_id !== logicalNodeId) || aliasesNodeId) {
+      throw new NodeAliasConflictError(`node alias conflicts with an existing selector: ${alias}`);
+    }
+    database.prepare("DELETE FROM node_aliases WHERE logical_id = ?").run(logicalNodeId);
+    database
+      .prepare("INSERT INTO node_aliases (alias, logical_id) VALUES (?, ?)")
+      .run(alias, logicalNodeId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function loadOrCreateSessionHmacKey(database: DatabaseSync): Buffer {
@@ -375,6 +424,10 @@ function migrate(database: DatabaseSync): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS node_aliases (
+      alias TEXT PRIMARY KEY,
+      logical_id TEXT NOT NULL UNIQUE
+    );
   `);
   ensureColumn(database, "subscription_revisions", "mihomo_config_json", "TEXT");
   ensureColumn(
@@ -404,7 +457,7 @@ function migrate(database: DatabaseSync): void {
       WHERE NOT EXISTS (
         SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
       );
-    PRAGMA user_version = 4;
+    PRAGMA user_version = 5;
   `);
   ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
 }

@@ -6,10 +6,11 @@ export interface SchedulerCandidate {
   id: string;
   listener: URL;
   manualWeight: number;
+  selectors?: readonly string[];
   successRate: number;
 }
 
-export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener">;
+export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener" | "selectors">;
 
 const DEFAULT_SCHEDULER_SIGNALS: SchedulerSignals = {
   activeConnections: 0,
@@ -24,8 +25,9 @@ export function createSchedulerCandidate(
   id: string,
   listener: URL,
   signals: SchedulerSignals = DEFAULT_SCHEDULER_SIGNALS,
+  selectors: readonly string[] = [],
 ): SchedulerCandidate {
-  return { id, listener, ...signals };
+  return { id, listener, selectors, ...signals };
 }
 
 export interface SchedulerLease {
@@ -39,6 +41,24 @@ interface CandidateState {
   leasedConnections: number;
 }
 
+export function validateSelectorUniqueness(
+  candidates: readonly Pick<SchedulerCandidate, "id" | "selectors">[],
+  reservedSelectors: readonly string[] = [],
+): void {
+  const selectors = new Set(reservedSelectors);
+  if (selectors.size !== reservedSelectors.length) {
+    throw new Error("duplicate scheduler selector");
+  }
+  for (const candidate of candidates) {
+    for (const selector of [candidate.id, ...(candidate.selectors ?? [])]) {
+      if (selectors.has(selector)) {
+        throw new Error(`duplicate scheduler selector: ${selector}`);
+      }
+      selectors.add(selector);
+    }
+  }
+}
+
 export class RotateScheduler {
   #states: CandidateState[] = [];
 
@@ -47,13 +67,9 @@ export class RotateScheduler {
   }
 
   replaceCandidates(candidates: readonly SchedulerCandidate[]): void {
-    const ids = new Set<string>();
+    validateSelectorUniqueness(candidates);
     this.#states = candidates.map((candidate) => {
       validateCandidate(candidate);
-      if (ids.has(candidate.id)) {
-        throw new Error(`duplicate scheduler candidate: ${candidate.id}`);
-      }
-      ids.add(candidate.id);
       return { candidate, currentWeight: 0, leasedConnections: 0 };
     });
   }
@@ -93,6 +109,38 @@ export class RotateScheduler {
       return undefined;
     }
     return lease(state);
+  }
+
+  acquireBySelector(selector: string): SchedulerLease | undefined {
+    const state = this.#states.find(
+      ({ candidate }) =>
+        candidate.id === selector || (candidate.selectors ?? []).includes(selector),
+    );
+    if (
+      !state?.candidate.healthy ||
+      state.candidate.manualWeight <= 0 ||
+      state.candidate.successRate <= 0
+    ) {
+      return undefined;
+    }
+    return lease(state);
+  }
+
+  hasCandidate(id: string): boolean {
+    return this.#states.some(({ candidate }) => candidate.id === id);
+  }
+
+  setSelectors(id: string, selectors: readonly string[]): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) {
+      return false;
+    }
+    const candidates = this.#states.map(({ candidate }) =>
+      candidate.id === id ? { ...candidate, selectors } : candidate,
+    );
+    validateSelectorUniqueness(candidates);
+    state.candidate = { ...state.candidate, selectors };
+    return true;
   }
 }
 
