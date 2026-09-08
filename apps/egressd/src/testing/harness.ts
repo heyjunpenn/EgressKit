@@ -84,7 +84,11 @@ function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
 
 export async function startTargetServer(
   observedRequests: ObservedRequest[],
-  options: { beforeResponse?: () => Promise<void>; closeWithoutResponse?: boolean } = {},
+  options: {
+    beforeResponse?: () => Promise<void>;
+    closeWithoutResponse?: boolean;
+    statusCode?: number;
+  } = {},
 ): Promise<RunningHttpFixture> {
   return listen(
     createServer((incoming, response) => {
@@ -103,7 +107,7 @@ export async function startTargetServer(
           return;
         }
         await options.beforeResponse?.();
-        response.writeHead(200, { "content-type": "application/json" });
+        response.writeHead(options.statusCode ?? 200, { "content-type": "application/json" });
         response.end(JSON.stringify(observed));
       });
     }),

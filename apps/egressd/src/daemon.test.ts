@@ -2254,6 +2254,104 @@ test("the test clock advances without waiting for wall-clock time", () => {
   assert.equal(clock.now(), 1_250);
 });
 
+test("authorized target feedback is opt-in, temporary, and scoped without leaking targets", async (t) => {
+  const disabled = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => disabled.close());
+  const endpoint = `http://${disabled.address.host}:${disabled.address.port}/reputation/feedback`;
+  assert.equal(await fetch(endpoint, { method: "POST" }).then((response) => response.status), 401);
+  assert.equal(
+    await fetch(endpoint, {
+      body: JSON.stringify({ nodeId: "local:first", outcome: 429, target: "example.com" }),
+      headers: { authorization: "Bearer test-admin-token" },
+      method: "POST",
+    }).then((response) => response.status),
+    409,
+  );
+
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-reputation-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const logs: unknown[] = [];
+  const { daemon } = await startTwoExitDaemon(t, undefined, {
+    log: (event) => logs.push(event),
+    stateDirectory,
+    targetReputationEnabled: true,
+  });
+  const targetRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(targetRequests);
+  t.after(() => target.close());
+  const targetUrl = `http://${target.host}:${target.port}/scoped`;
+  const feedbackEndpoint = `http://${daemon.address.host}:${daemon.address.port}/reputation/feedback`;
+  const response = await fetch(feedbackEndpoint, {
+    body: JSON.stringify({ nodeId: "local:first", outcome: 403, target: targetUrl, ttlMs: 60_000 }),
+    headers: { authorization: "Bearer test-admin-token" },
+    method: "POST",
+  });
+  assert.equal(response.status, 202);
+  const recorded = (await response.json()) as Record<string, unknown>;
+  assert.equal(recorded.nodeId, "local:first");
+  assert.equal(recorded.status, "recorded");
+  assert.equal(typeof recorded.expiresAt, "number");
+  assert.equal("target" in recorded, false);
+  const resultText = await fetch(feedbackEndpoint, {
+    body: JSON.stringify({
+      nodeId: "local:first",
+      outcome: "risk",
+      target: "https://sensitive.target.example/private",
+    }),
+    headers: { authorization: "Bearer test-admin-token" },
+    method: "POST",
+  }).then((item) => item.text());
+  assert.doesNotMatch(resultText, /sensitive\.target\.example/);
+
+  const proxied = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "");
+  assert.equal(proxied.status, 200);
+  assert.equal(targetRequests[0]?.headers["x-egresskit-test-exit"], "second");
+  const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
+    headers: { authorization: "Bearer test-admin-token" },
+  }).then((item) => item.text());
+  const persisted = await readFile(join(stateDirectory, "control.sqlite"));
+  assert.doesNotMatch(metrics, /sensitive\.target\.example/);
+  assert.doesNotMatch(JSON.stringify(logs), /sensitive\.target\.example/);
+  assert.equal(persisted.includes(Buffer.from("sensitive.target.example")), false);
+});
+
+test("ordinary target 403 and 429 responses remain successful node connections", async (t) => {
+  for (const statusCode of [403, 429]) {
+    const target = await startTargetServer([], { statusCode });
+    t.after(() => target.close());
+    const mihomo = await startSimulatedMihomoListener();
+    t.after(() => mihomo.close());
+    const daemon = await startEgressd({
+      adminToken: "test-admin-token",
+      host: "127.0.0.1",
+      mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+      port: 0,
+      proxyAuthentication: false,
+    });
+    t.after(() => daemon.close());
+
+    assert.equal(
+      await sendProxyRequest(
+        daemon.address,
+        `http://${target.host}:${target.port}/business-status`,
+        "GET",
+        "",
+      ),
+      statusCode,
+    );
+    const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
+      headers: { authorization: "Bearer test-admin-token" },
+    }).then((response) => response.text());
+    assert.match(metrics, /egresskit_connections_total\{result="success"\} 1/);
+    assert.match(metrics, /egresskit_connections_total\{result="failure"\} 0/);
+  }
+});
+
 test("a connection failure can be injected before the target is reached", async (t) => {
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);

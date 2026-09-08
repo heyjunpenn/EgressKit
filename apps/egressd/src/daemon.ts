@@ -53,6 +53,11 @@ import {
   RevisionForceConflictError,
 } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
+import {
+  TargetFeedbackError,
+  type TargetFeedbackOutcome,
+  TargetReputation,
+} from "./target-reputation.js";
 
 export interface MihomoRuntime {
   apply(
@@ -104,6 +109,8 @@ export interface EgressdOptions {
   sessionMaximumActiveSessions?: number;
   sessionMaximumConcurrentConnections?: number;
   stateDirectory?: string;
+  targetReputationClock?: () => number;
+  targetReputationEnabled?: boolean;
 }
 
 export interface ConnectionOutcome {
@@ -275,6 +282,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ]
       : [],
   );
+  const targetReputation = options.targetReputationEnabled
+    ? new TargetReputation({
+        ...(options.targetReputationClock === undefined
+          ? {}
+          : { now: options.targetReputationClock }),
+      })
+    : undefined;
   const healthController = options.healthCheckUrls
     ? new NodeHealthController({
         ...(options.healthCheckConcurrency === undefined
@@ -394,12 +408,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
 
   const acquirePreconnectedRoute = async (
     route: ProxyRoute,
+    target: string,
     signal: AbortSignal,
     confirmConnection?: (socket: Socket) => Promise<void>,
   ): Promise<
     { latencyMs: number; lease: SchedulerLease; socket: Socket } | "not-implemented" | undefined
   > => {
-    const attemptedIds = new Set<string>();
+    const attemptedIds = new Set<string>(targetReputation?.excludedNodeIds(target) ?? []);
     const maximumAttempts = isFallbackRoute(route) ? (options.preconnectAttempts ?? 3) : 1;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       if (attempt > 0) {
@@ -836,6 +851,35 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
             writeJson(response, 201, added);
           })
           .catch(() => writeJson(response, 422, { error: "proxy token request is invalid" }));
+        return;
+      }
+
+      if (incoming.method === "POST" && incoming.url === "/reputation/feedback") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!targetReputation) {
+          writeJson(response, 409, { error: "target reputation is disabled" });
+          return;
+        }
+        readBody(incoming)
+          .then(parseTargetFeedbackRequest)
+          .then((feedback) => {
+            if (!scheduler.hasCandidate(feedback.nodeId)) {
+              writeJson(response, 404, { error: "active node not found" });
+              return;
+            }
+            writeJson(response, 202, { ...targetReputation.record(feedback) });
+          })
+          .catch((error: unknown) =>
+            writeJson(response, 422, {
+              error:
+                error instanceof TargetFeedbackError
+                  ? error.message
+                  : "target feedback request is invalid",
+            }),
+          );
         return;
       }
 
@@ -1322,6 +1366,30 @@ function parseRemoteSubscriptionRequest(body: string): string {
   return document.url;
 }
 
+function parseTargetFeedbackRequest(body: string): {
+  nodeId: string;
+  outcome: TargetFeedbackOutcome;
+  target: string;
+  ttlMs?: number;
+} {
+  const document = JSON.parse(body) as Record<string, unknown>;
+  if (typeof document.nodeId !== "string" || typeof document.target !== "string") {
+    throw new TargetFeedbackError("nodeId and target are required");
+  }
+  if (document.outcome !== 403 && document.outcome !== 429 && document.outcome !== "risk") {
+    throw new TargetFeedbackError("outcome must be 403, 429, or risk");
+  }
+  if (document.ttlMs !== undefined && typeof document.ttlMs !== "number") {
+    throw new TargetFeedbackError("ttlMs must be a number");
+  }
+  return {
+    nodeId: document.nodeId,
+    outcome: document.outcome,
+    target: document.target,
+    ...(document.ttlMs === undefined ? {} : { ttlMs: document.ttlMs }),
+  };
+}
+
 function commitProxyTokenMutation<T>(
   registry: ProxyTokenRegistry,
   state: ControlState | undefined,
@@ -1446,6 +1514,7 @@ function checkListenerReady(listener: URL): Promise<void> {
 type PreconnectedRoute = { latencyMs: number; lease: SchedulerLease; socket: Socket };
 type PreconnectedRouteAcquirer = (
   route: ProxyRoute,
+  target: string,
   signal: AbortSignal,
   confirmConnection?: (socket: Socket) => Promise<void>,
 ) => Promise<PreconnectedRoute | "not-implemented" | undefined>;
@@ -1462,7 +1531,7 @@ async function forwardHttpProxyRequest(
   response.once("close", cancel);
   let connected: PreconnectedRoute | "not-implemented" | undefined;
   try {
-    connected = await acquirePreconnectedRoute(route, controller.signal);
+    connected = await acquirePreconnectedRoute(route, incoming.url ?? "", controller.signal);
   } catch (error) {
     incoming.off("aborted", cancel);
     response.off("close", cancel);
@@ -1549,14 +1618,19 @@ async function forwardConnectRequest(
   let connected: PreconnectedRoute | "not-implemented" | undefined;
   let handshake: ConnectHandshake | undefined;
   try {
-    connected = await acquirePreconnectedRoute(route, controller.signal, async (socket) => {
-      handshake = await performConnectHandshake(
-        socket,
-        incoming.url ?? "",
-        preconnectTimeoutMs,
-        controller.signal,
-      );
-    });
+    connected = await acquirePreconnectedRoute(
+      route,
+      incoming.url ?? "",
+      controller.signal,
+      async (socket) => {
+        handshake = await performConnectHandshake(
+          socket,
+          incoming.url ?? "",
+          preconnectTimeoutMs,
+          controller.signal,
+        );
+      },
+    );
   } catch (error) {
     stopWatchingForCancellation();
     if (error instanceof ClientCancelledError) {
