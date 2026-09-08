@@ -112,10 +112,12 @@ export async function startTargetServer(
 export async function startSimulatedMihomoListener(
   faults = new ConnectionFaultPlan(),
   observedConnectTargets: string[] = [],
+  observedHttpRequests: string[] = [],
 ): Promise<RunningHttpFixture> {
   const server = createServer((incoming, response) => {
     try {
       faults.trigger("before-target-connect");
+      observedHttpRequests.push(`${incoming.method} ${incoming.url}`);
       const target = new URL(incoming.url ?? "");
       const upstream = request(
         target,
@@ -192,22 +194,28 @@ export async function startSimulatedMihomoListener(
   return listen(server);
 }
 
-export async function startHttpsTarget(receivedRequests: string[]): Promise<RunningHttpFixture> {
-  return listen(
-    createTlsServer(
-      {
-        ciphers: TEST_PSK_CIPHER,
-        maxVersion: "TLSv1.2",
-        pskCallback: () => TEST_PSK,
-      },
-      (socket) => {
-        socket.on("data", (payload) => {
-          receivedRequests.push(payload.toString());
-          socket.end("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nobserved");
-        });
-      },
-    ),
+export async function startHttpsTarget(
+  receivedRequests: string[],
+  connectionEvents: string[] = [],
+): Promise<RunningHttpFixture> {
+  const server = createTlsServer(
+    {
+      ciphers: TEST_PSK_CIPHER,
+      maxVersion: "TLSv1.2",
+      pskCallback: () => TEST_PSK,
+    },
+    (socket) => {
+      socket.on("data", (payload) => {
+        receivedRequests.push(payload.toString());
+        socket.end("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nobserved");
+      });
+    },
   );
+  server.on("connection", (socket) => {
+    connectionEvents.push("opened");
+    socket.once("close", () => connectionEvents.push("closed"));
+  });
+  return listen(server);
 }
 
 export function connectTestTls(socket: TcpSocket): TLSSocket {
