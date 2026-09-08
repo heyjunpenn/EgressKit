@@ -192,10 +192,13 @@ sleep 30
   const configs = await Promise.all(
     configPaths.map(async (configPath) => parse(await readFile(configPath, "utf8"))),
   );
-  assert.deepEqual(
-    configs.map((config) => config.listeners),
-    [[second.mihomoConfig.listeners[0]], [second.mihomoConfig.listeners[1]]],
-  );
+  const startedListeners = configs
+    .map((config) => {
+      assert.equal(config.listeners.length, 1);
+      return config.listeners[0];
+    })
+    .sort((left, right) => left.port - right.port);
+  assert.deepEqual(startedListeners, second.mihomoConfig.listeners);
 });
 
 async function waitForExit(predicate: () => boolean): Promise<void> {
