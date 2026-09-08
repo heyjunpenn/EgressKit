@@ -17,6 +17,12 @@ export interface RemoteOperationRunnerOptions {
   state: ControlState;
 }
 
+export function validateRemoteSubscriptionTimeout(fetchTimeoutMs: number | undefined): void {
+  if (fetchTimeoutMs !== undefined && (!Number.isFinite(fetchTimeoutMs) || fetchTimeoutMs <= 0)) {
+    throw new Error("remote subscription fetch timeout must be positive");
+  }
+}
+
 export class RemoteOperationRunner {
   readonly #controllers = new Set<AbortController>();
   readonly #options: RemoteOperationRunnerOptions;
@@ -24,12 +30,7 @@ export class RemoteOperationRunner {
   #shuttingDown = false;
 
   constructor(options: RemoteOperationRunnerOptions) {
-    if (
-      options.fetchTimeoutMs !== undefined &&
-      (!Number.isFinite(options.fetchTimeoutMs) || options.fetchTimeoutMs <= 0)
-    ) {
-      throw new Error("remote subscription fetch timeout must be positive");
-    }
+    validateRemoteSubscriptionTimeout(options.fetchTimeoutMs);
     this.#options = options;
   }
 

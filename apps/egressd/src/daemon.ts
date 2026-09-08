@@ -15,7 +15,7 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
-import { RemoteOperationRunner } from "./remote-operation.js";
+import { RemoteOperationRunner, validateRemoteSubscriptionTimeout } from "./remote-operation.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
 import { openControlState, type PersistedNodeGeneration } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
@@ -69,6 +69,7 @@ function closeServer(server: Server): Promise<void> {
 }
 
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
+  validateRemoteSubscriptionTimeout(options.remoteSubscriptionTimeoutMs);
   if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
     if (!options.allowUnsafeUnauthenticatedProxy) {
       throw new Error("refusing to disable proxy authentication on a non-loopback host");
