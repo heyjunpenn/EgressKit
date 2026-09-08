@@ -807,6 +807,140 @@ test("minimum node count and abnormal shrinkage preserve the active revision", a
   });
 });
 
+test("a failed force operation releases its claim for an explicit retry", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let applies = 0;
+  const fixture = await startSubscriptionFixture(t, () => ({ body: "proxies: []\n", status: 200 }));
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async (_url, options) => fetch(fixture, options),
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async () => {
+        applies += 1;
+        if (applies === 1) {
+          throw new Error("temporary runtime failure");
+        }
+        return new Map();
+      },
+    },
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/retry-force" },
+    method: "POST",
+  });
+  const evaluated = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+
+  const firstForce = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  const failed = await waitForTerminalOperation(
+    daemon.address,
+    firstForce.body.operationId as string,
+  );
+  assert.equal(failed.body.status, "failed");
+
+  const secondForce = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  assert.equal(secondForce.status, 202);
+  const succeeded = await waitForTerminalOperation(
+    daemon.address,
+    secondForce.body.operationId as string,
+  );
+  const revision = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}`,
+  );
+
+  assert.equal(succeeded.body.status, "succeeded");
+  assert.equal((revision.body as RevisionBody).forced, true);
+  assert.equal(applies, 2);
+});
+
+test("an interrupted queued force operation releases its claim after restart", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let fetchNumber = 0;
+  let markBlockingFetchStarted: (() => void) | undefined;
+  const blockingFetchStarted = new Promise<void>((resolve) => {
+    markBlockingFetchStarted = resolve;
+  });
+  const first = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async (_url, options) => {
+      fetchNumber += 1;
+      if (fetchNumber === 1) {
+        return new Response("proxies: []\n");
+      }
+      markBlockingFetchStarted?.();
+      return new Promise<Response>((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(options.signal.reason), {
+          once: true,
+        });
+      });
+    },
+    host: "127.0.0.1",
+    mihomoRuntime: { apply: async () => new Map() },
+    port: 0,
+    stateDirectory,
+  });
+  const created = await adminJson(first.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/interrupted-force" },
+    method: "POST",
+  });
+  const evaluated = await waitForTerminalOperation(
+    first.address,
+    created.body.operationId as string,
+  );
+  await adminJson(first.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/blocking" },
+    method: "POST",
+  });
+  await blockingFetchStarted;
+  const queuedForce = await adminJson(
+    first.address,
+    `/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  await first.close();
+
+  const restarted = await startEgressd({
+    adminToken: "admin-token",
+    host: "127.0.0.1",
+    mihomoRuntime: { apply: async () => new Map() },
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => restarted.close());
+  const interrupted = await adminJson(
+    restarted.address,
+    `/operations/${queuedForce.body.operationId as string}`,
+  );
+  assert.equal(interrupted.body.status, "interrupted");
+
+  const retried = await adminJson(
+    restarted.address,
+    `/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  assert.equal(retried.status, 202);
+  const succeeded = await waitForTerminalOperation(
+    restarted.address,
+    retried.body.operationId as string,
+  );
+  assert.equal(succeeded.body.status, "succeeded");
+});
+
 function successfulRuntime(applied: unknown[]): MihomoRuntime {
   return {
     apply: async (config) => {

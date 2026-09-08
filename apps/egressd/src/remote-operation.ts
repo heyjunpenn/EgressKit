@@ -129,7 +129,12 @@ export class RemoteOperationRunner {
     let stage: OperationProcessingStage = "queued";
     try {
       const revision = this.#options.state.getRevision(subscriptionRevisionId);
-      if (!revision?.imported || revision.status !== "suspicious" || !revision.forced) {
+      if (
+        !revision?.imported ||
+        !revision.suspiciousReason ||
+        !["suspicious", "accepted"].includes(revision.status) ||
+        !revision.forcePending
+      ) {
         throw new Error(`subscription revision is not pending force: ${subscriptionRevisionId}`);
       }
       const subscription = this.#options.state.getSubscription(revision.subscriptionId);
@@ -147,7 +152,12 @@ export class RemoteOperationRunner {
       );
     } catch (error) {
       if (!this.#shuttingDown) {
-        this.#options.state.failOperation(operationId, stage, operationFailureReason(stage, error));
+        this.#options.state.failForceOperation(
+          operationId,
+          subscriptionRevisionId,
+          stage,
+          operationFailureReason(stage, error),
+        );
       }
     }
   }

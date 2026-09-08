@@ -38,6 +38,7 @@ export type SubscriptionRevisionStatus =
   | "healthy";
 
 export interface PersistedSubscriptionRevision {
+  forcePending: boolean;
   forced: boolean;
   history: SubscriptionRevisionStatus[];
   subscriptionRevisionId: number;
@@ -84,6 +85,12 @@ export interface ControlState {
   };
   databasePath: string;
   failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
+  failForceOperation(
+    operationId: string,
+    subscriptionRevisionId: number,
+    stage: OperationProcessingStage,
+    reason: string,
+  ): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
@@ -143,6 +150,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     databasePath,
     failOperation: (operationId, stage, reason) =>
       failOperation(controlDatabase, operationId, stage, reason),
+    failForceOperation: (operationId, subscriptionRevisionId, stage, reason) =>
+      failForceOperation(controlDatabase, operationId, subscriptionRevisionId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
@@ -218,6 +227,7 @@ function migrate(database: DatabaseSync): void {
       mihomo_config_json TEXT,
       lifecycle_status TEXT NOT NULL DEFAULT 'saved',
       suspicious_reason TEXT,
+      force_pending INTEGER NOT NULL DEFAULT 0,
       forced INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
@@ -264,6 +274,7 @@ function migrate(database: DatabaseSync): void {
     "TEXT NOT NULL DEFAULT 'ready'",
   );
   ensureColumn(database, "subscription_revisions", "suspicious_reason", "TEXT");
+  ensureColumn(database, "subscription_revisions", "force_pending", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(database, "subscription_revisions", "forced", "INTEGER NOT NULL DEFAULT 0");
   database.exec(`
     CREATE TABLE IF NOT EXISTS revision_events (
@@ -274,7 +285,8 @@ function migrate(database: DatabaseSync): void {
     );
     CREATE TABLE IF NOT EXISTS operation_revisions (
       operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE,
-      revision_id INTEGER NOT NULL REFERENCES subscription_revisions(id)
+      revision_id INTEGER NOT NULL REFERENCES subscription_revisions(id),
+      kind TEXT NOT NULL DEFAULT 'refresh'
     );
     INSERT INTO revision_events (revision_id, status, created_at)
       SELECT sr.id, sr.lifecycle_status, sr.created_at
@@ -284,6 +296,7 @@ function migrate(database: DatabaseSync): void {
       );
     PRAGMA user_version = 3;
   `);
+  ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
 }
 
 function ensureColumn(
@@ -351,8 +364,9 @@ function createForceOperation(
   try {
     const claimed = database
       .prepare(
-        `UPDATE subscription_revisions SET forced = 1
-         WHERE id = ? AND lifecycle_status = 'suspicious' AND forced = 0`,
+        `UPDATE subscription_revisions SET force_pending = 1
+         WHERE id = ? AND lifecycle_status IN ('suspicious', 'accepted')
+           AND suspicious_reason IS NOT NULL AND force_pending = 0`,
       )
       .run(subscriptionRevisionId);
     if (claimed.changes !== 1) {
@@ -370,7 +384,13 @@ function createForceOperation(
     if (!revision?.imported) {
       throw new Error(`suspicious revision not found: ${subscriptionRevisionId}`);
     }
-    insertOperation(database, operationId, revision.subscriptionId, subscriptionRevisionId);
+    insertOperation(
+      database,
+      operationId,
+      revision.subscriptionId,
+      subscriptionRevisionId,
+      "force",
+    );
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -400,6 +420,7 @@ function insertOperation(
   operationId: string,
   subscriptionId: string,
   subscriptionRevisionId: number,
+  kind: "force" | "refresh" = "refresh",
 ): void {
   const now = new Date().toISOString();
   database
@@ -415,8 +436,8 @@ function insertOperation(
     )
     .run(operationId, now);
   database
-    .prepare("INSERT INTO operation_revisions (operation_id, revision_id) VALUES (?, ?)")
-    .run(operationId, subscriptionRevisionId);
+    .prepare("INSERT INTO operation_revisions (operation_id, revision_id, kind) VALUES (?, ?, ?)")
+    .run(operationId, subscriptionRevisionId, kind);
 }
 
 function getSubscription(
@@ -476,12 +497,13 @@ function getRevision(
   const row = database
     .prepare(
       `SELECT id, subscription_id, normalized_nodes_json, mihomo_config_json,
-              lifecycle_status, suspicious_reason, forced
+              lifecycle_status, suspicious_reason, force_pending, forced
        FROM subscription_revisions WHERE id = ?`,
     )
     .get(subscriptionRevisionId) as
     | {
         forced: number;
+        force_pending: number;
         id: number;
         lifecycle_status: SubscriptionRevisionStatus;
         mihomo_config_json: string | null;
@@ -498,6 +520,7 @@ function getRevision(
     .prepare("SELECT status FROM revision_events WHERE revision_id = ? ORDER BY id")
     .all(subscriptionRevisionId) as Array<{ status: SubscriptionRevisionStatus }>;
   return {
+    forcePending: row.force_pending === 1,
     forced: row.forced === 1,
     history: history.map((event) => event.status),
     subscriptionRevisionId: row.id,
@@ -665,21 +688,7 @@ function failOperation(
   const now = new Date().toISOString();
   database.exec("BEGIN IMMEDIATE");
   try {
-    const result = database
-      .prepare(
-        `UPDATE operations
-         SET status = 'failed', failed_stage = ?, failure_reason = ?, updated_at = ?
-         WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
-      )
-      .run(stage, reason, now, operationId);
-    if (result.changes !== 1) {
-      throw new Error(`operation is missing or already terminal: ${operationId}`);
-    }
-    database
-      .prepare(
-        "INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, 'failed', ?)",
-      )
-      .run(operationId, now);
+    writeFailedOperation(database, operationId, stage, reason, now);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -687,12 +696,79 @@ function failOperation(
   }
 }
 
+function failForceOperation(
+  database: DatabaseSync,
+  operationId: string,
+  subscriptionRevisionId: number,
+  stage: OperationProcessingStage,
+  reason: string,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare("UPDATE subscription_revisions SET force_pending = 0 WHERE id = ?")
+      .run(subscriptionRevisionId);
+    writeFailedOperation(database, operationId, stage, reason, now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function writeFailedOperation(
+  database: DatabaseSync,
+  operationId: string,
+  stage: OperationProcessingStage,
+  reason: string,
+  now: string,
+): void {
+  const result = database
+    .prepare(
+      `UPDATE operations
+       SET status = 'failed', failed_stage = ?, failure_reason = ?, updated_at = ?
+       WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
+    )
+    .run(stage, reason, now, operationId);
+  if (result.changes !== 1) {
+    throw new Error(`operation is missing or already terminal: ${operationId}`);
+  }
+  database
+    .prepare(
+      "INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, 'failed', ?)",
+    )
+    .run(operationId, now);
+}
+
 function interruptUnfinishedOperations(database: DatabaseSync): void {
   const operations = database
-    .prepare("SELECT id FROM operations WHERE status NOT IN ('succeeded', 'failed', 'interrupted')")
-    .all() as Array<{ id: string }>;
+    .prepare(
+      `SELECT o.id, orv.kind, orv.revision_id
+       FROM operations o
+       LEFT JOIN operation_revisions orv ON orv.operation_id = o.id
+       WHERE o.status NOT IN ('succeeded', 'failed', 'interrupted')`,
+    )
+    .all() as Array<{
+    id: string;
+    kind: "force" | "refresh" | null;
+    revision_id: number | null;
+  }>;
   for (const operation of operations) {
-    transitionOperation(database, operation.id, "interrupted");
+    const now = new Date().toISOString();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if (operation.kind === "force" && operation.revision_id !== null) {
+        database
+          .prepare("UPDATE subscription_revisions SET force_pending = 0 WHERE id = ?")
+          .run(operation.revision_id);
+      }
+      writeOperationStatus(database, operation.id, "interrupted", now);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
   }
 }
 
@@ -786,6 +862,14 @@ function saveActiveRevision(
         throw new Error("remote revision activation requires an operation");
       }
       const now = new Date().toISOString();
+      database
+        .prepare(
+          `UPDATE subscription_revisions
+           SET forced = CASE WHEN suspicious_reason IS NULL THEN forced ELSE 1 END,
+               force_pending = 0
+           WHERE id = ?`,
+        )
+        .run(subscriptionRevisionId);
       writeRevisionStatus(database, subscriptionRevisionId, "ready", now);
       writeOperationStatus(database, input.operationId, "succeeded", now);
     }
