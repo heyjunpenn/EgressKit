@@ -5,21 +5,27 @@ import { join } from "node:path";
 
 import { runControlCli } from "./control-cli.js";
 import { UnixControlClient } from "./control-client.js";
+import { MihomoInstallError, runMihomoInstallCommand } from "./mihomo-install.js";
 
-const stateDirectory =
-  process.env.EGRESSKIT_STATE_DIRECTORY ??
-  (process.env.XDG_STATE_HOME
-    ? join(process.env.XDG_STATE_HOME, "egresskit")
-    : join(homedir(), ".local", "state", "egresskit"));
-const socketPath = process.env.EGRESSKIT_CONTROL_SOCKET ?? join(stateDirectory, "egressd.sock");
-const adminToken = process.env.EGRESSKIT_ADMIN_TOKEN;
+async function main(): Promise<void> {
+  const stateDirectory =
+    process.env.EGRESSKIT_STATE_DIRECTORY ??
+    (process.env.XDG_STATE_HOME
+      ? join(process.env.XDG_STATE_HOME, "egresskit")
+      : join(homedir(), ".local", "state", "egresskit"));
+  const arguments_ = process.argv.slice(2);
+  if (arguments_[0] === "runtime" && arguments_[1] === "install") {
+    await runMihomoInstallCommand(arguments_.slice(2), stateDirectory, (value) =>
+      process.stdout.write(value),
+    );
+    return;
+  }
+  const socketPath = process.env.EGRESSKIT_CONTROL_SOCKET ?? join(stateDirectory, "egressd.sock");
+  const adminToken = process.env.EGRESSKIT_ADMIN_TOKEN;
 
-if (!adminToken) {
-  process.stderr.write("EGRESSKIT_ADMIN_TOKEN is required\n");
-  process.exitCode = 1;
-} else {
-  runControlCli(
-    process.argv.slice(2),
+  if (!adminToken) throw new Error("EGRESSKIT_ADMIN_TOKEN is required");
+  await runControlCli(
+    arguments_,
     {
       readStdin: async () => {
         const chunks: Buffer[] = [];
@@ -31,8 +37,13 @@ if (!adminToken) {
       write: (value) => process.stdout.write(value),
     },
     new UnixControlClient({ adminToken, socketPath }),
-  ).catch((error: unknown) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
+  );
 }
+
+main().catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(
+    `${error instanceof MihomoInstallError ? `${error.code}: ` : ""}${message}\n`,
+  );
+  process.exitCode = 1;
+});
