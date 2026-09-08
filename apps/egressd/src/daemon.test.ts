@@ -25,6 +25,33 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
   assert.deepEqual(await response.json(), { status: "live" });
 });
 
+test("unauthenticated non-loopback proxy listeners require an explicit warned override", async (t) => {
+  await assert.rejects(
+    startEgressd({ host: "0.0.0.0", port: 0, proxyAuthentication: false }),
+    /refusing to disable proxy authentication on a non-loopback host/,
+  );
+
+  const events: unknown[] = [];
+  const daemon = await startEgressd({
+    allowUnsafeUnauthenticatedProxy: true,
+    host: "0.0.0.0",
+    log: (event) => events.push(event),
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => daemon.close());
+
+  assert.deepEqual(events, [
+    {
+      event: "egressd.proxy_auth.disabled",
+      exposure: "non-loopback",
+      host: "0.0.0.0",
+      level: "warn",
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(events), /token|authorization|secret/i);
+});
+
 test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) => {
   const mihomo = await startSimulatedMihomoListener();
   t.after(() => mihomo.close());
@@ -101,6 +128,7 @@ test("an HTTP proxy request reaches the target through the simulated Mihomo list
     host: "127.0.0.1",
     port: 0,
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
   });
   t.after(() => daemon.close());
 
@@ -135,6 +163,54 @@ test("an HTTP proxy request reaches the target through the simulated Mihomo list
   assert.equal(observedRequests[0]?.headers.via, "1.1 egresskit, 1.1 simulated-mihomo");
 });
 
+test("HTTP proxy requests require valid standard Basic proxy credentials", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const observedListenerRequests: string[] = [];
+  const mihomo = await startSimulatedMihomoListener(undefined, [], observedListenerRequests);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+  });
+  t.after(() => daemon.close());
+  const targetUrl = `http://${target.host}:${target.port}/authenticated`;
+
+  for (const proxyAuthorization of [
+    undefined,
+    "Bearer proxy-secret",
+    "Basic not-base64!",
+    basicProxyAuthorization("unknown", "proxy-secret"),
+    basicProxyAuthorization("rotate", "wrong-secret"),
+  ]) {
+    const response = await sendProxyRequestResponse(
+      daemon.address,
+      targetUrl,
+      "GET",
+      "",
+      proxyAuthorization === undefined ? {} : { "proxy-authorization": proxyAuthorization },
+    );
+
+    assert.equal(response.status, 407);
+    assert.equal(response.headers["proxy-authenticate"], 'Basic realm="EgressKit"');
+  }
+
+  for (const username of ["rotate", "sticky.session-a", "strict.session-b", "node.exit-alias"]) {
+    const accepted = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization(username, "proxy-secret"),
+    });
+    assert.equal(accepted.status, 200);
+  }
+  assert.equal(observedListenerRequests.length, 4);
+  assert.equal(observedRequests.length, 4);
+  assert.ok(
+    observedRequests.every((request) => request.headers["proxy-authorization"] === undefined),
+  );
+});
+
 test("GET, HEAD, and POST are forwarded once with their original method and body", async (t) => {
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);
@@ -145,6 +221,7 @@ test("GET, HEAD, and POST are forwarded once with their original method and body
     host: "127.0.0.1",
     port: 0,
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
   });
   t.after(() => daemon.close());
 
@@ -187,6 +264,7 @@ test("sent GET, HEAD, and POST requests are not replayed to another listener", {
     adminToken: "test-admin-token",
     host: "127.0.0.1",
     port: 0,
+    proxyAuthentication: false,
     mihomoRuntime: {
       apply: async () =>
         new Map([
@@ -250,6 +328,7 @@ test("an upstream failure after CONNECT 200 only closes the tunnel", {
     host: "127.0.0.1",
     port: 0,
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
   });
   t.after(() => daemon.close());
 
@@ -271,12 +350,59 @@ test("an upstream failure after CONNECT 200 only closes the tunnel", {
   assert.deepEqual(connectionEvents, ["opened", "closed"]);
 });
 
+test("CONNECT requires the same standard Basic proxy credentials", {
+  timeout: 2_000,
+}, async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  const observedConnectTargets: string[] = [];
+  const mihomo = await startSimulatedMihomoListener(undefined, observedConnectTargets);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+  });
+  t.after(() => daemon.close());
+  const authority = `${target.host}:${target.port}`;
+
+  for (const proxyAuthorization of [
+    undefined,
+    "Basic not-base64!",
+    basicProxyAuthorization("rotate", "wrong-secret"),
+  ]) {
+    const response = await sendConnectRequest(daemon.address, authority, proxyAuthorization);
+    assert.match(response, /^HTTP\/1\.1 407 Proxy Authentication Required\r\n/i);
+    assert.match(response, /Proxy-Authenticate: Basic realm="EgressKit"\r\n/i);
+  }
+  assert.equal(observedConnectTargets.length, 0);
+
+  const accepted = await sendConnectRequest(
+    daemon.address,
+    authority,
+    basicProxyAuthorization("rotate", "proxy-secret"),
+  );
+  assert.match(accepted, /^HTTP\/1\.1 200 Connection Established\r\n/);
+  assert.deepEqual(observedConnectTargets, [authority]);
+});
+
 function sendProxyRequest(
   proxy: { host: string; port: number },
   target: string,
   method: string,
   body: string,
 ): Promise<number> {
+  return sendProxyRequestResponse(proxy, target, method, body).then(({ status }) => status);
+}
+
+function sendProxyRequestResponse(
+  proxy: { host: string; port: number },
+  target: string,
+  method: string,
+  body: string,
+  headers: Record<string, string> = {},
+): Promise<{ headers: Record<string, string | string[] | undefined>; status: number }> {
   return new Promise((resolve, reject) => {
     const outgoing = request(
       {
@@ -284,15 +410,51 @@ function sendProxyRequest(
         port: proxy.port,
         path: target,
         method,
-        headers: body ? { "content-length": Buffer.byteLength(body) } : {},
+        headers: {
+          ...headers,
+          ...(body ? { "content-length": Buffer.byteLength(body) } : {}),
+        },
       },
       (response) => {
         response.resume();
-        response.on("end", () => resolve(response.statusCode ?? 0));
+        response.on("end", () =>
+          resolve({ headers: response.headers, status: response.statusCode ?? 0 }),
+        );
       },
     );
     outgoing.on("error", reject);
     outgoing.end(body);
+  });
+}
+
+function basicProxyAuthorization(username: string, password: string): string {
+  return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+}
+
+function sendConnectRequest(
+  proxy: { host: string; port: number },
+  authority: string,
+  proxyAuthorization?: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(proxy.port, proxy.host);
+    let response = "";
+    socket.on("connect", () => {
+      const authorizationHeader = proxyAuthorization
+        ? `Proxy-Authorization: ${proxyAuthorization}\r\n`
+        : "";
+      socket.write(
+        `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authorizationHeader}\r\n`,
+      );
+    });
+    socket.on("data", (chunk) => {
+      response += chunk.toString();
+      if (response.includes("\r\n\r\n")) {
+        socket.destroy();
+        resolve(response);
+      }
+    });
+    socket.on("error", reject);
   });
 }
 
@@ -316,6 +478,7 @@ test("a connection failure can be injected before the target is reached", async 
     host: "127.0.0.1",
     port: 0,
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
   });
   t.after(() => daemon.close());
 
@@ -352,6 +515,7 @@ test("a connection failure can be injected immediately after the target connecti
     host: "127.0.0.1",
     port: 0,
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: false,
   });
   t.after(() => daemon.close());
 
@@ -388,6 +552,7 @@ test("CONNECT reaches the target through the selected simulated Mihomo listener"
     adminToken: "test-admin-token",
     host: "127.0.0.1",
     port: 0,
+    proxyAuthentication: false,
     mihomoRuntime: {
       apply: async (config) => {
         appliedConfigs.push(config);

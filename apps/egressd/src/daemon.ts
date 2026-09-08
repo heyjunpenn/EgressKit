@@ -8,6 +8,13 @@ import {
 import { connect } from "node:net";
 import type { Duplex } from "node:stream";
 
+import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
+import {
+  authorizeProxyRequest,
+  type ProxyAuthentication,
+  rejectConnectProxyAuthentication,
+  rejectHttpProxyAuthentication,
+} from "./proxy-auth.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -16,10 +23,20 @@ export interface MihomoRuntime {
 
 export interface EgressdOptions {
   adminToken?: string;
+  allowUnsafeUnauthenticatedProxy?: boolean;
   host: string;
+  log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
   port: number;
+  proxyAuthentication?: ProxyAuthentication;
+}
+
+export interface EgressdLogEvent {
+  event: "egressd.proxy_auth.disabled";
+  exposure: "non-loopback";
+  host: string;
+  level: "warn";
 }
 
 export interface RunningEgressd {
@@ -44,6 +61,18 @@ function closeServer(server: Server): Promise<void> {
 }
 
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
+  if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
+    if (!options.allowUnsafeUnauthenticatedProxy) {
+      throw new Error("refusing to disable proxy authentication on a non-loopback host");
+    }
+    const event: EgressdLogEvent = {
+      event: "egressd.proxy_auth.disabled",
+      exposure: "non-loopback",
+      host: options.host,
+      level: "warn",
+    };
+    (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
+  }
   let activeMihomoListener = options.mihomoListener;
   const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
     if (!options.mihomoRuntime) {
@@ -56,7 +85,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
     for (const node of revision.nodes) {
       const listener = listeners.get(node.name);
-      if (!listener || !isLoopbackHttpListener(listener)) {
+      if (!listener || !isLoopbackHttpUrl(listener)) {
         throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
       }
     }
@@ -106,17 +135,28 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return;
     }
 
+    if (
+      authorizeProxyRequest(
+        incoming.headers["proxy-authorization"],
+        options.proxyAuthentication,
+      ) === undefined
+    ) {
+      rejectHttpProxyAuthentication(response);
+      return;
+    }
+
     if (!activeMihomoListener || !isAbsoluteHttpUrl(incoming.url)) {
       response.writeHead(activeMihomoListener ? 400 : 502);
       response.end();
       return;
     }
 
+    const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
     const upstream = request(
       activeMihomoListener,
       {
         headers: {
-          ...incoming.headers,
+          ...forwardedHeaders,
           via: appendVia(incoming.headers.via, "1.1 egresskit"),
         },
         method: incoming.method,
@@ -136,6 +176,15 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     incoming.pipe(upstream);
   });
   server.on("connect", (incoming, clientSocket, head) => {
+    if (
+      authorizeProxyRequest(
+        incoming.headers["proxy-authorization"],
+        options.proxyAuthentication,
+      ) === undefined
+    ) {
+      rejectConnectProxyAuthentication(clientSocket);
+      return;
+    }
     handleConnect(incoming, clientSocket, head, activeMihomoListener);
   });
 
@@ -176,15 +225,6 @@ function readBody(incoming: IncomingMessage): Promise<string> {
     incoming.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     incoming.on("error", reject);
   });
-}
-
-function isLoopbackHttpListener(listener: URL): boolean {
-  return (
-    listener.protocol === "http:" &&
-    (listener.hostname === "localhost" ||
-      listener.hostname === "[::1]" ||
-      /^127(?:\.\d{1,3}){3}$/.test(listener.hostname))
-  );
 }
 
 function handleConnect(
