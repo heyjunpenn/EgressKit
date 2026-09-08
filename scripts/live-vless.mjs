@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 
 export function cleanChildEnvironment(environment) {
   return Object.fromEntries(
-    Object.entries(environment).filter(([name]) => !name.startsWith("EGRESSKIT_LIVE_")),
+    Object.entries(environment).filter(([name]) => !name.startsWith("EGRESSKIT_")),
   );
 }
 
@@ -74,16 +74,17 @@ function waitForStart(child) {
 }
 
 async function stopDaemon(child) {
-  if (!child || child.exitCode !== null) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise((resolve) => child.once("exit", resolve));
-  child.kill("SIGTERM");
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.kill("SIGTERM")) return;
   const stopped = await Promise.race([
     exited.then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 3_000)),
   ]);
   if (!stopped && child.exitCode === null) {
     child.kill("SIGKILL");
-    await exited;
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1_000))]);
   }
 }
 
@@ -105,12 +106,20 @@ export async function main() {
   const proxyToken = randomBytes(24).toString("hex");
   const childEnvironment = cleanChildEnvironment(process.env);
   let daemon;
-  const interrupt = () => daemon?.kill("SIGTERM");
+  let cancelled = false;
+  const interrupt = () => {
+    cancelled = true;
+    daemon?.kill("SIGTERM");
+  };
+  const ensureNotCancelled = () => {
+    if (cancelled) throw new Error("live test interrupted");
+  };
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
 
   try {
     run("pnpm", ["--filter", "@egresskit/egressd", "build"], { env: childEnvironment });
+    ensureNotCancelled();
     daemon = spawn("node", ["apps/egressd/dist/cli.js"], {
       env: {
         ...childEnvironment,
@@ -123,6 +132,7 @@ export async function main() {
       stdio: ["ignore", "pipe", "pipe"],
     });
     const address = await waitForStart(daemon);
+    ensureNotCancelled();
     run("node", ["apps/egressd/dist/control-cli-bin.js", "subscription", "add", "--redact"], {
       env: {
         ...childEnvironment,
@@ -131,10 +141,12 @@ export async function main() {
       },
       input: subscriptionUrl,
     });
+    ensureNotCancelled();
     const curlBase = ["--fail", "--silent", "--show-error", "--max-time", "30"];
     const direct = parseObservedIp(
       run("curl", [...curlBase, targetUrl], { env: childEnvironment }),
     );
+    ensureNotCancelled();
     const observed = parseObservedIp(
       run(
         "curl",
@@ -151,6 +163,7 @@ export async function main() {
         { env: childEnvironment },
       ),
     );
+    ensureNotCancelled();
     if (!isVerifiedExit(direct, observed)) {
       throw new Error("the target did not observe a distinct valid proxy exit");
     }
@@ -160,8 +173,11 @@ export async function main() {
   } finally {
     process.off("SIGINT", interrupt);
     process.off("SIGTERM", interrupt);
-    await stopDaemon(daemon);
-    await rm(stateDirectory, { force: true, recursive: true });
+    try {
+      await stopDaemon(daemon);
+    } finally {
+      await rm(stateDirectory, { force: true, recursive: true });
+    }
   }
 }
 
