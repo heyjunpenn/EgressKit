@@ -25,4 +25,8 @@ test("proxy usernames expose structured scheduling routes", () => {
     mode: "node",
     selector: "exit-alias",
   });
+  assert.deepEqual(authorizeProxyRequest(authorization("node.local%3Aprimary"), authentication), {
+    mode: "node",
+    selector: "local:primary",
+  });
 });

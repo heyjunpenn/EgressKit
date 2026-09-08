@@ -6,10 +6,11 @@ export interface SchedulerCandidate {
   id: string;
   listener: URL;
   manualWeight: number;
+  selectors?: readonly string[];
   successRate: number;
 }
 
-export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener">;
+export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener" | "selectors">;
 
 const DEFAULT_SCHEDULER_SIGNALS: SchedulerSignals = {
   activeConnections: 0,
@@ -24,8 +25,9 @@ export function createSchedulerCandidate(
   id: string,
   listener: URL,
   signals: SchedulerSignals = DEFAULT_SCHEDULER_SIGNALS,
+  selectors: readonly string[] = [],
 ): SchedulerCandidate {
-  return { id, listener, ...signals };
+  return { id, listener, selectors, ...signals };
 }
 
 export interface SchedulerLease {
@@ -48,12 +50,19 @@ export class RotateScheduler {
 
   replaceCandidates(candidates: readonly SchedulerCandidate[]): void {
     const ids = new Set<string>();
+    const selectors = new Set<string>();
     this.#states = candidates.map((candidate) => {
       validateCandidate(candidate);
       if (ids.has(candidate.id)) {
         throw new Error(`duplicate scheduler candidate: ${candidate.id}`);
       }
       ids.add(candidate.id);
+      for (const selector of [candidate.id, ...(candidate.selectors ?? [])]) {
+        if (selectors.has(selector)) {
+          throw new Error(`duplicate scheduler selector: ${selector}`);
+        }
+        selectors.add(selector);
+      }
       return { candidate, currentWeight: 0, leasedConnections: 0 };
     });
   }
@@ -85,6 +94,21 @@ export class RotateScheduler {
 
   acquireById(id: string): SchedulerLease | undefined {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (
+      !state?.candidate.healthy ||
+      state.candidate.manualWeight <= 0 ||
+      state.candidate.successRate <= 0
+    ) {
+      return undefined;
+    }
+    return lease(state);
+  }
+
+  acquireBySelector(selector: string): SchedulerLease | undefined {
+    const state = this.#states.find(
+      ({ candidate }) =>
+        candidate.id === selector || (candidate.selectors ?? []).includes(selector),
+    );
     if (
       !state?.candidate.healthy ||
       state.candidate.manualWeight <= 0 ||

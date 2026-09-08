@@ -76,3 +76,30 @@ test("each scheduling signal can independently change the next selection", () =>
     lease.release();
   }
 });
+
+test("explicit selectors are unique, exact, and never fall back", () => {
+  const scheduler = new RotateScheduler([
+    candidate("first", { selectors: ["primary"] }),
+    candidate("second", { selectors: ["backup"] }),
+  ]);
+
+  const selected = scheduler.acquireBySelector("backup");
+  assert.equal(selected?.candidate.id, "second");
+  selected?.release();
+  assert.equal(scheduler.acquireBySelector("missing"), undefined);
+
+  const unavailable = new RotateScheduler([
+    candidate("healthy", { selectors: ["available"] }),
+    candidate("failed", { healthy: false, selectors: ["unavailable"] }),
+  ]);
+  assert.equal(unavailable.acquireBySelector("unavailable"), undefined);
+
+  assert.throws(
+    () =>
+      new RotateScheduler([
+        candidate("one", { selectors: ["duplicate"] }),
+        candidate("two", { selectors: ["duplicate"] }),
+      ]),
+    /duplicate scheduler selector/,
+  );
+});

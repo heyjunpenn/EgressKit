@@ -159,6 +159,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (route.mode === "sticky") {
       return softStickySessions.acquire(route.sessionKey);
     }
+    if (route.mode === "strict") {
+      return softStickySessions.acquireStrict(route.sessionKey);
+    }
+    if (route.mode === "node") {
+      return scheduler.acquireBySelector(route.selector);
+    }
     return "not-implemented" as const;
   };
 
@@ -189,6 +195,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           id,
           listeners.get(node.name) as URL,
           options.schedulerSignals?.get(id),
+          [node.name],
         );
       }),
     );

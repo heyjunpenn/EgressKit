@@ -77,7 +77,15 @@ function parseProxyUsername(username: string): ProxyRoute | undefined {
     return undefined;
   }
   if (mode === "node") {
-    return { mode: "node", selector: value };
+    try {
+      const selector = decodeURIComponent(value);
+      if (!selector || hasControlCharacter(selector)) {
+        return undefined;
+      }
+      return { mode: "node", selector };
+    } catch {
+      return undefined;
+    }
   }
   if (mode === "sticky" || mode === "strict") {
     return { mode, sessionKey: value };
@@ -86,11 +94,12 @@ function parseProxyUsername(username: string): ProxyRoute | undefined {
 }
 
 function isValidUsernameValue(value: string): boolean {
-  return (
-    !value.includes(":") &&
-    [...value].every((character) => {
-      const codePoint = character.codePointAt(0) ?? 0;
-      return codePoint > 31 && codePoint !== 127;
-    })
-  );
+  return !value.includes(":") && !hasControlCharacter(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 31 || codePoint === 127;
+  });
 }
