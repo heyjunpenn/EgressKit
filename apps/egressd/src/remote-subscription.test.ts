@@ -125,6 +125,46 @@ test("remote operations are serialized in creation order", async (t) => {
   assert.equal(maximumActiveRequests, 1);
 });
 
+test("a hung source times out without permanently blocking later operations", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let requestNumber = 0;
+  const fixture = await startSubscriptionFixture(t, (response) => {
+    requestNumber += 1;
+    if (requestNumber === 1) {
+      response.writeHead(200);
+      response.flushHeaders();
+      return undefined;
+    }
+    return { body: VALID_SUBSCRIPTION, status: 200 };
+  });
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (_url, options) => fetch(fixture, options),
+    host: "127.0.0.1",
+    mihomoRuntime: successfulRuntime([]),
+    port: 0,
+    remoteSubscriptionTimeoutMs: 20,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const first = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/hung" },
+    method: "POST",
+  });
+  const second = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/healthy" },
+    method: "POST",
+  });
+
+  const [timedOut, succeeded] = await Promise.all([
+    waitForTerminalOperation(daemon.address, first.body.operationId as string),
+    waitForTerminalOperation(daemon.address, second.body.operationId as string),
+  ]);
+  assert.equal(timedOut.body.failure?.reason, "remote subscription request timed out");
+  assert.equal(succeeded.body.status, "succeeded");
+});
+
 test("a first fetch failure remains queryable without losing the original URL", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   const fixture = await startSubscriptionFixture(t, () => ({ body: "unavailable", status: 503 }));
@@ -188,6 +228,10 @@ test("operation failures identify the exact processing stage", async (t) => {
   for (const scenario of cases) {
     await t.test(scenario.expectedStage, async (subtest) => {
       const stateDirectory = await temporaryStateDirectory(subtest);
+      const fixture = await startSubscriptionFixture(subtest, () => ({
+        body: scenario.source,
+        status: 200,
+      }));
       const daemon = await startEgressd({
         adminToken: "admin-token",
         ...(scenario.expectedStage === "checking"
@@ -196,7 +240,7 @@ test("operation failures identify the exact processing stage", async (t) => {
                 Promise.reject(new Error("listener is not accepting connections")),
             }
           : {}),
-        fetchSubscription: async () => new Response(scenario.source),
+        fetchSubscription: async (_url, options) => fetch(fixture, options),
         host: "127.0.0.1",
         mihomoRuntime: scenario.runtime,
         port: 0,

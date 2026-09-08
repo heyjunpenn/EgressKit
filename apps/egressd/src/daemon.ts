@@ -7,7 +7,6 @@ import {
 } from "node:http";
 import { connect } from "node:net";
 import type { Duplex } from "node:stream";
-import { parse } from "yaml";
 
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
@@ -16,12 +15,9 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
+import { RemoteOperationRunner } from "./remote-operation.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
-import {
-  type OperationProcessingStage,
-  openControlState,
-  type PersistedNodeGeneration,
-} from "./state.js";
+import { openControlState, type PersistedNodeGeneration } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -39,6 +35,7 @@ export interface EgressdOptions {
   mihomoRuntime?: MihomoRuntime;
   port: number;
   proxyAuthentication?: ProxyAuthentication;
+  remoteSubscriptionTimeoutMs?: number;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
   stateDirectory?: string;
 }
@@ -152,79 +149,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     return revision;
   };
 
-  let shuttingDown = false;
-  const remoteFetches = new Set<AbortController>();
-  let remoteOperationQueue = Promise.resolve();
-  const downloadRemoteSubscription = async (locator: string): Promise<string> => {
-    const controller = new AbortController();
-    remoteFetches.add(controller);
-    try {
-      const response = await (options.fetchSubscription ?? fetch)(locator, {
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new SafeOperationError(`remote subscription returned HTTP ${response.status}`);
-      }
-      return await readRemoteSubscription(response, controller);
-    } finally {
-      remoteFetches.delete(controller);
-    }
-  };
-  const processRemoteOperation = async (
-    operationId: string,
-    subscriptionId: string,
-  ): Promise<void> => {
-    if (!state || shuttingDown) {
-      return;
-    }
-    let stage: OperationProcessingStage = "queued";
-    try {
-      const subscription = state.getSubscription(subscriptionId);
-      if (subscription?.kind !== "remote") {
-        throw new Error(`remote subscription not found: ${subscriptionId}`);
-      }
-      stage = "fetching";
-      state.transitionOperation(operationId, stage);
-      const source = await downloadRemoteSubscription(subscription.locator);
-      if (shuttingDown) {
-        return;
-      }
-      stage = "parsing";
-      state.transitionOperation(operationId, stage);
-      parse(source);
-      stage = "validating";
-      state.transitionOperation(operationId, stage);
-      const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
-      if (revision.nodes.length === 0) {
-        throw new Error("subscription contains no VLESS nodes");
-      }
-      stage = "applying";
-      state.transitionOperation(operationId, stage);
-      await activateRevision(revision, undefined, subscription.id, () => {
-        if (!shuttingDown) {
-          stage = "checking";
-          state.transitionOperation(operationId, stage);
-        }
-      });
-      if (shuttingDown) {
-        return;
-      }
-      state.saveActiveRevision({ imported: revision, source: subscription });
-      state.transitionOperation(operationId, "succeeded");
-    } catch (error) {
-      if (!shuttingDown) {
-        state.failOperation(operationId, stage, operationFailureReason(stage, error));
-      }
-    }
-  };
-
-  const queueRemoteOperation = (operationId: string, subscriptionId: string): void => {
-    setImmediate(() => {
-      remoteOperationQueue = remoteOperationQueue
-        .then(() => processRemoteOperation(operationId, subscriptionId))
-        .catch(() => undefined);
-    });
-  };
+  const remoteOperations = state
+    ? new RemoteOperationRunner({
+        activateRevision: (revision, subscription, checking) =>
+          activateRevision(revision, undefined, subscription.id, checking),
+        ...(options.fetchSubscription === undefined
+          ? {}
+          : { fetchSubscription: options.fetchSubscription }),
+        ...(options.remoteSubscriptionTimeoutMs === undefined
+          ? {}
+          : { fetchTimeoutMs: options.remoteSubscriptionTimeoutMs }),
+        state,
+      })
+    : undefined;
 
   const server = createServer((incoming, response) => {
     if (incoming.method === "GET" && incoming.url === "/live") {
@@ -278,7 +215,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         .then((url) => state.createRemoteSubscription(url))
         .then((created) => {
           writeJson(response, 202, { ...created, status: "queued" });
-          queueRemoteOperation(created.operationId, created.subscriptionId);
+          remoteOperations?.enqueue(created.operationId, created.subscriptionId);
         })
         .catch((error: unknown) => {
           writeJson(response, 422, {
@@ -326,7 +263,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           status: operation.status,
           subscriptionId: operation.subscriptionId,
         });
-        queueRemoteOperation(operation.id, operation.subscriptionId);
+        remoteOperations?.enqueue(operation.id, operation.subscriptionId);
       } catch (error) {
         writeJson(response, 404, {
           error: error instanceof Error ? error.message : String(error),
@@ -438,10 +375,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
-      shuttingDown = true;
-      for (const controller of remoteFetches) {
-        controller.abort();
-      }
+      remoteOperations?.close();
       try {
         await closeServer(server);
       } finally {
@@ -498,62 +432,6 @@ function writeJson(
 ): void {
   response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify(body));
-}
-
-class SafeOperationError extends Error {}
-
-function operationFailureReason(stage: OperationProcessingStage, error: unknown): string {
-  if (error instanceof SafeOperationError) {
-    return error.message;
-  }
-  switch (stage) {
-    case "queued":
-      return "remote operation could not start";
-    case "fetching":
-      return "remote subscription request failed";
-    case "parsing":
-      return "remote subscription is not valid YAML";
-    case "validating":
-      return "remote subscription failed validation";
-    case "applying":
-      return "Mihomo runtime rejected the subscription";
-    case "checking":
-      return "Mihomo listener readiness check failed";
-  }
-}
-
-async function readRemoteSubscription(
-  response: Response,
-  controller: AbortController,
-): Promise<string> {
-  const maximumBytes = 1024 * 1024;
-  if (!response.body) {
-    return "";
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      size += value.byteLength;
-      if (size > maximumBytes) {
-        await reader.cancel();
-        controller.abort();
-        throw new SafeOperationError("remote subscription exceeds 1 MiB");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return Buffer.concat(
-    chunks.map((chunk) => Buffer.from(chunk)),
-    size,
-  ).toString("utf8");
 }
 
 function checkListenerReady(listener: URL): Promise<void> {
