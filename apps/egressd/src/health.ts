@@ -97,7 +97,7 @@ export class NodeHealthController {
           listener: node.listener,
           manuallyEnabled: existing?.manuallyEnabled ?? true,
           nextProbeAt: now + this.#nextJitter(),
-          status: existing?.manuallyEnabled === false ? "disabled" : "warming",
+          status: "warming",
         });
         this.#onStatusChange?.(
           node.id,
