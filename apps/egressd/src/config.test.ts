@@ -63,6 +63,18 @@ test("proxy token configures data-plane authentication", () => {
   assert.deepEqual(config.proxyAuthentication, { tokens: ["proxy-secret"] });
 });
 
+test("target reputation is disabled by default and requires an explicit enable", () => {
+  assert.equal(loadConfig({}).targetReputationEnabled, undefined);
+  assert.equal(
+    loadConfig({ EGRESSKIT_TARGET_REPUTATION: "enabled" }).targetReputationEnabled,
+    true,
+  );
+  assert.throws(
+    () => loadConfig({ EGRESSKIT_TARGET_REPUTATION: "true" }),
+    /EGRESSKIT_TARGET_REPUTATION must be either "enabled" or "disabled"/,
+  );
+});
+
 test("state directory configures durable daemon control state", () => {
   assert.equal(
     loadConfig({ EGRESSKIT_STATE_DIRECTORY: "/var/lib/egresskit" }).stateDirectory,

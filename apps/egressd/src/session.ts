@@ -89,8 +89,11 @@ export class SoftStickySessions {
     return this.#acquire(sessionKey, true, excludedIds);
   }
 
-  acquireStrict(sessionKey: string): SchedulerLease | undefined {
-    return this.#acquire(sessionKey, false, new Set());
+  acquireStrict(
+    sessionKey: string,
+    excludedIds: ReadonlySet<string> = new Set(),
+  ): SchedulerLease | undefined {
+    return this.#acquire(sessionKey, false, excludedIds);
   }
 
   countActiveSessions(): number {

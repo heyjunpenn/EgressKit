@@ -25,6 +25,7 @@ export interface EgressdConfig {
   sessionMaximumActiveSessions?: number;
   sessionMaximumConcurrentConnections?: number;
   stateDirectory: string;
+  targetReputationEnabled?: true;
 }
 
 function parseNonNegativeInteger(name: string, value: string | undefined): number | undefined {
@@ -87,6 +88,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   const proxyAuthSetting = environment.EGRESSKIT_PROXY_AUTH ?? "enabled";
   if (proxyAuthSetting !== "enabled" && proxyAuthSetting !== "disabled") {
     throw new Error('EGRESSKIT_PROXY_AUTH must be either "enabled" or "disabled"');
+  }
+  const targetReputationSetting = environment.EGRESSKIT_TARGET_REPUTATION ?? "disabled";
+  if (targetReputationSetting !== "enabled" && targetReputationSetting !== "disabled") {
+    throw new Error('EGRESSKIT_TARGET_REPUTATION must be either "enabled" or "disabled"');
   }
   const allowUnsafeUnauthenticatedProxy =
     environment.EGRESSKIT_ALLOW_UNSAFE_UNAUTHENTICATED_PROXY === "true";
@@ -182,6 +187,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
     ...(preconnectTimeoutMs === undefined ? {} : { preconnectTimeoutMs }),
     stateDirectory,
+    ...(targetReputationSetting === "enabled" ? { targetReputationEnabled: true as const } : {}),
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
     proxyAuthentication:
       proxyAuthSetting === "disabled"
