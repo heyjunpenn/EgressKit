@@ -211,6 +211,59 @@ test("HTTP proxy requests require valid standard Basic proxy credentials", async
   );
 });
 
+test("each new HTTP proxy request performs a fresh rotate selection", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const first = await startSimulatedMihomoListener(undefined, [], [], "first");
+  t.after(() => first.close());
+  const second = await startSimulatedMihomoListener(undefined, [], [], "second");
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+
+  for (let requestNumber = 1; requestNumber <= 4; requestNumber += 1) {
+    assert.equal(
+      await sendProxyRequest(
+        daemon.address,
+        `http://${target.host}:${target.port}/request-${requestNumber}`,
+        "GET",
+        "",
+      ),
+      200,
+    );
+  }
+
+  assert.deepEqual(
+    observedRequests.map((request) => request.headers["x-egresskit-test-exit"]),
+    ["first", "second", "first", "second"],
+  );
+});
+
 test("GET, HEAD, and POST are forwarded once with their original method and body", async (t) => {
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);
@@ -310,8 +363,11 @@ test("sent GET, HEAD, and POST requests are not replayed to another listener", {
       { method: "POST", body: "do-not-replay" },
     ],
   );
-  assert.equal(firstListenerRequests.length, 3);
-  assert.equal(secondListenerRequests.length, 0);
+  assert.deepEqual([...firstListenerRequests, ...secondListenerRequests].sort(), [
+    `GET http://${target.host}:${target.port}/failed`,
+    `HEAD http://${target.host}:${target.port}/failed`,
+    `POST http://${target.host}:${target.port}/failed`,
+  ]);
 });
 
 test("an upstream failure after CONNECT 200 only closes the tunnel", {
@@ -387,6 +443,65 @@ test("CONNECT requires the same standard Basic proxy credentials", {
   assert.deepEqual(observedConnectTargets, [authority]);
 });
 
+test("new CONNECT tunnels rotate while requests inside one tunnel keep the same exit", {
+  timeout: 2_000,
+}, async (t) => {
+  const receivedRequests: string[] = [];
+  const target = await startHttpsTarget(receivedRequests);
+  t.after(() => target.close());
+  const firstSelections: string[] = [];
+  const first = await startSimulatedMihomoListener(undefined, firstSelections);
+  t.after(() => first.close());
+  const secondSelections: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, secondSelections);
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+  const authority = `${target.host}:${target.port}`;
+
+  await sendHttpsPayloadThroughProxy(
+    daemon.address,
+    authority,
+    `GET /one HTTP/1.1\r\nHost: ${authority}\r\n\r\nGET /two HTTP/1.1\r\nHost: ${authority}\r\nConnection: close\r\n\r\n`,
+  );
+  await sendHttpsPayloadThroughProxy(
+    daemon.address,
+    authority,
+    `GET /three HTTP/1.1\r\nHost: ${authority}\r\nConnection: close\r\n\r\n`,
+  );
+
+  assert.deepEqual(firstSelections, [authority]);
+  assert.deepEqual(secondSelections, [authority]);
+  const received = receivedRequests.join("");
+  assert.match(received, /GET \/one HTTP\/1\.1/);
+  assert.match(received, /GET \/two HTTP\/1\.1/);
+  assert.match(received, /GET \/three HTTP\/1\.1/);
+});
+
 function sendProxyRequest(
   proxy: { host: string; port: number },
   target: string,
@@ -453,6 +568,34 @@ function sendConnectRequest(
         socket.destroy();
         resolve(response);
       }
+    });
+    socket.on("error", reject);
+  });
+}
+
+function sendHttpsPayloadThroughProxy(
+  proxy: { host: string; port: number },
+  authority: string,
+  payload: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(proxy.port, proxy.host);
+    let responseHead = "";
+    socket.on("connect", () =>
+      socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`),
+    );
+    socket.on("data", (chunk) => {
+      responseHead += chunk.toString();
+      if (!responseHead.includes("\r\n\r\n")) {
+        return;
+      }
+      socket.removeAllListeners("data");
+      assert.match(responseHead, /^HTTP\/1\.1 200 Connection Established/);
+      const tlsSocket = connectTestTls(socket);
+      tlsSocket.on("secureConnect", () => tlsSocket.write(payload));
+      tlsSocket.on("data", () => undefined);
+      tlsSocket.on("end", resolve);
+      tlsSocket.on("error", reject);
     });
     socket.on("error", reject);
   });

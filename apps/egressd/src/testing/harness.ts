@@ -113,6 +113,7 @@ export async function startSimulatedMihomoListener(
   faults = new ConnectionFaultPlan(),
   observedConnectTargets: string[] = [],
   observedHttpRequests: string[] = [],
+  exitId?: string,
 ): Promise<RunningHttpFixture> {
   const server = createServer((incoming, response) => {
     try {
@@ -126,6 +127,7 @@ export async function startSimulatedMihomoListener(
             ...incoming.headers,
             host: target.host,
             via: appendVia(incoming.headers.via, "1.1 simulated-mihomo"),
+            ...(exitId === undefined ? {} : { "x-egresskit-test-exit": exitId }),
           },
           method: incoming.method,
         },
