@@ -5,6 +5,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { ImportedVlessRevision, NormalizedVlessNode } from "./subscription.js";
 
+const SQLITE_BUSY = 5;
+
 export interface SubscriptionIdentity {
   id: string;
   kind: "local" | "remote";
@@ -102,7 +104,7 @@ function acquireLock(lockPath: string, stateDirectory: string): DatabaseSync {
     return lock;
   } catch (error) {
     lock.close();
-    if ((error as { errcode?: number }).errcode === 5) {
+    if ((error as { errcode?: number }).errcode === SQLITE_BUSY) {
       throw new Error(`state directory is already owned by another daemon: ${stateDirectory}`);
     }
     throw error;
