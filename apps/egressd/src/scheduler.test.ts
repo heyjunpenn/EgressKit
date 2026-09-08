@@ -160,6 +160,8 @@ test("replaced generations stop new traffic and drain existing leases before rem
   const oldLease = scheduler.acquireById("node");
   assert.equal(oldLease?.candidate.generation, "old");
 
+  scheduler.replaceCandidates([candidate("node", { generation: "old" })]);
+
   scheduler.replaceCandidates([candidate("node", { generation: "new" })], (drained) =>
     removed.push(drained.generation),
   );

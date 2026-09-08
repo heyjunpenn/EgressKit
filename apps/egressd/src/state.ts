@@ -32,6 +32,12 @@ export interface PreparedNodeRevision {
   nodes: PersistedNodeGeneration[];
 }
 
+export interface PersistedListenerLease {
+  generation: string;
+  listenerPort: number;
+  logicalId: string;
+}
+
 export type SubscriptionRevisionStatus =
   | "saved"
   | "downloaded"
@@ -103,6 +109,7 @@ export interface ControlState extends SessionBindingStore {
   getNodeAliases(): ReadonlyMap<string, string>;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
+  listDrainingListenerLeases(): PersistedListenerLease[];
   loadActiveRevision(): PersistedActiveRevision | undefined;
   prepareNodeRevision(
     sourceId: string,
@@ -187,6 +194,7 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
+    listDrainingListenerLeases: () => listDrainingListenerLeases(controlDatabase),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     prepareNodeRevision: (sourceId, imported, now) =>
@@ -1133,8 +1141,10 @@ function prepareNodeRevision(
       (lease) =>
         lease.logical_id === logicalId &&
         lease.generation === generation &&
-        (lease.status !== "quarantined" ||
-          (lease.reusable_after !== null && lease.reusable_after <= now)),
+        (lease.status === "active" ||
+          (lease.status === "quarantined" &&
+            lease.reusable_after !== null &&
+            lease.reusable_after <= now)),
     );
     let listenerPort = prior?.listener_port;
     if (listenerPort === undefined || assigned.has(listenerPort)) {
@@ -1181,6 +1191,29 @@ function releaseNodeGeneration(
     )
     .run(reusableAfter, listenerPort, logicalId, generation);
   return result.changes > 0;
+}
+
+function listDrainingListenerLeases(database: DatabaseSync): PersistedListenerLease[] {
+  return database
+    .prepare(
+      `SELECT logical_id, generation, listener_port
+       FROM listener_port_leases
+       WHERE status = 'draining'
+       ORDER BY listener_port`,
+    )
+    .all()
+    .map((row) => {
+      const lease = row as {
+        generation: string;
+        listener_port: number;
+        logical_id: string;
+      };
+      return {
+        generation: lease.generation,
+        listenerPort: lease.listener_port,
+        logicalId: lease.logical_id,
+      };
+    });
 }
 
 function loadActiveRevision(database: DatabaseSync): PersistedActiveRevision | undefined {

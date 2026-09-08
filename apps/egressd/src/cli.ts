@@ -18,6 +18,9 @@ async function main(): Promise<void> {
               const node = mihomoConfig.proxies[0];
               return new Map(node ? [[node.name, config.mihomoListener as URL]] : []);
             },
+            removeListener: async () => {
+              throw new Error("the configured external Mihomo listener cannot be removed");
+            },
           },
         }),
   });

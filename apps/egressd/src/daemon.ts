@@ -53,7 +53,7 @@ export interface MihomoRuntime {
     config: ImportedVlessRevision["mihomoConfig"],
     context: MihomoApplyContext,
   ): Promise<ReadonlyMap<string, URL>>;
-  removeListener?(listener: URL): Promise<void>;
+  removeListener(listener: URL): Promise<void>;
 }
 
 export interface MihomoApplyContext {
@@ -196,6 +196,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
   try {
+    if (state && options.mihomoRuntime) {
+      for (const lease of state.listDrainingListenerLeases()) {
+        await options.mihomoRuntime.removeListener(
+          new URL(`http://127.0.0.1:${lease.listenerPort}`),
+        );
+        state.releaseNodeGeneration(
+          lease.logicalId,
+          lease.generation,
+          lease.listenerPort,
+          Date.now() + (options.portQuarantineMs ?? 60_000),
+        );
+      }
+    }
     softStickySessions = new SoftStickySessions({
       ...(options.sessionAbsoluteTtlMs === undefined
         ? {}
@@ -294,7 +307,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     logicalIdPrefix = "local",
     checking?: () => void,
   ): Promise<ImportedVlessRevision> => {
-    if (!options.mihomoRuntime) {
+    const runtime = options.mihomoRuntime;
+    if (!runtime) {
       throw new Error("Mihomo runtime is not configured");
     }
     const prepared =
@@ -313,7 +327,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       identities.map(({ id }) => ({ id })),
       [...aliases.values()],
     );
-    const listeners = await options.mihomoRuntime.apply(prepared.imported.mihomoConfig, {
+    const listeners = await runtime.apply(prepared.imported.mihomoConfig, {
       preserveListeners: [...runtimeGenerations.values()].map(({ listener }) => listener),
     });
     checking?.();
@@ -329,11 +343,20 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       identities.map(({ id }) => ({ id })),
       [...aliases.values()],
     );
+    const activeRuntimeKeys = new Set(
+      scheduler
+        .snapshot()
+        .map(({ generation, id, listener }) => generationKey(id, generation, listener)),
+    );
     const nextRuntimeGenerations = new Map<string, RuntimeGeneration>();
     const candidates = identities.map(({ generation, id, listenerPort, node }) => {
       const alias = aliases.get(id);
       const listener = listeners.get(node.name) as URL;
-      nextRuntimeGenerations.set(generationKey(id, generation), {
+      const key = generationKey(id, generation, listener);
+      if (runtimeGenerations.has(key) && !activeRuntimeKeys.has(key)) {
+        throw new Error(`Mihomo runtime reused a draining listener for ${node.name}`);
+      }
+      nextRuntimeGenerations.set(key, {
         generation,
         id,
         listener,
@@ -351,13 +374,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       runtimeGenerations.set(key, generation);
     }
     scheduler.replaceCandidates(candidates, (drained) => {
-      const key = generationKey(drained.id, drained.generation);
+      const key = generationKey(drained.id, drained.generation, drained.listener);
       const retired = runtimeGenerations.get(key);
-      if (!retired || !options.mihomoRuntime?.removeListener) {
+      if (!retired) {
         return;
       }
       let removal: Promise<void>;
-      removal = options.mihomoRuntime
+      removal = runtime
         .removeListener(retired.listener)
         .then(() => {
           state?.releaseNodeGeneration(
@@ -737,6 +760,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       remoteOperations?.close();
       try {
         await closeServer(server);
+        if (retirementOperations.size > 0) {
+          await waitForBoundedCompletion(
+            Promise.allSettled([...retirementOperations]).then(() => undefined),
+            1_000,
+          );
+        }
       } finally {
         await state?.close();
       }
@@ -797,8 +826,8 @@ function preparePersistedNodeRevision(
   };
 }
 
-function generationKey(id: string, generation: string): string {
-  return `${id}\0${generation}`;
+function generationKey(id: string, generation: string, listener: URL): string {
+  return `${id}\0${generation}\0${listener.href}`;
 }
 
 function waitForBoundedCompletion(operation: Promise<void>, timeoutMs: number): Promise<void> {

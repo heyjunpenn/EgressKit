@@ -257,6 +257,7 @@ test("a restart restores the last valid revision and forwards without reimportin
     proxyAuthentication: false as const,
     stateDirectory,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async (
         config: Parameters<
           NonNullable<Parameters<typeof startEgressd>[0]["mihomoRuntime"]>["apply"]
@@ -324,6 +325,7 @@ test("an unavailable remote source does not block startup from its last valid sn
     proxyAuthentication: false,
     stateDirectory,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () => new Map([["remote", new URL(`http://${mihomo.host}:${mihomo.port}`)]]),
     },
   });
@@ -528,6 +530,7 @@ test("sent GET, HEAD, and POST requests are not replayed to another listener", {
     port: 0,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -598,6 +601,7 @@ test("soft sticky retries a different listener before sending HTTP and keeps the
     proxyAuthentication: { tokens: ["proxy-secret"] },
     stateDirectory,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
@@ -633,6 +637,7 @@ test("HTTP listener transport failure is recorded without replay and egressd sta
     port: 0,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([["first", new URL(`http://${resetting.host}:${resetting.port}`)]]),
     },
@@ -669,6 +674,7 @@ test("rotate retries a different listener before CONNECT 200", { timeout: 2_000 
     port: 0,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
@@ -718,7 +724,7 @@ test("CONNECT failover uses three attempts by default and honors a bounded overr
       port: 0,
       ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
       proxyAuthentication: false,
-      mihomoRuntime: { apply: async () => listeners },
+      mihomoRuntime: { apply: async () => listeners, removeListener: async () => undefined },
     });
   const source = `proxies:
   - { name: one, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
@@ -761,6 +767,7 @@ test("strict sticky and explicit node routes never use another candidate", async
     port: 0,
     proxyAuthentication: { tokens: ["proxy-secret"] },
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -811,6 +818,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
     preconnectTimeoutMs: 20,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${timeoutListener.host}:${timeoutListener.port}`)],
@@ -853,6 +861,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
     preconnectTimeoutMs: 100,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${cancelledListener.host}:${cancelledListener.port}`)],
@@ -1323,6 +1332,7 @@ test("alias updates serialize with revision activation and remain routable", asy
     proxyAuthentication: { tokens: ["proxy-secret"] },
     stateDirectory,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () => {
         applyCount += 1;
         if (applyCount === 2) {
@@ -1389,6 +1399,7 @@ test("alias conflicts are rejected before runtime apply and preserve the active 
     proxyAuthentication: { tokens: ["proxy-secret"] } as const,
     stateDirectory,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () => {
         applyCount += 1;
         return new Map([["first", new URL(`http://${first.host}:${first.port}`)]]);
@@ -1504,7 +1515,7 @@ test("a changed generation drains its listener before removal and port quarantin
   assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
 
-  assert.equal((await importYaml("newest.example.com")).status, 201);
+  assert.equal((await importYaml("old.example.com")).status, 201);
   assert.equal(appliedConfigs[2]?.listeners[0]?.port, 20_002);
   assert.deepEqual(preservedListeners, [
     [],
@@ -1529,6 +1540,120 @@ test("a changed generation drains its listener before removal and port quarantin
       `http://${oldListener.host}:${oldListener.port}/`,
     ]),
   );
+});
+
+test("daemon shutdown persists a completed listener removal before closing state", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-removal-shutdown-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const listener = await startSimulatedMihomoListener();
+  t.after(() => listener.close());
+  let announceRemoval: (() => void) | undefined;
+  const removalStarted = new Promise<void>((resolve) => {
+    announceRemoval = resolve;
+  });
+  let finishRemoval: (() => void) | undefined;
+  const removalGate = new Promise<void>((resolve) => {
+    finishRemoval = resolve;
+  });
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]),
+      removeListener: async () => {
+        announceRemoval?.();
+        await removalGate;
+      },
+    },
+    port: 0,
+    portQuarantineMs: 0,
+    proxyAuthentication: false,
+    stateDirectory,
+  });
+  const importYaml = (server: string) =>
+    fetch(`http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`, {
+      body: `proxies:\n  - { name: primary, type: vless, server: ${server}, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n`,
+      headers: { authorization: "Bearer test-admin-token" },
+      method: "POST",
+    });
+  assert.equal((await importYaml("old.example.com")).status, 201);
+  assert.equal((await importYaml("new.example.com")).status, 201);
+  await removalStarted;
+
+  let closed = false;
+  const closing = daemon.close().then(() => {
+    closed = true;
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.equal(closed, false);
+  finishRemoval?.();
+  await closing;
+
+  const state = await openControlState(stateDirectory);
+  t.after(() => state.close());
+  const replacement = state.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:\n  - { name: replacement, type: vless, server: replacement.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }\n`,
+      { firstListenerPort: 20_000 },
+    ),
+  );
+  assert.equal(replacement.nodes[0]?.listenerPort, 20_000);
+});
+
+test("startup removes abandoned draining listeners before quarantining their ports", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-draining-recovery-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const state = await openControlState(stateDirectory);
+  const source = { id: "local", kind: "local" as const, locator: "inline" };
+  const first = state.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:\n  - { name: primary, type: vless, server: old.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n`,
+      { firstListenerPort: 20_000 },
+    ),
+  );
+  state.saveActiveRevision({ imported: first.imported, source });
+  const second = state.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:\n  - { name: primary, type: vless, server: new.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n`,
+      { firstListenerPort: 20_000 },
+    ),
+  );
+  state.saveActiveRevision({ imported: second.imported, source });
+  await state.close();
+  const listener = await startSimulatedMihomoListener();
+  t.after(() => listener.close());
+  const removedListeners: string[] = [];
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]),
+      removeListener: async (removed) => {
+        removedListeners.push(removed.href);
+      },
+    },
+    port: 0,
+    portQuarantineMs: 0,
+    proxyAuthentication: false,
+    stateDirectory,
+  });
+  await daemon.close();
+
+  assert.deepEqual(removedListeners, ["http://127.0.0.1:20000/"]);
+  const recovered = await openControlState(stateDirectory);
+  t.after(() => recovered.close());
+  const replacement = recovered.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:\n  - { name: replacement, type: vless, server: replacement.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }\n`,
+      { firstListenerPort: 20_000 },
+    ),
+  );
+  assert.equal(replacement.nodes[0]?.listenerPort, 20_000);
 });
 
 function sendProxyRequest(
@@ -1791,6 +1916,7 @@ async function startTwoExitDaemon(
     ...(schedulerSignals === undefined ? {} : { schedulerSignals }),
     ...overrides,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -1910,6 +2036,7 @@ test("CONNECT reaches the target through the selected simulated Mihomo listener"
     port: 0,
     proxyAuthentication: false,
     mihomoRuntime: {
+      removeListener: async () => undefined,
       apply: async (config) => {
         appliedConfigs.push(config);
         return new Map([["primary", new URL(`http://${mihomo.host}:${mihomo.port}`)]]);

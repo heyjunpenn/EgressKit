@@ -101,19 +101,15 @@ export class RotateScheduler {
           onDrained: undefined,
         };
       }
-      return {
-        candidate: {
-          ...candidate,
-          consecutiveFailures: existing.candidate.consecutiveFailures,
-          ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
-          healthy: existing.candidate.healthy,
-          successRate: existing.candidate.successRate,
-        },
-        currentWeight: existing.currentWeight,
-        healthStatus: existing.healthStatus,
-        leasedConnections: existing.leasedConnections,
-        onDrained: undefined,
+      existing.candidate = {
+        ...candidate,
+        consecutiveFailures: existing.candidate.consecutiveFailures,
+        ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
+        healthy: existing.candidate.healthy,
+        successRate: existing.candidate.successRate,
       };
+      existing.onDrained = undefined;
+      return existing;
     });
   }
 
@@ -269,8 +265,10 @@ function lease(state: CandidateState): SchedulerLease {
   };
 }
 
-function candidateKey(candidate: Pick<SchedulerCandidate, "generation" | "id">): string {
-  return `${candidate.id}\0${candidate.generation}`;
+function candidateKey(
+  candidate: Pick<SchedulerCandidate, "generation" | "id" | "listener">,
+): string {
+  return `${candidate.id}\0${candidate.generation}\0${candidate.listener.href}`;
 }
 
 function beginDraining(

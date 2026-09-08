@@ -113,6 +113,28 @@ test("node generation planning keeps stable ports and quarantines retired listen
   assert.equal(changed.nodes[1]?.listenerPort, 20_002);
   assert.notEqual(changed.nodes[1]?.generation, first.nodes[0]?.generation);
   state.saveActiveRevision({ imported: changed.imported, source });
+  assert.deepEqual(
+    state.listDrainingListenerLeases().map(({ listenerPort, logicalId }) => ({
+      listenerPort,
+      logicalId,
+    })),
+    [{ listenerPort: 20_000, logicalId: "local:first" }],
+  );
+
+  const reverted = state.prepareNodeRevision(
+    "local",
+    importLocalVlessYaml(
+      `proxies:
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+`,
+      { firstListenerPort: 20_000 },
+    ),
+    3,
+  );
+  assert.equal(reverted.nodes[0]?.listenerPort, 20_001);
+  assert.equal(reverted.nodes[1]?.listenerPort, 20_003);
+  assert.equal(reverted.nodes[1]?.generation, first.nodes[0]?.generation);
 
   assert.equal(
     state.releaseNodeGeneration(
