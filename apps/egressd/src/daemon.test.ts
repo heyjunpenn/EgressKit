@@ -1434,6 +1434,103 @@ test("alias conflicts are rejected before runtime apply and preserve the active 
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
 });
 
+test("a changed generation drains its listener before removal and port quarantine", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-draining-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  let releaseFirstResponse: (() => void) | undefined;
+  const firstResponseGate = new Promise<void>((resolve) => {
+    releaseFirstResponse = resolve;
+  });
+  t.after(() => releaseFirstResponse?.());
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests, {
+    beforeResponse: async () => {
+      if (observedRequests.length === 1) {
+        await firstResponseGate;
+      }
+    },
+  });
+  t.after(() => target.close());
+  const oldListener = await startSimulatedMihomoListener(undefined, [], [], "old");
+  t.after(() => oldListener.close());
+  const newListener = await startSimulatedMihomoListener(undefined, [], [], "new");
+  t.after(() => newListener.close());
+  const newestListener = await startSimulatedMihomoListener(undefined, [], [], "newest");
+  t.after(() => newestListener.close());
+  const appliedConfigs: Parameters<
+    NonNullable<Parameters<typeof startEgressd>[0]["mihomoRuntime"]>["apply"]
+  >[0][] = [];
+  const preservedListeners: string[][] = [];
+  const removedListeners: string[] = [];
+  let applyCount = 0;
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async (config, context) => {
+        appliedConfigs.push(config);
+        preservedListeners.push(context.preserveListeners.map((listener) => listener.href));
+        applyCount += 1;
+        const listener = [oldListener, newListener, newestListener][applyCount - 1];
+        assert.ok(listener);
+        return new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]);
+      },
+      removeListener: async (listener) => {
+        removedListeners.push(listener.href);
+      },
+    },
+    port: 0,
+    portQuarantineMs: 100,
+    proxyAuthentication: false,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const importYaml = (server: string) =>
+    fetch(`http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`, {
+      body: `proxies:\n  - { name: primary, type: vless, server: ${server}, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n`,
+      headers: { authorization: "Bearer test-admin-token" },
+      method: "POST",
+    });
+  assert.equal((await importYaml("old.example.com")).status, 201);
+  const targetUrl = `http://${target.host}:${target.port}/generation`;
+  const oldRequest = sendProxyRequest(daemon.address, targetUrl, "GET", "");
+  await waitFor(async () => observedRequests.length === 1);
+
+  assert.equal((await importYaml("new.example.com")).status, 201);
+  assert.equal(appliedConfigs[0]?.listeners[0]?.port, 20_000);
+  assert.equal(appliedConfigs[1]?.listeners[0]?.port, 20_001);
+  assert.deepEqual(preservedListeners, [[], [`http://${oldListener.host}:${oldListener.port}/`]]);
+  assert.deepEqual(removedListeners, []);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
+
+  assert.equal((await importYaml("newest.example.com")).status, 201);
+  assert.equal(appliedConfigs[2]?.listeners[0]?.port, 20_002);
+  assert.deepEqual(preservedListeners, [
+    [],
+    [`http://${oldListener.host}:${oldListener.port}/`],
+    [
+      `http://${oldListener.host}:${oldListener.port}/`,
+      `http://${newListener.host}:${newListener.port}/`,
+    ],
+  ]);
+  await waitFor(async () => removedListeners.length === 1);
+  assert.deepEqual(removedListeners, [`http://${newListener.host}:${newListener.port}/`]);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "newest");
+
+  releaseFirstResponse?.();
+  assert.equal(await oldRequest, 200);
+  await waitFor(async () => removedListeners.length === 2);
+  assert.deepEqual(
+    new Set(removedListeners),
+    new Set([
+      `http://${newListener.host}:${newListener.port}/`,
+      `http://${oldListener.host}:${oldListener.port}/`,
+    ]),
+  );
+});
+
 function sendProxyRequest(
   proxy: { host: string; port: number },
   target: string,

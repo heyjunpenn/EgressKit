@@ -19,7 +19,7 @@ export interface RemoteOperationRunnerOptions {
     revision: ImportedVlessRevision,
     subscription: SubscriptionIdentity,
     checking: () => void,
-  ): Promise<void>;
+  ): Promise<ImportedVlessRevision>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   fetchTimeoutMs?: number;
   clock?: RemoteOperationClock;
@@ -175,7 +175,7 @@ export class RemoteOperationRunner {
     const runControlPlaneOperation =
       this.#options.runControlPlaneOperation ?? runControlPlaneOperationDirectly;
     await runControlPlaneOperation(async () => {
-      await this.#options.activateRevision(revision, subscription, () => {
+      const activatedRevision = await this.#options.activateRevision(revision, subscription, () => {
         if (!this.#shuttingDown) {
           this.#options.state.markRevisionAccepted(subscriptionRevisionId, operationId);
           setStage("checking");
@@ -185,7 +185,7 @@ export class RemoteOperationRunner {
         return;
       }
       this.#options.state.saveActiveRevision({
-        imported: revision,
+        imported: activatedRevision,
         operationId,
         source: subscription,
         subscriptionRevisionId,
