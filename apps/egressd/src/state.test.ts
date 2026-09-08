@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -56,10 +58,33 @@ test("control state restores the last active subscription revision and node gene
   assert.deepEqual(restored?.imported, imported);
 });
 
-test("control state reclaims a lock left by an exited daemon", async (t) => {
+test("the operating system releases state ownership after a daemon crash", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-state-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));
-  await writeFile(join(stateDirectory, "egressd.lock"), "2147483647\n");
+  const stateModuleUrl = new URL("../dist/state.js", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `const { openControlState } = await import(${JSON.stringify(stateModuleUrl)});
+await openControlState(process.env.EGRESSKIT_TEST_STATE_DIRECTORY);
+process.stdout.write("locked\\n");
+await new Promise(() => {});`,
+    ],
+    {
+      env: { ...process.env, EGRESSKIT_TEST_STATE_DIRECTORY: stateDirectory },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  });
+  await once(child.stdout, "data");
+  child.kill("SIGKILL");
+  await once(child, "exit");
 
   const state = await openControlState(stateDirectory);
   t.after(() => state.close());

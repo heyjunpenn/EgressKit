@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { loadConfig } from "./config.js";
@@ -19,6 +21,7 @@ test("proxy authentication is enabled by default", () => {
     host: "127.0.0.1",
     port: 8787,
     proxyAuthentication: { tokens: [] },
+    stateDirectory: join(homedir(), ".local", "state", "egresskit"),
   });
 });
 
@@ -65,4 +68,5 @@ test("state directory configures durable daemon control state", () => {
     "/var/lib/egresskit",
   );
   assert.throws(() => loadConfig({ EGRESSKIT_STATE_DIRECTORY: "" }), /must not be empty/);
+  assert.equal(loadConfig({ XDG_STATE_HOME: "/tmp/state" }).stateDirectory, "/tmp/state/egresskit");
 });

@@ -9,6 +9,8 @@ import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 
 import { startEgressd } from "./daemon.js";
+import { openControlState } from "./state.js";
+import { importLocalVlessYaml } from "./subscription.js";
 import {
   ConnectionFaultPlan,
   connectTestTls,
@@ -222,6 +224,57 @@ test("a restart restores the last valid revision and forwards without reimportin
   assert.equal(observedRequests[0]?.url, "/restored");
   assert.equal(appliedConfigs.length, 2);
   assert.deepEqual(appliedConfigs[1], appliedConfigs[0]);
+});
+
+test("an unavailable remote source does not block startup from its last valid snapshot", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-daemon-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const sourceUrl = "https://127.0.0.1:1/subscription.yaml";
+  const imported = importLocalVlessYaml(
+    `proxies:
+  - { name: remote, type: vless, server: proxy.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+`,
+    { firstListenerPort: 20_000 },
+  );
+  const state = await openControlState(stateDirectory);
+  state.saveActiveRevision({
+    imported,
+    source: { id: "remote-subscription", kind: "remote", locator: sourceUrl },
+  });
+  await state.close();
+
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    stateDirectory,
+    mihomoRuntime: {
+      apply: async () => new Map([["remote", new URL(`http://${mihomo.host}:${mihomo.port}`)]]),
+    },
+  });
+  t.after(() => daemon.close());
+
+  const response = await sendProxyRequestResponse(
+    daemon.address,
+    `http://${target.host}:${target.port}/offline-restore`,
+    "GET",
+    "",
+  );
+  assert.equal(response.status, 200);
+  assert.equal(observedRequests[0]?.url, "/offline-restore");
+  await daemon.close();
+  const reopenedState = await openControlState(stateDirectory);
+  assert.deepEqual(reopenedState.loadActiveRevision()?.source, {
+    id: "remote-subscription",
+    kind: "remote",
+    locator: sourceUrl,
+  });
+  await reopenedState.close();
 });
 
 test("a second daemon cannot own the same state directory", async (t) => {

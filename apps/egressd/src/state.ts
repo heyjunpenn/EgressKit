@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { type FileHandle, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -45,13 +44,7 @@ export interface ControlState {
 export async function openControlState(stateDirectory: string): Promise<ControlState> {
   await mkdir(stateDirectory, { recursive: true });
   const lockPath = join(stateDirectory, "egressd.lock");
-  const lock = await acquireLock(lockPath, stateDirectory);
-  try {
-    await lock.writeFile(`${process.pid}\n`);
-  } catch (error) {
-    await releaseLock(lock, lockPath);
-    throw error;
-  }
+  const lock = acquireLock(lockPath, stateDirectory);
 
   const databasePath = join(stateDirectory, "control.sqlite");
   let database: DatabaseSync | undefined;
@@ -66,7 +59,7 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     migrate(database);
   } catch (error) {
     database?.close();
-    await releaseLock(lock, lockPath);
+    releaseLock(lock);
     throw error;
   }
   const controlDatabase = database;
@@ -93,42 +86,34 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
         return;
       }
       closed = true;
-      controlDatabase.close();
-      await releaseLock(lock, lockPath);
+      try {
+        controlDatabase.close();
+      } finally {
+        releaseLock(lock);
+      }
     },
   };
 }
 
-async function acquireLock(lockPath: string, stateDirectory: string): Promise<FileHandle> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-      const ownerPid = Number.parseInt(await readFile(lockPath, "utf8"), 10);
-      if (
-        attempt === 0 &&
-        Number.isInteger(ownerPid) &&
-        ownerPid > 0 &&
-        !isProcessAlive(ownerPid)
-      ) {
-        await unlink(lockPath);
-        continue;
-      }
+function acquireLock(lockPath: string, stateDirectory: string): DatabaseSync {
+  const lock = new DatabaseSync(lockPath);
+  try {
+    lock.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE");
+    return lock;
+  } catch (error) {
+    lock.close();
+    if ((error as { errcode?: number }).errcode === 5) {
       throw new Error(`state directory is already owned by another daemon: ${stateDirectory}`);
     }
+    throw error;
   }
-  throw new Error(`could not acquire state directory: ${stateDirectory}`);
 }
 
-function isProcessAlive(pid: number): boolean {
+function releaseLock(lock: DatabaseSync): void {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    lock.exec("ROLLBACK");
+  } finally {
+    lock.close();
   }
 }
 
@@ -302,13 +287,4 @@ function loadActiveRevision(database: DatabaseSync): PersistedActiveRevision | u
 function nodeGeneration(node: NormalizedVlessNode): string {
   const { name: _name, ...connectionParameters } = node;
   return createHash("sha256").update(JSON.stringify(connectionParameters)).digest("hex");
-}
-
-async function releaseLock(lock: FileHandle, lockPath: string): Promise<void> {
-  await lock.close();
-  await unlink(lockPath).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  });
 }
