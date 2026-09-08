@@ -135,6 +135,167 @@ test("an HTTP proxy request reaches the target through the simulated Mihomo list
   assert.equal(observedRequests[0]?.headers.via, "1.1 egresskit, 1.1 simulated-mihomo");
 });
 
+test("GET, HEAD, and POST are forwarded once with their original method and body", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  for (const [method, body] of [
+    ["GET", ""],
+    ["HEAD", ""],
+    ["POST", "payload"],
+  ] as const) {
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/${method.toLowerCase()}`,
+      method,
+      body,
+    );
+  }
+
+  assert.deepEqual(
+    observedRequests.map(({ method, body }) => ({ method, body })),
+    [
+      { method: "GET", body: "" },
+      { method: "HEAD", body: "" },
+      { method: "POST", body: "payload" },
+    ],
+  );
+});
+
+test("sent GET, HEAD, and POST requests are not replayed to another listener", {
+  timeout: 2_000,
+}, async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests, { closeWithoutResponse: true });
+  t.after(() => target.close());
+  const firstListenerRequests: string[] = [];
+  const first = await startSimulatedMihomoListener(undefined, [], firstListenerRequests);
+  t.after(() => first.close());
+  const secondListenerRequests: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, [], secondListenerRequests);
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+  for (const [method, body] of [
+    ["GET", ""],
+    ["HEAD", ""],
+    ["POST", "do-not-replay"],
+  ] as const) {
+    assert.equal(
+      await sendProxyRequest(
+        daemon.address,
+        `http://${target.host}:${target.port}/failed`,
+        method,
+        body,
+      ),
+      502,
+    );
+  }
+
+  assert.deepEqual(
+    observedRequests.map(({ method, body }) => ({ method, body })),
+    [
+      { method: "GET", body: "" },
+      { method: "HEAD", body: "" },
+      { method: "POST", body: "do-not-replay" },
+    ],
+  );
+  assert.equal(firstListenerRequests.length, 3);
+  assert.equal(secondListenerRequests.length, 0);
+});
+
+test("an upstream failure after CONNECT 200 only closes the tunnel", {
+  timeout: 2_000,
+}, async (t) => {
+  const connectionEvents: string[] = [];
+  const target = await startHttpsTarget([], connectionEvents);
+  t.after(() => target.close());
+  const faults = new ConnectionFaultPlan();
+  faults.failNext("after-tunnel-established");
+  const mihomo = await startSimulatedMihomoListener(faults);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  const targetAuthority = `${target.host}:${target.port}`;
+  const received = await new Promise<string>((resolve, reject) => {
+    const socket = connect(daemon.address.port, daemon.address.host);
+    let response = "";
+    socket.on("connect", () =>
+      socket.write(`CONNECT ${targetAuthority} HTTP/1.1\r\nHost: ${targetAuthority}\r\n\r\n`),
+    );
+    socket.on("data", (chunk) => {
+      response += chunk.toString();
+    });
+    socket.on("close", () => resolve(response));
+    socket.on("error", reject);
+  });
+
+  assert.equal(received, "HTTP/1.1 200 Connection Established\r\n\r\n");
+  assert.deepEqual(connectionEvents, ["opened", "closed"]);
+});
+
+function sendProxyRequest(
+  proxy: { host: string; port: number },
+  target: string,
+  method: string,
+  body: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        host: proxy.host,
+        port: proxy.port,
+        path: target,
+        method,
+        headers: body ? { "content-length": Buffer.byteLength(body) } : {},
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(body);
+  });
+}
+
 test("the test clock advances without waiting for wall-clock time", () => {
   const clock = new ManualClock(1_000);
 
