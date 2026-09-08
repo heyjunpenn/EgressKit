@@ -1,3 +1,5 @@
+import type { NodeHealthStatus } from "./health.js";
+
 export interface SchedulerCandidate {
   activeConnections: number;
   consecutiveFailures: number;
@@ -40,6 +42,7 @@ export interface SchedulerLease {
 interface CandidateState {
   candidate: SchedulerCandidate;
   currentWeight: number;
+  healthStatus: NodeHealthStatus;
   leasedConnections: number;
 }
 
@@ -70,9 +73,30 @@ export class RotateScheduler {
 
   replaceCandidates(candidates: readonly SchedulerCandidate[]): void {
     validateSelectorUniqueness(candidates);
+    const previous = new Map(this.#states.map((state) => [state.candidate.id, state]));
     this.#states = candidates.map((candidate) => {
       validateCandidate(candidate);
-      return { candidate, currentWeight: 0, leasedConnections: 0 };
+      const existing = previous.get(candidate.id);
+      if (!existing) {
+        return {
+          candidate,
+          currentWeight: 0,
+          healthStatus: candidate.healthy ? "healthy" : "cooldown",
+          leasedConnections: 0,
+        };
+      }
+      return {
+        candidate: {
+          ...candidate,
+          consecutiveFailures: existing.candidate.consecutiveFailures,
+          ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
+          healthy: existing.candidate.healthy,
+          successRate: existing.candidate.successRate,
+        },
+        currentWeight: existing.currentWeight,
+        healthStatus: existing.healthStatus,
+        leasedConnections: existing.leasedConnections,
+      };
     });
   }
 
@@ -137,6 +161,42 @@ export class RotateScheduler {
 
   snapshot(): readonly SchedulerCandidate[] {
     return this.#states.map(({ candidate }) => ({ ...candidate }));
+  }
+
+  healthStatus(id: string): NodeHealthStatus | undefined {
+    return this.#states.find(({ candidate }) => candidate.id === id)?.healthStatus;
+  }
+
+  reportHealthCheck(id: string, succeeded: boolean): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) {
+      return false;
+    }
+    state.candidate = succeeded
+      ? {
+          ...state.candidate,
+          consecutiveFailures: 0,
+          successRate: state.candidate.successRate * 0.8 + 0.2,
+        }
+      : {
+          ...state.candidate,
+          consecutiveFailures: state.candidate.consecutiveFailures + 1,
+          successRate: state.candidate.successRate * 0.8,
+        };
+    return true;
+  }
+
+  setHealthStatus(id: string, healthStatus: NodeHealthStatus): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) {
+      return false;
+    }
+    state.healthStatus = healthStatus;
+    state.candidate = {
+      ...state.candidate,
+      healthy: healthStatus === "healthy" || healthStatus === "degraded",
+    };
+    return true;
   }
 
   setSelectors(id: string, selectors: readonly string[]): boolean {

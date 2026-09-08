@@ -139,3 +139,34 @@ test("session resource limits and expirations are configurable positive integers
     assert.throws(() => loadConfig({ [name]: "0" }), /positive integer/);
   }
 });
+
+test("node health targets, threshold, concurrency, interval, and jitter are configurable", () => {
+  const config = loadConfig({
+    EGRESSKIT_HEALTH_CHECK_CONCURRENCY: "3",
+    EGRESSKIT_HEALTH_CHECK_INTERVAL_MS: "45000",
+    EGRESSKIT_HEALTH_CHECK_JITTER_MS: "2500",
+    EGRESSKIT_HEALTH_CHECK_SUCCESS_THRESHOLD: "2",
+    EGRESSKIT_HEALTH_CHECK_URLS: "https://one.example/health, http://two.example/status",
+  });
+
+  assert.deepEqual(config.healthCheckUrls?.map(String), [
+    "https://one.example/health",
+    "http://two.example/status",
+  ]);
+  assert.equal(config.healthCheckSuccessThreshold, 2);
+  assert.equal(config.healthCheckConcurrency, 3);
+  assert.equal(config.healthCheckIntervalMs, 45_000);
+  assert.equal(config.healthCheckJitterMs, 2_500);
+  assert.throws(
+    () => loadConfig({ EGRESSKIT_HEALTH_CHECK_URLS: "ftp://invalid.example" }),
+    /HTTP or HTTPS/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        EGRESSKIT_HEALTH_CHECK_SUCCESS_THRESHOLD: "2",
+        EGRESSKIT_HEALTH_CHECK_URLS: "https://only.example",
+      }),
+    /within the configured URL count/,
+  );
+});

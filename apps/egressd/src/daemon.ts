@@ -9,6 +9,7 @@ import {
 import { connect, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
+import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
   authorizeProxyRequest,
@@ -54,6 +55,12 @@ export interface EgressdOptions {
   allowUnsafeUnauthenticatedProxy?: boolean;
   checkMihomoListener?: (listener: URL) => Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
+  healthCheckConcurrency?: number;
+  healthCheckIntervalMs?: number;
+  healthCheckJitterMs?: number;
+  healthCheckProbe?: HealthProbe;
+  healthCheckSuccessThreshold?: number;
+  healthCheckUrls?: readonly URL[];
   host: string;
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
@@ -95,7 +102,9 @@ export interface RunningEgressd {
     port: number;
   };
   close(): Promise<void>;
+  healthSnapshot(): readonly NodeHealthSnapshot[];
   importLocalSubscription(source: string): Promise<ImportedVlessRevision>;
+  setNodeEnabled(id: string, enabled: boolean): boolean;
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -138,6 +147,31 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ]
       : [],
   );
+  const healthController = options.healthCheckUrls
+    ? new NodeHealthController({
+        ...(options.healthCheckConcurrency === undefined
+          ? {}
+          : { concurrency: options.healthCheckConcurrency }),
+        healthUrls: options.healthCheckUrls,
+        ...(options.healthCheckIntervalMs === undefined
+          ? {}
+          : { intervalMs: options.healthCheckIntervalMs }),
+        ...(options.healthCheckJitterMs === undefined
+          ? {}
+          : { jitterMs: options.healthCheckJitterMs }),
+        onProbeResult: (id, succeeded) => scheduler.reportHealthCheck(id, succeeded),
+        onStatusChange: (id, status) => scheduler.setHealthStatus(id, status),
+        ...(options.healthCheckProbe === undefined ? {} : { probe: options.healthCheckProbe }),
+        ...(options.healthCheckSuccessThreshold === undefined
+          ? {}
+          : { successThreshold: options.healthCheckSuccessThreshold }),
+      })
+    : undefined;
+  if (healthController) {
+    healthController.replaceNodes(
+      scheduler.snapshot().map(({ id, listener }) => ({ generation: "configured", id, listener })),
+    );
+  }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
@@ -198,7 +232,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (lease === "not-implemented" || lease === undefined) {
         return lease;
       }
-      const observedLease = observeConnectionOutcome(lease, options.onConnectionOutcome);
+      const observedLease = observeConnectionOutcome(lease, (outcome) => {
+        if (outcome.result === "failure") {
+          healthController?.recordConnectionFailure(outcome.nodeId);
+        } else {
+          healthController?.recordConnectionSuccess(outcome.nodeId);
+        }
+        options.onConnectionOutcome?.(outcome);
+      });
       attemptedIds.add(observedLease.candidate.id);
       const startedAt = Date.now();
       try {
@@ -271,6 +312,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           alias === undefined ? [] : [alias],
         );
       }),
+    );
+    healthController?.replaceNodes(
+      identities.map(({ id, node }) => ({
+        generation: JSON.stringify(node),
+        id,
+        listener: listeners.get(node.name) as URL,
+      })),
     );
   };
 
@@ -585,6 +633,30 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     throw new Error("egressd did not bind a TCP address");
   }
 
+  let healthCheckRunning = false;
+  let healthCheckRun: Promise<void> | undefined;
+  const healthCheckAbort = new AbortController();
+  const healthCheckTimer = healthController
+    ? setInterval(
+        () => {
+          if (healthCheckRunning) {
+            return;
+          }
+          healthCheckRunning = true;
+          const run = healthController.runDue(Date.now(), healthCheckAbort.signal);
+          healthCheckRun = run;
+          const finishRun = () => {
+            healthCheckRunning = false;
+            if (healthCheckRun === run) {
+              healthCheckRun = undefined;
+            }
+          };
+          void run.then(finishRun, finishRun);
+        },
+        Math.min(1_000, options.healthCheckIntervalMs ?? 30_000),
+      )
+    : undefined;
+
   let closed = false;
   return {
     address: { host: options.host, port: address.port },
@@ -593,6 +665,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
+      if (healthCheckTimer) {
+        clearInterval(healthCheckTimer);
+      }
+      healthCheckAbort.abort();
+      if (healthCheckRun) {
+        await waitForBoundedCompletion(healthCheckRun, 1_000);
+      }
       remoteOperations?.close();
       try {
         await closeServer(server);
@@ -600,8 +679,26 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         await state?.close();
       }
     },
+    healthSnapshot: () => healthController?.snapshot() ?? [],
     importLocalSubscription,
+    setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
   };
+}
+
+function waitForBoundedCompletion(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, timeoutMs);
+    void operation.then(
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+    );
+  });
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {
