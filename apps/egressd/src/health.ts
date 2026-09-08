@@ -120,17 +120,18 @@ export class NodeHealthController {
     return true;
   }
 
-  recordConnectionSuccess(id: string): boolean {
+  recordConnectionSuccess(id: string, now = Date.now()): boolean {
     const state = this.#states.get(id);
     if (!state?.manuallyEnabled || state.status === "cooldown") {
       return false;
     }
     state.consecutiveFailures = 0;
     state.epoch += 1;
+    this.#ensureProbeScheduled(state, now);
     return true;
   }
 
-  setManualEnabled(id: string, enabled: boolean): boolean {
+  setManualEnabled(id: string, enabled: boolean, now = Date.now()): boolean {
     const state = this.#states.get(id);
     if (!state) {
       return false;
@@ -140,6 +141,7 @@ export class NodeHealthController {
     }
     state.manuallyEnabled = enabled;
     state.epoch += 1;
+    this.#ensureProbeScheduled(state, now);
     this.#onStatusChange?.(state.id, enabled ? state.status : "disabled");
     return true;
   }
@@ -184,7 +186,11 @@ export class NodeHealthController {
     await runWithConcurrency(tasks, this.#concurrency);
 
     for (const { epoch, state } of due) {
-      if (signal.aborted || this.#states.get(state.id) !== state || state.epoch !== epoch) {
+      if (this.#states.get(state.id) !== state || state.epoch !== epoch) {
+        continue;
+      }
+      if (signal.aborted) {
+        this.#ensureProbeScheduled(state, now);
         continue;
       }
       if (!state.manuallyEnabled) {
@@ -225,6 +231,12 @@ export class NodeHealthController {
 
   #nextJitter(): number {
     return Math.floor(this.#random() * this.#jitterMs);
+  }
+
+  #ensureProbeScheduled(state: NodeHealthState, now: number): void {
+    if (!Number.isFinite(state.nextProbeAt)) {
+      state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
+    }
   }
 
   #setStatus(state: NodeHealthState, status: NodeHealthStatus): void {

@@ -297,6 +297,65 @@ test("an older successful probe cannot override a newer cooldown", async () => {
   assert.equal(controller.snapshot()[0]?.nextProbeAt, 60_003);
 });
 
+test("connection success during a probe keeps future active checks scheduled", async () => {
+  let probeCount = 0;
+  let releaseSecondProbe: (() => void) | undefined;
+  const secondProbeGate = new Promise<void>((resolve) => {
+    releaseSecondProbe = resolve;
+  });
+  const controller = new NodeHealthController({
+    healthUrls: [new URL("https://health.example")],
+    jitterMs: 0,
+    probe: async () => {
+      probeCount += 1;
+      if (probeCount === 2) {
+        await secondProbeGate;
+      }
+      return true;
+    },
+  });
+  controller.replaceNodes([{ id: "node", listener: new URL("http://127.0.0.1:20001") }], 0);
+  await controller.runDue(0);
+  const staleProbe = controller.runDue(30_000);
+  controller.recordConnectionSuccess("node", 30_001);
+  releaseSecondProbe?.();
+  await staleProbe;
+
+  assert.equal(controller.snapshot()[0]?.nextProbeAt, 60_001);
+  await controller.runDue(60_001);
+  assert.equal(probeCount, 3);
+});
+
+test("disable and re-enable during warming cannot strand the node", async () => {
+  let releaseProbe: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseProbe = resolve;
+  });
+  let probeCount = 0;
+  const controller = new NodeHealthController({
+    healthUrls: [new URL("https://health.example")],
+    jitterMs: 0,
+    probe: async () => {
+      probeCount += 1;
+      if (probeCount === 1) {
+        await gate;
+      }
+      return true;
+    },
+  });
+  controller.replaceNodes([{ id: "node", listener: new URL("http://127.0.0.1:20001") }], 0);
+  const staleProbe = controller.runDue(0);
+  controller.setManualEnabled("node", false, 1);
+  controller.setManualEnabled("node", true, 2);
+  releaseProbe?.();
+  await staleProbe;
+
+  assert.equal(controller.snapshot()[0]?.status, "warming");
+  assert.equal(controller.snapshot()[0]?.nextProbeAt, 30_001);
+  await controller.runDue(30_001);
+  assert.equal(controller.snapshot()[0]?.status, "healthy");
+});
+
 function sequenceRandom(values: readonly number[]): () => number {
   let index = 0;
   return () => values[index++] ?? 0;
