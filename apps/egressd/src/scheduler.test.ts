@@ -122,3 +122,33 @@ test("pre-connect retries exclude attempted nodes and record connection outcomes
   assert.equal(snapshot.find(({ id }) => id === "first")?.consecutiveFailures, 1);
   assert.equal(snapshot.find(({ id }) => id === "second")?.consecutiveFailures, 0);
 });
+
+test("runtime health gates selection and survives candidate replacement", () => {
+  const scheduler = new RotateScheduler([candidate("first"), candidate("second")]);
+
+  assert.equal(scheduler.setHealthStatus("first", "warming"), true);
+  assert.equal(scheduler.acquireById("first"), undefined);
+  assert.equal(scheduler.setHealthStatus("first", "degraded"), true);
+  const degraded = scheduler.acquireById("first");
+  assert.equal(degraded?.candidate.id, "first");
+  degraded?.reportConnectionFailure();
+  degraded?.release();
+
+  scheduler.replaceCandidates([candidate("first"), candidate("second")]);
+
+  assert.equal(scheduler.healthStatus("first"), "degraded");
+  assert.equal(scheduler.snapshot().find(({ id }) => id === "first")?.consecutiveFailures, 1);
+  assert.equal(scheduler.setHealthStatus("first", "disabled"), true);
+  assert.equal(scheduler.acquireBySelector("first"), undefined);
+});
+
+test("active probe outcomes update scheduler reliability signals", () => {
+  const scheduler = new RotateScheduler([candidate("node")]);
+
+  assert.equal(scheduler.reportHealthCheck("node", false), true);
+  assert.equal(scheduler.snapshot()[0]?.consecutiveFailures, 1);
+  assert.equal(scheduler.snapshot()[0]?.successRate, 0.8);
+  assert.equal(scheduler.reportHealthCheck("node", true), true);
+  assert.equal(scheduler.snapshot()[0]?.consecutiveFailures, 0);
+  assert.ok(Math.abs((scheduler.snapshot()[0]?.successRate ?? 0) - 0.84) < 0.000_001);
+});

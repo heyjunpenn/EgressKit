@@ -9,6 +9,7 @@ import {
 import { connect, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
+import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
   authorizeProxyRequest,
@@ -54,6 +55,12 @@ export interface EgressdOptions {
   allowUnsafeUnauthenticatedProxy?: boolean;
   checkMihomoListener?: (listener: URL) => Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
+  healthCheckConcurrency?: number;
+  healthCheckIntervalMs?: number;
+  healthCheckJitterMs?: number;
+  healthCheckProbe?: HealthProbe;
+  healthCheckSuccessThreshold?: number;
+  healthCheckUrls?: readonly URL[];
   host: string;
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
@@ -95,7 +102,9 @@ export interface RunningEgressd {
     port: number;
   };
   close(): Promise<void>;
+  healthSnapshot(): readonly NodeHealthSnapshot[];
   importLocalSubscription(source: string): Promise<ImportedVlessRevision>;
+  setNodeEnabled(id: string, enabled: boolean): boolean;
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -138,6 +147,31 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ]
       : [],
   );
+  const healthController = options.healthCheckUrls
+    ? new NodeHealthController({
+        ...(options.healthCheckConcurrency === undefined
+          ? {}
+          : { concurrency: options.healthCheckConcurrency }),
+        healthUrls: options.healthCheckUrls,
+        ...(options.healthCheckIntervalMs === undefined
+          ? {}
+          : { intervalMs: options.healthCheckIntervalMs }),
+        ...(options.healthCheckJitterMs === undefined
+          ? {}
+          : { jitterMs: options.healthCheckJitterMs }),
+        onProbeResult: (id, succeeded) => scheduler.reportHealthCheck(id, succeeded),
+        onStatusChange: (id, status) => scheduler.setHealthStatus(id, status),
+        ...(options.healthCheckProbe === undefined ? {} : { probe: options.healthCheckProbe }),
+        ...(options.healthCheckSuccessThreshold === undefined
+          ? {}
+          : { successThreshold: options.healthCheckSuccessThreshold }),
+      })
+    : undefined;
+  if (healthController) {
+    healthController.replaceNodes(
+      scheduler.snapshot().map(({ id, listener }) => ({ id, listener })),
+    );
+  }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
@@ -198,7 +232,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (lease === "not-implemented" || lease === undefined) {
         return lease;
       }
-      const observedLease = observeConnectionOutcome(lease, options.onConnectionOutcome);
+      const observedLease = observeConnectionOutcome(lease, (outcome) => {
+        if (outcome.result === "failure") {
+          healthController?.recordConnectionFailure(outcome.nodeId);
+        } else {
+          healthController?.recordConnectionSuccess(outcome.nodeId);
+        }
+        options.onConnectionOutcome?.(outcome);
+      });
       attemptedIds.add(observedLease.candidate.id);
       const startedAt = Date.now();
       try {
@@ -271,6 +312,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           alias === undefined ? [] : [alias],
         );
       }),
+    );
+    healthController?.replaceNodes(
+      scheduler.snapshot().map(({ id, listener }) => ({ id, listener })),
     );
   };
 
@@ -585,6 +629,22 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     throw new Error("egressd did not bind a TCP address");
   }
 
+  let healthCheckRunning = false;
+  const healthCheckTimer = healthController
+    ? setInterval(
+        () => {
+          if (healthCheckRunning) {
+            return;
+          }
+          healthCheckRunning = true;
+          void healthController.runDue().finally(() => {
+            healthCheckRunning = false;
+          });
+        },
+        Math.min(1_000, options.healthCheckIntervalMs ?? 30_000),
+      )
+    : undefined;
+
   let closed = false;
   return {
     address: { host: options.host, port: address.port },
@@ -593,6 +653,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
+      if (healthCheckTimer) {
+        clearInterval(healthCheckTimer);
+      }
       remoteOperations?.close();
       try {
         await closeServer(server);
@@ -600,7 +663,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         await state?.close();
       }
     },
+    healthSnapshot: () => healthController?.snapshot() ?? [],
     importLocalSubscription,
+    setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
   };
 }
 

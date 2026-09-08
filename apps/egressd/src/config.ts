@@ -7,6 +7,11 @@ import type { ProxyAuthentication } from "./proxy-auth.js";
 export interface EgressdConfig {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: true;
+  healthCheckConcurrency?: number;
+  healthCheckIntervalMs?: number;
+  healthCheckJitterMs?: number;
+  healthCheckSuccessThreshold?: number;
+  healthCheckUrls?: readonly URL[];
   host: string;
   port: number;
   mihomoListener?: URL;
@@ -19,6 +24,17 @@ export interface EgressdConfig {
   sessionMaximumActiveSessions?: number;
   sessionMaximumConcurrentConnections?: number;
   stateDirectory: string;
+}
+
+function parseNonNegativeInteger(name: string, value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
 }
 
 function parsePositiveInteger(name: string, value: string | undefined): number | undefined {
@@ -96,6 +112,31 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     "EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES",
     environment.EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES,
   );
+  const healthCheckUrls = parseHealthCheckUrls(environment.EGRESSKIT_HEALTH_CHECK_URLS);
+  const healthCheckSuccessThreshold = parsePositiveInteger(
+    "EGRESSKIT_HEALTH_CHECK_SUCCESS_THRESHOLD",
+    environment.EGRESSKIT_HEALTH_CHECK_SUCCESS_THRESHOLD,
+  );
+  if (
+    healthCheckSuccessThreshold !== undefined &&
+    (healthCheckUrls === undefined || healthCheckSuccessThreshold > healthCheckUrls.length)
+  ) {
+    throw new Error(
+      "EGRESSKIT_HEALTH_CHECK_SUCCESS_THRESHOLD must be within the configured URL count",
+    );
+  }
+  const healthCheckConcurrency = parsePositiveInteger(
+    "EGRESSKIT_HEALTH_CHECK_CONCURRENCY",
+    environment.EGRESSKIT_HEALTH_CHECK_CONCURRENCY,
+  );
+  const healthCheckIntervalMs = parsePositiveInteger(
+    "EGRESSKIT_HEALTH_CHECK_INTERVAL_MS",
+    environment.EGRESSKIT_HEALTH_CHECK_INTERVAL_MS,
+  );
+  const healthCheckJitterMs = parseNonNegativeInteger(
+    "EGRESSKIT_HEALTH_CHECK_JITTER_MS",
+    environment.EGRESSKIT_HEALTH_CHECK_JITTER_MS,
+  );
   const preconnectAttempts = parseBoundedPositiveInteger(
     "EGRESSKIT_PRECONNECT_ATTEMPTS",
     environment.EGRESSKIT_PRECONNECT_ATTEMPTS,
@@ -129,6 +170,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
       : { adminToken: environment.EGRESSKIT_ADMIN_TOKEN }),
     ...(allowUnsafeUnauthenticatedProxy ? { allowUnsafeUnauthenticatedProxy: true as const } : {}),
     host,
+    ...(healthCheckConcurrency === undefined ? {} : { healthCheckConcurrency }),
+    ...(healthCheckIntervalMs === undefined ? {} : { healthCheckIntervalMs }),
+    ...(healthCheckJitterMs === undefined ? {} : { healthCheckJitterMs }),
+    ...(healthCheckSuccessThreshold === undefined ? {} : { healthCheckSuccessThreshold }),
+    ...(healthCheckUrls === undefined ? {} : { healthCheckUrls }),
     ...(minimumSubscriptionNodes === undefined ? {} : { minimumSubscriptionNodes }),
     port: parsePort(environment.EGRESSKIT_PORT),
     ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
@@ -146,4 +192,19 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
       ? {}
       : { sessionMaximumConcurrentConnections }),
   };
+}
+
+function parseHealthCheckUrls(value: string | undefined): readonly URL[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const entries = value.split(",").map((entry) => entry.trim());
+  if (entries.length === 0 || entries.some((entry) => entry.length === 0)) {
+    throw new Error("EGRESSKIT_HEALTH_CHECK_URLS must contain at least one URL");
+  }
+  const urls = entries.map((entry) => new URL(entry));
+  if (urls.some((url) => url.protocol !== "http:" && url.protocol !== "https:")) {
+    throw new Error("EGRESSKIT_HEALTH_CHECK_URLS entries must use HTTP or HTTPS");
+  }
+  return urls;
 }

@@ -22,6 +22,16 @@ import {
   startTargetServer,
 } from "./testing/harness.js";
 
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) {
+      throw new Error("timed out waiting for condition");
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test("/live reports Node process liveness without a Mihomo listener", async (t) => {
   const daemon = await startEgressd({ host: "127.0.0.1", port: 0 });
   t.after(() => daemon.close());
@@ -30,6 +40,34 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
 
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { status: "live" });
+});
+
+test("daemon probes exits through their listeners and exposes manual health control", async (t) => {
+  const targetRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(targetRequests);
+  t.after(() => target.close());
+  const listenerRequests: string[] = [];
+  const mihomo = await startSimulatedMihomoListener(undefined, [], listenerRequests);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    healthCheckIntervalMs: 100,
+    healthCheckJitterMs: 0,
+    healthCheckUrls: [new URL(`http://${target.host}:${target.port}/health`)],
+    host: "127.0.0.1",
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => daemon.close());
+
+  await waitFor(async () => daemon.healthSnapshot()[0]?.status === "healthy");
+
+  assert.deepEqual(listenerRequests, [`GET http://${target.host}:${target.port}/health`]);
+  assert.equal(targetRequests.length, 1);
+  assert.equal(daemon.setNodeEnabled("configured", false), true);
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.equal(daemon.healthSnapshot()[0]?.status, "disabled");
+  assert.equal(targetRequests.length, 1);
 });
 
 test("unauthenticated non-loopback proxy listeners require an explicit warned override", async (t) => {
