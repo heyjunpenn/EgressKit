@@ -44,39 +44,66 @@ async function startConnectListener() {
   return {
     close: async () => {
       for (const socket of sockets) socket.destroy();
-      server.close();
-      await once(server, "close");
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
     },
     port: address.port,
   };
 }
 
 async function openTunnel(address) {
-  const startedAt = performance.now();
-  const socket = connect(address.port, address.host);
-  const timeout = setTimeout(() => socket.destroy(new Error("CONNECT timed out")), 10_000);
-  await once(socket, "connect");
-  socket.write("CONNECT benchmark.invalid:443 HTTP/1.1\r\nHost: benchmark.invalid:443\r\n\r\n");
-  const [chunk] = await once(socket, "data");
-  const status = /^HTTP\/1\.1 (\d{3})/.exec(chunk.toString())?.[1] ?? "UNKNOWN";
-  if (status !== "200") {
-    clearTimeout(timeout);
-    socket.destroy();
-    throw Object.assign(new Error("CONNECT failed"), { code: `HTTP_${status}` });
-  }
-  clearTimeout(timeout);
-  return { latencyMs: performance.now() - startedAt, socket };
-}
-
-async function directConnectLatency(port) {
-  const startedAt = performance.now();
-  const socket = connect(port, "127.0.0.1");
-  await once(socket, "connect");
-  socket.destroy();
-  return performance.now() - startedAt;
+  return new Promise((resolve, reject) => {
+    const startedAt = performance.now();
+    const socket = connect(address.port, address.host);
+    let header = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (error) {
+        socket.destroy();
+        reject(error);
+      } else resolve(value);
+    };
+    const onError = (error) => finish(error);
+    const onClose = () => finish(Object.assign(new Error("CONNECT closed"), { code: "CLOSED" }));
+    const onData = (chunk) => {
+      header += chunk;
+      if (header.length > 8_192) {
+        finish(Object.assign(new Error("CONNECT header too large"), { code: "INVALID_HEADER" }));
+        return;
+      }
+      const end = header.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      const status = /^HTTP\/1\.1 (\d{3})/.exec(header.slice(0, end))?.[1] ?? "UNKNOWN";
+      if (status !== "200") {
+        finish(Object.assign(new Error("CONNECT failed"), { code: `HTTP_${status}` }));
+        return;
+      }
+      finish(undefined, { latencyMs: performance.now() - startedAt, socket });
+    };
+    const timeout = setTimeout(
+      () => finish(Object.assign(new Error("CONNECT timed out"), { code: "TIMEOUT" })),
+      10_000,
+    );
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    socket.on("data", onData);
+    socket.once("connect", () =>
+      socket.write("CONNECT benchmark.invalid:443 HTTP/1.1\r\nHost: benchmark.invalid:443\r\n\r\n"),
+    );
+  });
 }
 
 export async function runBenchmark({ soakSeconds = 60 } = {}) {
+  if (!Number.isInteger(soakSeconds) || soakSeconds < 60) {
+    throw new Error("benchmark soak duration must be an integer of at least 60 seconds");
+  }
   const [{ startEgressd }, subscription, schedulerModule, sessionModule] = await Promise.all([
     import("../apps/egressd/dist/daemon.js"),
     import("../apps/egressd/dist/subscription.js"),
@@ -86,31 +113,79 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "egresskit-benchmark-"));
   const listeners = [];
   let daemon;
+  let database;
   try {
     const parseStarted = performance.now();
-    const parsed = subscription.importLocalVlessYaml(yamlForNodes(500), {
+    subscription.importLocalVlessYaml(yamlForNodes(500), {
       firstListenerPort: 20_000,
     });
     const subscriptionParseMs = performance.now() - parseStarted;
 
+    const scaleListeners = [];
+    let scaleDaemon;
+    let scaleDatabase;
+    let persistedSubscriptionNodes = 0;
+    try {
+      for (let index = 0; index < 500; index += 1) {
+        scaleListeners.push(await startConnectListener());
+      }
+      scaleDaemon = await startEgressd({
+        checkMihomoListener: async () => undefined,
+        host: "127.0.0.1",
+        log: () => undefined,
+        mihomoRuntime: {
+          apply: async (config) =>
+            new Map(
+              config.proxies.map((node, index) => [
+                node.name,
+                new URL(`http://127.0.0.1:${scaleListeners[index].port}`),
+              ]),
+            ),
+          check: async () => undefined,
+          removeListener: async () => undefined,
+        },
+        port: 0,
+        proxyAuthentication: false,
+        stateDirectory: join(temporaryDirectory, "scale-500-state"),
+      });
+      await scaleDaemon.importLocalSubscription(yamlForNodes(500));
+      scaleDatabase = new DatabaseSync(
+        join(temporaryDirectory, "scale-500-state", "control.sqlite"),
+      );
+      persistedSubscriptionNodes = Number(
+        scaleDatabase.prepare("SELECT COUNT(*) AS count FROM node_generations").get().count,
+      );
+      scaleDatabase.close();
+      scaleDatabase = undefined;
+    } finally {
+      scaleDatabase?.close();
+      await Promise.allSettled([
+        scaleDaemon?.close(),
+        ...scaleListeners.map((listener) => listener.close()),
+      ]);
+    }
+
     for (let index = 0; index < 400; index += 1) listeners.push(await startConnectListener());
-    const activeListeners = 100;
     const upstream = listeners[0];
     let unexpectedExit;
     let mihomoRestarts = 0;
+    let activeListeners = 0;
     daemon = await startEgressd({
       checkMihomoListener: async () => undefined,
       host: "127.0.0.1",
       log: () => undefined,
       mihomoRuntime: {
-        apply: async (config) =>
-          new Map(
+        apply: async (config) => {
+          const applied = new Map(
             config.proxies.map((node, index) => {
               const numericSuffix = Number(node.uuid.slice(-12));
               const bank = Math.floor(numericSuffix / 100) * 100;
               return [node.name, new URL(`http://127.0.0.1:${listeners[bank + index].port}`)];
             }),
-          ),
+          );
+          activeListeners = new Set([...applied.values()].map((listener) => listener.href)).size;
+          return applied;
+        },
         check: async () => undefined,
         onUnexpectedExit: (listener) => {
           unexpectedExit = listener;
@@ -125,6 +200,7 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
       },
       port: 0,
       proxyAuthentication: false,
+      stateDirectory: join(temporaryDirectory, "soak-state"),
     });
     await daemon.importLocalSubscription(yamlForNodes(100));
 
@@ -132,7 +208,9 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
     const directSamples = [];
     const gatewayAddedSamples = [];
     for (let index = 0; index < 200; index += 1) {
-      const directLatency = await directConnectLatency(upstream.port);
+      const directTunnel = await openTunnel({ host: "127.0.0.1", port: upstream.port });
+      const directLatency = directTunnel.latencyMs;
+      directTunnel.socket.destroy();
       directSamples.push(directLatency);
       const tunnel = await openTunnel(daemon.address);
       gatewaySamples.push(tunnel.latencyMs);
@@ -161,18 +239,17 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
     }
     const activeSessions = sessions.countActiveSessions();
 
-    const database = new DatabaseSync(join(temporaryDirectory, "soak.sqlite"));
-    database.exec(
-      "PRAGMA journal_mode=WAL; CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT)",
-    );
+    database = new DatabaseSync(join(temporaryDirectory, "soak-state", "control.sqlite"));
+    const sqliteJournalMode = database.prepare("PRAGMA journal_mode").get().journal_mode;
     const soak = {
       connectAttempts: 0,
       connectFailures: 0,
       connectFailureReasons: {},
       drainingCycles: 0,
-      sqliteWalWrites: 0,
+      sqliteWalReads: 0,
       subscriptionUpdates: 0,
     };
+    const soakStartedAt = performance.now();
     const deadline = Date.now() + soakSeconds * 1_000;
     await Promise.all([
       (async () => {
@@ -192,26 +269,35 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
               soak.connectFailureReasons[reason] = (soak.connectFailureReasons[reason] ?? 0) + 1;
             }
           }
-          database
-            .prepare("INSERT INTO events(value) VALUES (?)")
-            .run(String(soak.sqliteWalWrites));
-          database.prepare("SELECT COUNT(*) FROM events").get();
-          soak.sqliteWalWrites += 1;
+          database.prepare("SELECT COUNT(*) FROM subscription_revisions").get();
+          soak.sqliteWalReads += 1;
+          await new Promise((resolve) => setTimeout(resolve, 200));
         }
       })(),
       (async () => {
         while (Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 15_000));
           if (Date.now() >= deadline) break;
+          const heldTunnel = await openTunnel(daemon.address);
           await daemon.importLocalSubscription(yamlForNodes(100, soak.subscriptionUpdates + 1));
           soak.subscriptionUpdates += 1;
-          soak.drainingCycles += 1;
+          const draining = Number(
+            database
+              .prepare(
+                "SELECT COUNT(*) AS count FROM listener_port_leases WHERE status = 'draining'",
+              )
+              .get().count,
+          );
+          if (draining > 0) soak.drainingCycles += 1;
+          heldTunnel.socket.destroy();
           unexpectedExit?.();
         }
       })(),
     ]);
     database.close();
+    database = undefined;
     const soakResult = { ...soak, mihomoRestarts };
+    const soakElapsedSeconds = Number(((performance.now() - soakStartedAt) / 1_000).toFixed(3));
 
     const result = {
       measurements: {
@@ -223,7 +309,7 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
           passed: gatewayAddedP95Ms < 20,
           targetMaximum: 20,
         },
-        subscriptionNodes: verdict(parsed.nodes.length, 500),
+        subscriptionNodes: verdict(persistedSubscriptionNodes, 500),
         soakReliability: {
           measuredSuccessRate:
             soak.connectAttempts === 0
@@ -231,7 +317,10 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
               : Number(
                   ((soak.connectAttempts - soak.connectFailures) / soak.connectAttempts).toFixed(6),
                 ),
-          passed: soak.connectFailures === 0,
+          passed:
+            soak.connectAttempts > 0 &&
+            soak.connectFailures === 0 &&
+            soakElapsedSeconds >= soakSeconds,
           target: "zero CONNECT failures during the fixed soak",
         },
       },
@@ -239,15 +328,20 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
         directConnectP95Ms: Number(percentile(directSamples, 0.95).toFixed(3)),
         gatewayConnectP95Ms: Number(percentile(gatewaySamples, 0.95).toFixed(3)),
         soak: soakResult,
+        soakElapsedSeconds,
         soakSeconds,
+        sqliteJournalMode,
         subscriptionParseMs: Number(subscriptionParseMs.toFixed(3)),
       },
     };
     return result;
   } finally {
-    await daemon?.close();
-    await Promise.all(listeners.map((listener) => listener.close()));
-    await rm(temporaryDirectory, { force: true, recursive: true });
+    try {
+      database?.close();
+    } finally {
+      await Promise.allSettled([daemon?.close(), ...listeners.map((listener) => listener.close())]);
+      await rm(temporaryDirectory, { force: true, recursive: true });
+    }
   }
 }
 

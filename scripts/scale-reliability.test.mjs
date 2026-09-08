@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { percentile, verdict } from "./scale-reliability.mjs";
+import { percentile, runBenchmark, verdict } from "./scale-reliability.mjs";
 
 test("percentile uses the nearest-rank observation without inventing samples", () => {
   assert.equal(percentile([9, 1, 5, 3], 0.95), 9);
@@ -11,6 +11,12 @@ test("percentile uses the nearest-rank observation without inventing samples", (
 test("benchmark verdicts distinguish measured capability from unmet targets", () => {
   assert.deepEqual(verdict(100, 100), { measured: 100, passed: true, target: 100 });
   assert.deepEqual(verdict(99, 100), { measured: 99, passed: false, target: 100 });
+});
+
+test("soak duration rejects zero, negative, non-numeric, and short runs", async () => {
+  for (const soakSeconds of [0, -1, Number.NaN, 59]) {
+    await assert.rejects(runBenchmark({ soakSeconds }), /at least 60 seconds/);
+  }
 });
 
 test("checked-in report preserves raw failures and does not claim soak reliability", async () => {

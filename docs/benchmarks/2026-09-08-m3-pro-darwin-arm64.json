@@ -16,7 +16,7 @@
       "target": 1000
     },
     "gatewayAddedConnectP95Ms": {
-      "measured": 0.695,
+      "measured": 0.308,
       "passed": true,
       "targetMaximum": 20
     },
@@ -26,27 +26,28 @@
       "target": 500
     },
     "soakReliability": {
-      "measuredSuccessRate": 0.154194,
+      "measuredSuccessRate": 0.947368,
       "passed": false,
       "target": "zero CONNECT failures during the fixed soak"
     }
   },
   "raw": {
-    "directConnectP95Ms": 0.218,
-    "gatewayConnectP95Ms": 0.853,
+    "directConnectP95Ms": 0.299,
+    "gatewayConnectP95Ms": 0.607,
     "soak": {
-      "connectAttempts": 94368,
-      "connectFailures": 79817,
+      "connectAttempts": 9120,
+      "connectFailures": 480,
       "connectFailureReasons": {
-        "HTTP_502": 1445,
-        "EADDRNOTAVAIL": 78372
+        "HTTP_502": 480
       },
       "drainingCycles": 3,
-      "sqliteWalWrites": 2949,
+      "sqliteWalReads": 285,
       "subscriptionUpdates": 3,
       "mihomoRestarts": 3
     },
+    "soakElapsedSeconds": 60.179,
     "soakSeconds": 60,
-    "subscriptionParseMs": 37.511
+    "sqliteJournalMode": "wal",
+    "subscriptionParseMs": 38.069
   }
 }
