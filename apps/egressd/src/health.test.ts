@@ -31,6 +31,32 @@ test("active probes use the node's internal Mihomo listener", async () => {
   }
 });
 
+test("aborting a listener-backed probe destroys a hanging request", async () => {
+  let observed: (() => void) | undefined;
+  const received = new Promise<void>((resolve) => {
+    observed = resolve;
+  });
+  const listener = createServer(() => observed?.());
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address !== "string");
+  const controller = new AbortController();
+
+  const probing = probeThroughMihomo(
+    new URL(`http://127.0.0.1:${address.port}`),
+    new URL("http://health.example/status"),
+    10_000,
+    controller.signal,
+  );
+  await received;
+  controller.abort();
+
+  assert.equal(await probing, false);
+  await new Promise<void>((resolve, reject) =>
+    listener.close((error) => (error ? reject(error) : resolve())),
+  );
+});
+
 test("health checks apply multiple-target threshold, global concurrency, and jitter", async () => {
   let active = 0;
   let maximumActive = 0;
@@ -119,6 +145,11 @@ test("consecutive failures degrade, cool down exponentially, and require a warmi
     nextProbeAt: 60_003,
     status: "cooldown",
   });
+  controller.setManualEnabled("node", false);
+  assert.equal(controller.snapshot()[0]?.status, "disabled");
+  controller.setManualEnabled("node", true);
+  assert.equal(controller.snapshot()[0]?.status, "cooldown");
+  assert.equal(controller.snapshot()[0]?.nextProbeAt, 60_003);
 
   await controller.runDue(60_002);
   assert.equal(controller.snapshot()[0]?.status, "cooldown");
@@ -138,6 +169,22 @@ test("consecutive failures degrade, cool down exponentially, and require a warmi
     nextProbeAt: 180_003,
     status: "healthy",
   });
+});
+
+test("an initially warming node degrades before entering cooldown", async () => {
+  const controller = new NodeHealthController({
+    healthUrls: [new URL("https://health.example")],
+    jitterMs: 0,
+    probe: async () => false,
+  });
+  controller.replaceNodes([{ id: "node", listener: new URL("http://127.0.0.1:20001") }], 0);
+
+  await controller.runDue(0);
+  assert.equal(controller.snapshot()[0]?.status, "warming");
+  await controller.runDue(30_000);
+  assert.equal(controller.snapshot()[0]?.status, "degraded");
+  await controller.runDue(60_000);
+  assert.equal(controller.snapshot()[0]?.status, "cooldown");
 });
 
 test("a successful connection breaks a sequence of passive failures without bypassing probes", () => {
@@ -169,7 +216,7 @@ test("manual disable is never overridden by probes or cooldown expiry", async ()
     },
   });
   controller.replaceNodes([{ id: "node", listener: new URL("http://127.0.0.1:20001") }], 0);
-  assert.equal(controller.setManualEnabled("node", false, 1), true);
+  assert.equal(controller.setManualEnabled("node", false), true);
 
   controller.recordConnectionFailure("node", 2);
   await controller.runDue(Number.MAX_SAFE_INTEGER);
@@ -204,6 +251,50 @@ test("a stale probe cannot approve a replacement listener for the same node", as
   assert.equal(controller.snapshot()[0]?.status, "warming");
   assert.equal(controller.snapshot()[0]?.nextProbeAt, 1);
   assert.equal(statuses.at(-1), "warming");
+});
+
+test("a new generation must warm even when it reuses the same listener URL", async () => {
+  const controller = new NodeHealthController({
+    healthUrls: [new URL("https://health.example")],
+    jitterMs: 0,
+    probe: async () => true,
+  });
+  const listener = new URL("http://127.0.0.1:20001");
+  controller.replaceNodes([{ generation: "first", id: "node", listener }], 0);
+  await controller.runDue(0);
+  assert.equal(controller.snapshot()[0]?.status, "healthy");
+
+  controller.replaceNodes([{ generation: "second", id: "node", listener }], 5);
+
+  assert.equal(controller.snapshot()[0]?.status, "warming");
+  assert.equal(controller.snapshot()[0]?.nextProbeAt, 5);
+});
+
+test("an older successful probe cannot override a newer cooldown", async () => {
+  let releaseProbe: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseProbe = resolve;
+  });
+  const controller = new NodeHealthController({
+    healthUrls: [new URL("https://health.example")],
+    jitterMs: 0,
+    probe: async () => {
+      await gate;
+      return true;
+    },
+  });
+  controller.replaceNodes([{ id: "node", listener: new URL("http://127.0.0.1:20001") }], 0);
+  const staleProbe = controller.runDue(0);
+  controller.recordConnectionFailure("node", 1);
+  controller.recordConnectionFailure("node", 2);
+  controller.recordConnectionFailure("node", 3);
+  assert.equal(controller.snapshot()[0]?.status, "cooldown");
+
+  releaseProbe?.();
+  await staleProbe;
+
+  assert.equal(controller.snapshot()[0]?.status, "cooldown");
+  assert.equal(controller.snapshot()[0]?.nextProbeAt, 60_003);
 });
 
 function sequenceRandom(values: readonly number[]): () => number {

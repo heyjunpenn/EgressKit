@@ -3,6 +3,7 @@ import { request } from "node:http";
 export type NodeHealthStatus = "cooldown" | "degraded" | "disabled" | "healthy" | "warming";
 
 export interface HealthNode {
+  generation?: string;
   id: string;
   listener: URL;
 }
@@ -16,7 +17,7 @@ export interface NodeHealthSnapshot {
   status: NodeHealthStatus;
 }
 
-export type HealthProbe = (listener: URL, target: URL) => Promise<boolean>;
+export type HealthProbe = (listener: URL, target: URL, signal: AbortSignal) => Promise<boolean>;
 
 export interface NodeHealthControllerOptions {
   concurrency?: number;
@@ -35,6 +36,8 @@ export interface NodeHealthControllerOptions {
 }
 
 interface NodeHealthState extends NodeHealthSnapshot {
+  epoch: number;
+  generation: string;
   listener: URL;
 }
 
@@ -67,7 +70,10 @@ export class NodeHealthController {
     this.#cooldownAfterFailures = options.cooldownAfterFailures ?? 3;
     this.#cooldownInitialMs = options.cooldownInitialMs ?? 60_000;
     this.#cooldownMaximumMs = options.cooldownMaximumMs ?? 15 * 60_000;
-    this.#probe = options.probe ?? ((listener, target) => probeThroughMihomo(listener, target));
+    this.#probe =
+      options.probe ??
+      ((listener, target, signal) =>
+        probeThroughMihomo(listener, target, DEFAULT_PROBE_TIMEOUT_MS, signal));
     this.#random = options.random ?? Math.random;
     this.#onProbeResult = options.onProbeResult;
     this.#onStatusChange = options.onStatusChange;
@@ -78,12 +84,15 @@ export class NodeHealthController {
     const next = new Map<string, NodeHealthState>();
     for (const node of nodes) {
       const existing = this.#states.get(node.id);
-      if (existing?.listener.href === node.listener.href) {
+      const generation = node.generation ?? node.listener.href;
+      if (existing?.listener.href === node.listener.href && existing.generation === generation) {
         next.set(node.id, existing);
       } else {
         next.set(node.id, {
           consecutiveFailures: 0,
           cooldownCount: 0,
+          epoch: 0,
+          generation,
           id: node.id,
           listener: node.listener,
           manuallyEnabled: existing?.manuallyEnabled ?? true,
@@ -105,6 +114,9 @@ export class NodeHealthController {
       return false;
     }
     this.#applyFailure(state, now);
+    if (!Number.isFinite(state.nextProbeAt)) {
+      state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
+    }
     return true;
   }
 
@@ -114,51 +126,53 @@ export class NodeHealthController {
       return false;
     }
     state.consecutiveFailures = 0;
+    state.epoch += 1;
     return true;
   }
 
-  setManualEnabled(id: string, enabled: boolean, now = Date.now()): boolean {
+  setManualEnabled(id: string, enabled: boolean): boolean {
     const state = this.#states.get(id);
     if (!state) {
       return false;
     }
-    state.manuallyEnabled = enabled;
-    if (!enabled) {
-      this.#setStatus(state, "disabled");
+    if (state.manuallyEnabled === enabled) {
       return true;
     }
-    state.consecutiveFailures = 0;
-    state.nextProbeAt = now + this.#nextJitter();
-    this.#setStatus(state, "warming");
+    state.manuallyEnabled = enabled;
+    state.epoch += 1;
+    this.#onStatusChange?.(state.id, enabled ? state.status : "disabled");
     return true;
   }
 
   snapshot(): readonly NodeHealthSnapshot[] {
-    return [...this.#states.values()].map(({ listener: _listener, ...snapshot }) => ({
-      ...snapshot,
-    }));
+    return [...this.#states.values()].map(
+      ({ epoch: _epoch, generation: _generation, listener: _listener, ...snapshot }) => ({
+        ...snapshot,
+        status: snapshot.manuallyEnabled ? snapshot.status : "disabled",
+      }),
+    );
   }
 
-  async runDue(now = Date.now()): Promise<void> {
-    const due = [...this.#states.values()].filter(
-      (state) => state.manuallyEnabled && state.nextProbeAt <= now,
-    );
+  async runDue(now = Date.now(), signal = new AbortController().signal): Promise<void> {
+    const due = [...this.#states.values()]
+      .filter((state) => state.manuallyEnabled && state.nextProbeAt <= now)
+      .map((state) => {
+        if (state.status === "cooldown") {
+          this.#setStatus(state, "warming");
+        }
+        state.nextProbeAt = Number.POSITIVE_INFINITY;
+        return { epoch: state.epoch, state };
+      });
     if (due.length === 0) {
       return;
     }
-    for (const state of due) {
-      if (state.status === "cooldown") {
-        this.#setStatus(state, "warming");
-      }
-      state.nextProbeAt = Number.POSITIVE_INFINITY;
-    }
 
     const results = new Map<string, number>();
-    const tasks = due.flatMap((state) =>
+    const tasks = due.flatMap(({ state }) =>
       this.#healthUrls.map((target) => async () => {
         let succeeded = false;
         try {
-          succeeded = await this.#probe(state.listener, target);
+          succeeded = await this.#probe(state.listener, target, signal);
         } catch {
           succeeded = false;
         }
@@ -169,8 +183,8 @@ export class NodeHealthController {
     );
     await runWithConcurrency(tasks, this.#concurrency);
 
-    for (const state of due) {
-      if (this.#states.get(state.id) !== state) {
+    for (const { epoch, state } of due) {
+      if (signal.aborted || this.#states.get(state.id) !== state || state.epoch !== epoch) {
         continue;
       }
       if (!state.manuallyEnabled) {
@@ -182,6 +196,7 @@ export class NodeHealthController {
         state.consecutiveFailures = 0;
         state.cooldownCount = 0;
         state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
+        state.epoch += 1;
         this.#setStatus(state, "healthy");
       } else {
         this.#applyFailure(state, now);
@@ -194,6 +209,7 @@ export class NodeHealthController {
 
   #applyFailure(state: NodeHealthState, now: number): void {
     state.consecutiveFailures += 1;
+    state.epoch += 1;
     if (state.consecutiveFailures >= this.#cooldownAfterFailures) {
       state.cooldownCount += 1;
       const cooldownMs = Math.min(
@@ -202,10 +218,7 @@ export class NodeHealthController {
       );
       state.nextProbeAt = now + cooldownMs;
       this.#setStatus(state, "cooldown");
-    } else if (
-      state.status !== "warming" &&
-      state.consecutiveFailures >= this.#degradedAfterFailures
-    ) {
+    } else if (state.consecutiveFailures >= this.#degradedAfterFailures) {
       this.#setStatus(state, "degraded");
     }
   }
@@ -219,7 +232,7 @@ export class NodeHealthController {
       return;
     }
     state.status = status;
-    this.#onStatusChange?.(state.id, status);
+    this.#onStatusChange?.(state.id, state.manuallyEnabled ? status : "disabled");
   }
 }
 
@@ -227,6 +240,7 @@ export function probeThroughMihomo(
   listener: URL,
   target: URL,
   timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
@@ -244,6 +258,7 @@ export function probeThroughMihomo(
         path: target.href,
         port: Number(listener.port || 80),
         headers: { host: target.host, via: "1.1 egresskit-health" },
+        ...(signal === undefined ? {} : { signal }),
       },
       (response) => {
         response.resume();

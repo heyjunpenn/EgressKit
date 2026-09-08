@@ -169,7 +169,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     : undefined;
   if (healthController) {
     healthController.replaceNodes(
-      scheduler.snapshot().map(({ id, listener }) => ({ id, listener })),
+      scheduler.snapshot().map(({ id, listener }) => ({ generation: "configured", id, listener })),
     );
   }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
@@ -314,7 +314,11 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }),
     );
     healthController?.replaceNodes(
-      scheduler.snapshot().map(({ id, listener }) => ({ id, listener })),
+      identities.map(({ id, node }) => ({
+        generation: JSON.stringify(node),
+        id,
+        listener: listeners.get(node.name) as URL,
+      })),
     );
   };
 
@@ -630,6 +634,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   }
 
   let healthCheckRunning = false;
+  let healthCheckRun: Promise<void> | undefined;
+  const healthCheckAbort = new AbortController();
   const healthCheckTimer = healthController
     ? setInterval(
         () => {
@@ -637,9 +643,15 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
             return;
           }
           healthCheckRunning = true;
-          void healthController.runDue().finally(() => {
+          const run = healthController.runDue(Date.now(), healthCheckAbort.signal);
+          healthCheckRun = run;
+          const finishRun = () => {
             healthCheckRunning = false;
-          });
+            if (healthCheckRun === run) {
+              healthCheckRun = undefined;
+            }
+          };
+          void run.then(finishRun, finishRun);
         },
         Math.min(1_000, options.healthCheckIntervalMs ?? 30_000),
       )
@@ -656,6 +668,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (healthCheckTimer) {
         clearInterval(healthCheckTimer);
       }
+      healthCheckAbort.abort();
+      if (healthCheckRun) {
+        await waitForBoundedCompletion(healthCheckRun, 1_000);
+      }
       remoteOperations?.close();
       try {
         await closeServer(server);
@@ -667,6 +683,22 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     importLocalSubscription,
     setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
   };
+}
+
+function waitForBoundedCompletion(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, timeoutMs);
+    void operation.then(
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+    );
+  });
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {

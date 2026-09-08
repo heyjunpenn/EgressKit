@@ -70,6 +70,36 @@ test("daemon probes exits through their listeners and exposes manual health cont
   assert.equal(targetRequests.length, 1);
 });
 
+test("daemon shutdown aborts and waits for an in-flight health probe", async () => {
+  let started: (() => void) | undefined;
+  const probeStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const daemon = await startEgressd({
+    healthCheckIntervalMs: 1,
+    healthCheckJitterMs: 0,
+    healthCheckProbe: async (_listener, _target, signal) => {
+      started?.();
+      return new Promise<boolean>((resolve) =>
+        signal.addEventListener("abort", () => resolve(false), { once: true }),
+      );
+    },
+    healthCheckUrls: [new URL("http://health.example")],
+    host: "127.0.0.1",
+    mihomoListener: new URL("http://127.0.0.1:20001"),
+    port: 0,
+    proxyAuthentication: false,
+  });
+  await probeStarted;
+
+  await Promise.race([
+    daemon.close(),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("daemon shutdown did not cancel health probe")), 500),
+    ),
+  ]);
+});
+
 test("unauthenticated non-loopback proxy listeners require an explicit warned override", async (t) => {
   await assert.rejects(
     startEgressd({ host: "0.0.0.0", port: 0, proxyAuthentication: false }),
