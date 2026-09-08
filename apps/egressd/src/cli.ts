@@ -5,7 +5,22 @@ import { startEgressd } from "./daemon.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
-  const daemon = await startEgressd(config);
+  const daemon = await startEgressd({
+    ...config,
+    ...(config.mihomoListener === undefined
+      ? {}
+      : {
+          mihomoRuntime: {
+            apply: async (mihomoConfig) => {
+              if (mihomoConfig.proxies.length !== 1) {
+                throw new Error("configured Mihomo listener supports exactly one imported node");
+              }
+              const node = mihomoConfig.proxies[0];
+              return new Map(node ? [[node.name, config.mihomoListener as URL]] : []);
+            },
+          },
+        }),
+  });
 
   process.stdout.write(`${JSON.stringify({ event: "egressd.started", ...daemon.address })}\n`);
 
