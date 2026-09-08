@@ -1,0 +1,52 @@
+{
+  "measurements": {
+    "activeListeners": {
+      "measured": 100,
+      "passed": true,
+      "target": 100
+    },
+    "activeSessions": {
+      "measured": 10000,
+      "passed": true,
+      "target": 10000
+    },
+    "concurrentConnects": {
+      "measured": 1000,
+      "passed": true,
+      "target": 1000
+    },
+    "gatewayAddedConnectP95Ms": {
+      "measured": 0.695,
+      "passed": true,
+      "targetMaximum": 20
+    },
+    "subscriptionNodes": {
+      "measured": 500,
+      "passed": true,
+      "target": 500
+    },
+    "soakReliability": {
+      "measuredSuccessRate": 0.154194,
+      "passed": false,
+      "target": "zero CONNECT failures during the fixed soak"
+    }
+  },
+  "raw": {
+    "directConnectP95Ms": 0.218,
+    "gatewayConnectP95Ms": 0.853,
+    "soak": {
+      "connectAttempts": 94368,
+      "connectFailures": 79817,
+      "connectFailureReasons": {
+        "HTTP_502": 1445,
+        "EADDRNOTAVAIL": 78372
+      },
+      "drainingCycles": 3,
+      "sqliteWalWrites": 2949,
+      "subscriptionUpdates": 3,
+      "mihomoRestarts": 3
+    },
+    "soakSeconds": 60,
+    "subscriptionParseMs": 37.511
+  }
+}
