@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -27,8 +27,40 @@ export interface PersistedActiveRevision {
   source: SubscriptionIdentity;
 }
 
+export type OperationStatus =
+  | "queued"
+  | "fetching"
+  | "parsing"
+  | "validating"
+  | "applying"
+  | "checking"
+  | "succeeded"
+  | "failed"
+  | "interrupted";
+
+export type OperationProcessingStage = Exclude<
+  OperationStatus,
+  "failed" | "interrupted" | "succeeded"
+>;
+
+export interface SubscriptionOperation {
+  failure?: { reason: string; stage: OperationProcessingStage };
+  history: OperationStatus[];
+  id: string;
+  status: OperationStatus;
+  subscriptionId: string;
+}
+
 export interface ControlState {
+  createRefreshOperation(subscriptionId: string): SubscriptionOperation;
+  createRemoteSubscription(locator: string): {
+    operationId: string;
+    subscriptionId: string;
+  };
   databasePath: string;
+  failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
+  getOperation(operationId: string): SubscriptionOperation | undefined;
+  getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
   saveActiveRevision(input: {
     imported: ImportedVlessRevision;
@@ -40,6 +72,7 @@ export interface ControlState {
     journalMode: string;
     synchronous: number;
   };
+  transitionOperation(operationId: string, status: OperationStatus): void;
   close(): Promise<void>;
 }
 
@@ -59,6 +92,7 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       PRAGMA synchronous = NORMAL;
     `);
     migrate(database);
+    interruptUnfinishedOperations(database);
   } catch (error) {
     database?.close();
     releaseLock(lock);
@@ -68,7 +102,14 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
 
   let closed = false;
   return {
+    createRefreshOperation: (subscriptionId) =>
+      createRefreshOperation(controlDatabase, subscriptionId),
+    createRemoteSubscription: (locator) => createRemoteSubscription(controlDatabase, locator),
     databasePath,
+    failOperation: (operationId, stage, reason) =>
+      failOperation(controlDatabase, operationId, stage, reason),
+    getOperation: (operationId) => getOperation(controlDatabase, operationId),
+    getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
     settings: () => ({
@@ -83,6 +124,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       synchronous: (controlDatabase.prepare("PRAGMA synchronous").get() as { synchronous: number })
         .synchronous,
     }),
+    transitionOperation: (operationId, status) =>
+      transitionOperation(controlDatabase, operationId, status),
     close: async () => {
       if (closed) {
         return;
@@ -148,8 +191,198 @@ function migrate(database: DatabaseSync): void {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS one_active_runtime_revision
       ON runtime_revisions(status) WHERE status = 'active';
-    PRAGMA user_version = 1;
+    CREATE TABLE IF NOT EXISTS operations (
+      id TEXT PRIMARY KEY,
+      subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
+      status TEXT NOT NULL CHECK (
+        status IN ('queued', 'fetching', 'parsing', 'validating', 'applying', 'checking',
+                   'succeeded', 'failed', 'interrupted')
+      ),
+      failed_stage TEXT,
+      failure_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS operation_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    PRAGMA user_version = 2;
   `);
+}
+
+function createRemoteSubscription(
+  database: DatabaseSync,
+  locator: string,
+): { operationId: string; subscriptionId: string } {
+  const subscriptionId = randomUUID();
+  const operationId = randomUUID();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare("INSERT INTO subscriptions (id, kind, locator) VALUES (?, 'remote', ?)")
+      .run(subscriptionId, locator);
+    insertOperation(database, operationId, subscriptionId);
+    database.exec("COMMIT");
+    return { operationId, subscriptionId };
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function createRefreshOperation(
+  database: DatabaseSync,
+  subscriptionId: string,
+): SubscriptionOperation {
+  const subscription = getSubscription(database, subscriptionId);
+  if (subscription?.kind !== "remote") {
+    throw new Error(`remote subscription not found: ${subscriptionId}`);
+  }
+  const operationId = randomUUID();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    insertOperation(database, operationId, subscriptionId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  return getOperation(database, operationId) as SubscriptionOperation;
+}
+
+function insertOperation(
+  database: DatabaseSync,
+  operationId: string,
+  subscriptionId: string,
+): void {
+  const now = new Date().toISOString();
+  database
+    .prepare(
+      `INSERT INTO operations
+         (id, subscription_id, status, created_at, updated_at)
+       VALUES (?, ?, 'queued', ?, ?)`,
+    )
+    .run(operationId, subscriptionId, now, now);
+  database
+    .prepare(
+      "INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, 'queued', ?)",
+    )
+    .run(operationId, now);
+}
+
+function getSubscription(
+  database: DatabaseSync,
+  subscriptionId: string,
+): SubscriptionIdentity | undefined {
+  const row = database
+    .prepare("SELECT id, kind, locator FROM subscriptions WHERE id = ?")
+    .get(subscriptionId) as { id: string; kind: "local" | "remote"; locator: string } | undefined;
+  return row;
+}
+
+function getOperation(
+  database: DatabaseSync,
+  operationId: string,
+): SubscriptionOperation | undefined {
+  const row = database
+    .prepare(
+      `SELECT id, subscription_id, status, failed_stage, failure_reason
+       FROM operations WHERE id = ?`,
+    )
+    .get(operationId) as
+    | {
+        failed_stage: OperationProcessingStage | null;
+        failure_reason: string | null;
+        id: string;
+        status: OperationStatus;
+        subscription_id: string;
+      }
+    | undefined;
+  if (!row) {
+    return undefined;
+  }
+  const history = database
+    .prepare("SELECT status FROM operation_events WHERE operation_id = ? ORDER BY id")
+    .all(operationId) as Array<{ status: OperationStatus }>;
+  return {
+    ...(row.failed_stage && row.failure_reason
+      ? { failure: { reason: row.failure_reason, stage: row.failed_stage } }
+      : {}),
+    history: history.map((event) => event.status),
+    id: row.id,
+    status: row.status,
+    subscriptionId: row.subscription_id,
+  };
+}
+
+function transitionOperation(
+  database: DatabaseSync,
+  operationId: string,
+  status: OperationStatus,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database
+      .prepare(
+        `UPDATE operations SET status = ?, updated_at = ?
+         WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
+      )
+      .run(status, now, operationId);
+    if (result.changes !== 1) {
+      throw new Error(`operation is missing or already terminal: ${operationId}`);
+    }
+    database
+      .prepare("INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, ?, ?)")
+      .run(operationId, status, now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function failOperation(
+  database: DatabaseSync,
+  operationId: string,
+  stage: OperationProcessingStage,
+  reason: string,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database
+      .prepare(
+        `UPDATE operations
+         SET status = 'failed', failed_stage = ?, failure_reason = ?, updated_at = ?
+         WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
+      )
+      .run(stage, reason, now, operationId);
+    if (result.changes !== 1) {
+      throw new Error(`operation is missing or already terminal: ${operationId}`);
+    }
+    database
+      .prepare(
+        "INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, 'failed', ?)",
+      )
+      .run(operationId, now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function interruptUnfinishedOperations(database: DatabaseSync): void {
+  const operations = database
+    .prepare("SELECT id FROM operations WHERE status NOT IN ('succeeded', 'failed', 'interrupted')")
+    .all() as Array<{ id: string }>;
+  for (const operation of operations) {
+    transitionOperation(database, operation.id, "interrupted");
+  }
 }
 
 function saveActiveRevision(

@@ -7,6 +7,7 @@ import {
 } from "node:http";
 import { connect } from "node:net";
 import type { Duplex } from "node:stream";
+import { parse } from "yaml";
 
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
@@ -16,7 +17,11 @@ import {
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
-import { openControlState, type PersistedNodeGeneration } from "./state.js";
+import {
+  type OperationProcessingStage,
+  openControlState,
+  type PersistedNodeGeneration,
+} from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -26,6 +31,7 @@ export interface MihomoRuntime {
 export interface EgressdOptions {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: boolean;
+  fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   host: string;
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
@@ -93,11 +99,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const activateRevision = async (
     revision: ImportedVlessRevision,
     persistedNodes?: readonly PersistedNodeGeneration[],
+    logicalIdPrefix = "local",
+    checking?: () => void,
   ): Promise<void> => {
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
     }
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
+    checking?.();
     for (const node of revision.nodes) {
       const listener = listeners.get(node.name);
       if (!listener || !isLoopbackHttpUrl(listener)) {
@@ -108,7 +117,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       revision.nodes.map((node) => {
         const id =
           persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
-          localLogicalNodeId(node.name);
+          `${logicalIdPrefix}:${node.name}`;
         return createSchedulerCandidate(
           id,
           listeners.get(node.name) as URL,
@@ -139,6 +148,78 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       source: { id: "local", kind: "local", locator: "inline" },
     });
     return revision;
+  };
+
+  let shuttingDown = false;
+  const remoteFetches = new Set<AbortController>();
+  const processRemoteOperation = async (
+    operationId: string,
+    subscriptionId: string,
+  ): Promise<void> => {
+    if (!state || shuttingDown) {
+      return;
+    }
+    let stage: OperationProcessingStage = "queued";
+    try {
+      const subscription = state.getSubscription(subscriptionId);
+      if (subscription?.kind !== "remote") {
+        throw new Error(`remote subscription not found: ${subscriptionId}`);
+      }
+      stage = "fetching";
+      state.transitionOperation(operationId, stage);
+      const controller = new AbortController();
+      remoteFetches.add(controller);
+      const response = await (options.fetchSubscription ?? fetch)(subscription.locator, {
+        signal: controller.signal,
+      }).finally(() => remoteFetches.delete(controller));
+      if (shuttingDown) {
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`remote subscription returned HTTP ${response.status}`);
+      }
+      const source = await response.text();
+      if (shuttingDown) {
+        return;
+      }
+      stage = "parsing";
+      state.transitionOperation(operationId, stage);
+      parse(source);
+      stage = "validating";
+      state.transitionOperation(operationId, stage);
+      const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
+      if (revision.nodes.length === 0) {
+        throw new Error("subscription contains no VLESS nodes");
+      }
+      stage = "applying";
+      state.transitionOperation(operationId, stage);
+      await activateRevision(revision, undefined, subscription.id, () => {
+        if (!shuttingDown) {
+          stage = "checking";
+          state.transitionOperation(operationId, stage);
+        }
+      });
+      if (shuttingDown) {
+        return;
+      }
+      state.saveActiveRevision({ imported: revision, source: subscription });
+      state.transitionOperation(operationId, "succeeded");
+    } catch (error) {
+      if (!shuttingDown) {
+        state.failOperation(
+          operationId,
+          stage,
+          redactSecretUrl(
+            error instanceof Error ? error.message : String(error),
+            state.getSubscription(subscriptionId)?.locator,
+          ),
+        );
+      }
+    }
+  };
+
+  const queueRemoteOperation = (operationId: string, subscriptionId: string): void => {
+    setImmediate(() => void processRemoteOperation(operationId, subscriptionId));
   };
 
   const server = createServer((incoming, response) => {
@@ -176,6 +257,77 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           response.writeHead(status, { "content-type": "application/json" });
           response.end(JSON.stringify({ error: message }));
         });
+      return;
+    }
+
+    if (incoming.method === "POST" && incoming.url === "/subscriptions/remote") {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      readBody(incoming)
+        .then((body) => parseRemoteSubscriptionRequest(body))
+        .then((url) => state.createRemoteSubscription(url))
+        .then((created) => {
+          writeJson(response, 202, { ...created, status: "queued" });
+          queueRemoteOperation(created.operationId, created.subscriptionId);
+        })
+        .catch((error: unknown) => {
+          writeJson(response, 422, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      return;
+    }
+
+    const operationMatch = incoming.url?.match(/^\/operations\/([^/]+)$/);
+    if (incoming.method === "GET" && operationMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      const operation = state?.getOperation(operationMatch[1] as string);
+      if (!operation) {
+        writeJson(response, 404, { error: "operation not found" });
+        return;
+      }
+      writeJson(response, 200, {
+        ...(operation.failure ? { failure: operation.failure } : {}),
+        history: operation.history,
+        operationId: operation.id,
+        status: operation.status,
+        subscriptionId: operation.subscriptionId,
+      });
+      return;
+    }
+
+    const refreshMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)\/refresh$/);
+    if (incoming.method === "POST" && refreshMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      try {
+        const operation = state.createRefreshOperation(refreshMatch[1] as string);
+        writeJson(response, 202, {
+          operationId: operation.id,
+          status: operation.status,
+          subscriptionId: operation.subscriptionId,
+        });
+        queueRemoteOperation(operation.id, operation.subscriptionId);
+      } catch (error) {
+        writeJson(response, 404, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
 
@@ -282,6 +434,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
+      shuttingDown = true;
+      for (const controller of remoteFetches) {
+        controller.abort();
+      }
       try {
         await closeServer(server);
       } finally {
@@ -290,10 +446,6 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     },
     importLocalSubscription,
   };
-}
-
-function localLogicalNodeId(normalizedNodeName: string): string {
-  return `local:${normalizedNodeName}`;
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {
@@ -312,6 +464,40 @@ function readBody(incoming: IncomingMessage): Promise<string> {
     incoming.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     incoming.on("error", reject);
   });
+}
+
+function parseRemoteSubscriptionRequest(body: string): string {
+  const document = JSON.parse(body) as { url?: unknown };
+  if (typeof document.url !== "string") {
+    throw new Error("remote subscription URL is required");
+  }
+  const url = new URL(document.url);
+  if (url.protocol !== "https:") {
+    throw new Error("remote subscription URL must use HTTPS");
+  }
+  return document.url;
+}
+
+function isAuthorizedAdmin(incoming: IncomingMessage, adminToken: string | undefined): boolean {
+  return Boolean(adminToken && incoming.headers.authorization === `Bearer ${adminToken}`);
+}
+
+function rejectAdminAuthentication(response: import("node:http").ServerResponse): void {
+  response.writeHead(401, { "www-authenticate": "Bearer" });
+  response.end();
+}
+
+function writeJson(
+  response: import("node:http").ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+): void {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+function redactSecretUrl(message: string, locator: string | undefined): string {
+  return locator ? message.replaceAll(locator, "[redacted subscription URL]") : message;
 }
 
 function handleConnect(
