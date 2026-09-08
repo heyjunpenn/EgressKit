@@ -18,10 +18,15 @@ import {
 import {
   type RemoteOperationClock,
   RemoteOperationRunner,
+  validateMinimumSubscriptionNodes,
   validateRemoteSubscriptionTimeout,
 } from "./remote-operation.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
-import { openControlState, type PersistedNodeGeneration } from "./state.js";
+import {
+  openControlState,
+  type PersistedNodeGeneration,
+  RevisionForceConflictError,
+} from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -37,6 +42,7 @@ export interface EgressdOptions {
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
+  minimumSubscriptionNodes?: number;
   port: number;
   proxyAuthentication?: ProxyAuthentication;
   remoteSubscriptionTimeoutMs?: number;
@@ -75,6 +81,7 @@ function closeServer(server: Server): Promise<void> {
 
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
   validateRemoteSubscriptionTimeout(options.remoteSubscriptionTimeoutMs);
+  validateMinimumSubscriptionNodes(options.minimumSubscriptionNodes);
   if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
     if (!options.allowUnsafeUnauthenticatedProxy) {
       throw new Error("refusing to disable proxy authentication on a non-loopback host");
@@ -168,6 +175,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(options.remoteOperationClock === undefined
           ? {}
           : { clock: options.remoteOperationClock }),
+        ...(options.minimumSubscriptionNodes === undefined
+          ? {}
+          : { minimumNodes: options.minimumSubscriptionNodes }),
         state,
       })
     : undefined;
@@ -223,7 +233,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         .then((body) => parseRemoteSubscriptionRequest(body))
         .then((url) => state.createRemoteSubscription(url))
         .then((created) => {
-          writeJson(response, 202, { ...created, status: "queued" });
+          writeJson(response, 202, {
+            operationId: created.operationId,
+            revisionId: created.subscriptionRevisionId,
+            status: "queued",
+            subscriptionId: created.subscriptionId,
+          });
           remoteOperations?.enqueue(created.operationId, created.subscriptionId);
         })
         .catch((error: unknown) => {
@@ -249,9 +264,64 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(operation.failure ? { failure: operation.failure } : {}),
         history: operation.history,
         operationId: operation.id,
+        ...(operation.subscriptionRevisionId === undefined
+          ? {}
+          : { revisionId: operation.subscriptionRevisionId }),
         status: operation.status,
         subscriptionId: operation.subscriptionId,
       });
+      return;
+    }
+
+    const revisionMatch = incoming.url?.match(/^\/revisions\/(\d+)$/);
+    if (incoming.method === "GET" && revisionMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      const revision = state?.getRevision(Number(revisionMatch[1]));
+      if (!revision) {
+        writeJson(response, 404, { error: "revision not found" });
+        return;
+      }
+      writeJson(response, 200, {
+        forced: revision.forced,
+        history: revision.history,
+        nodeCount: revision.nodeCount,
+        revisionId: revision.subscriptionRevisionId,
+        status: revision.status,
+        subscriptionId: revision.subscriptionId,
+        ...(revision.suspiciousReason === undefined
+          ? {}
+          : { suspiciousReason: revision.suspiciousReason }),
+      });
+      return;
+    }
+
+    const forceRevisionMatch = incoming.url?.match(/^\/revisions\/(\d+)\/force$/);
+    if (incoming.method === "POST" && forceRevisionMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state || !remoteOperations) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      try {
+        const operation = state.createForceOperation(Number(forceRevisionMatch[1]));
+        writeJson(response, 202, {
+          operationId: operation.id,
+          revisionId: operation.subscriptionRevisionId,
+          status: operation.status,
+          subscriptionId: operation.subscriptionId,
+        });
+        remoteOperations.enqueueForce(operation.id, operation.subscriptionRevisionId as number);
+      } catch (error) {
+        writeJson(response, error instanceof RevisionForceConflictError ? 409 : 404, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
 
@@ -269,6 +339,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         const operation = state.createRefreshOperation(refreshMatch[1] as string);
         writeJson(response, 202, {
           operationId: operation.id,
+          revisionId: operation.subscriptionRevisionId,
           status: operation.status,
           subscriptionId: operation.subscriptionId,
         });
