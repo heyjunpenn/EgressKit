@@ -10,6 +10,8 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { startEgressd } from "./daemon.js";
+import type { SessionBindingStore } from "./session.js";
+import { startSimulatedMihomoListener, startTargetServer } from "./testing/harness.js";
 
 test("HTTP redacts subscription URLs while authenticated local socket access can reveal them", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "egresskit-control-api-"));
@@ -98,6 +100,166 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
   assert.deepEqual(
     (await socketJson(socketPath, "GET", "/subscriptions/local", "admin-secret")).body,
     { kind: "local", subscriptionId: "local" },
+  );
+});
+
+test("authenticated metrics and structured logs expose signals without seeded secrets", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "egresskit-observability-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const events: unknown[] = [];
+  const privateUuid = "123e4567-e89b-12d3-a456-426614174000";
+  const secretUrl = `https://private-user:private-password@provider.example:8443/private/path?token=subscription-secret&uuid=${privateUuid}#private`;
+  const target = await startTargetServer([]);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const stateDirectory = join(directory, "state");
+  const daemon = await startEgressd({
+    adminToken: "controller-secret",
+    fetchSubscription: async () => new Response("unauthorized", { status: 401 }),
+    host: "127.0.0.1",
+    log: (event) => events.push(event),
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const unauthenticated = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/metrics`,
+  );
+  assert.equal(unauthenticated.status, 401);
+  const faultDatabase = new DatabaseSync(join(stateDirectory, "control.sqlite"));
+  t.after(() => faultDatabase.close());
+  faultDatabase.exec(`
+    CREATE TRIGGER reject_observed_subscription
+    BEFORE INSERT ON subscriptions
+    BEGIN
+      SELECT RAISE(FAIL, '${privateUuid}');
+    END;
+  `);
+  const failedCreate = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/remote`,
+    {
+      body: JSON.stringify({ url: secretUrl }),
+      headers: {
+        authorization: "Bearer controller-secret",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    },
+  );
+  assert.equal(failedCreate.status, 422);
+  const failedCreateBody = await failedCreate.text();
+  assert.equal(
+    events.some(
+      (event) => (event as { event?: string }).event === "egressd.subscription.remote.created",
+    ),
+    false,
+  );
+  faultDatabase.exec("DROP TRIGGER reject_observed_subscription");
+  const created = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/remote`,
+    {
+      body: JSON.stringify({ url: secretUrl }),
+      headers: {
+        authorization: "Bearer controller-secret",
+        cookie: "session=private-cookie",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    },
+  );
+  assert.equal(created.status, 202);
+  const createdBody = await created.text();
+  const rejectedLocal = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      body: `proxies:\n  - { name: ${privateUuid}, type: vless, server: node.example, port: 443, uuid: invalid-${privateUuid} }\n`,
+      headers: {
+        authorization: "Bearer controller-secret",
+        "content-type": "text/yaml",
+      },
+      method: "POST",
+    },
+  );
+  assert.equal(rejectedLocal.status, 422);
+  const rejectedLocalBody = await rejectedLocal.text();
+  assert.equal(
+    await routedProxyStatus(
+      daemon.address,
+      "sticky.private-session-key",
+      "proxy-secret",
+      `http://${target.host}:${target.port}/observed`,
+    ),
+    200,
+  );
+  const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
+    headers: { authorization: "Bearer controller-secret" },
+  });
+  assert.equal(metrics.status, 200);
+  const metricsBody = await metrics.text();
+  assert.match(metricsBody, /egresskit_connections_total\{result="success"\} 1/);
+  assert.match(metricsBody, /egresskit_active_sessions 1/);
+  assert.match(metricsBody, /egresskit_connection_latency_ms_count 1/);
+  assert.match(metricsBody, /egresskit_nodes\{status="healthy"\} 1/);
+  assert.match(metricsBody, /egresskit_operations\{status="/);
+  let safeError: unknown;
+  try {
+    await startEgressd({
+      adminToken: privateUuid,
+      host: "127.0.0.1",
+      port: 0,
+      proxyAuthentication: { tokens: [privateUuid] },
+    });
+  } catch (error) {
+    safeError = error;
+  }
+  const observable = JSON.stringify({
+    error: String(safeError),
+    events,
+    httpResponses: [createdBody, failedCreateBody, rejectedLocalBody],
+    metrics: metricsBody,
+  });
+  assert.match(observable, /https:\/\/provider\.example:8443/);
+  assert.doesNotMatch(
+    observable,
+    new RegExp(
+      `private-user|private-password|private\\/path|subscription-secret|private-cookie|controller-secret|proxy-secret|Proxy-Authorization|${privateUuid}`,
+      "i",
+    ),
+  );
+});
+
+test("metrics snapshot failures return a safe 503 without affecting liveness", async (t) => {
+  const failingStore: SessionBindingStore = {
+    countSessionBindings: () => 0,
+    deleteExpiredSessionBindings: () => {
+      throw new Error("private metrics storage failure");
+    },
+    getSessionBinding: () => undefined,
+    loadOrCreateSessionHmacKey: () => Buffer.alloc(32),
+    saveSessionBinding: () => undefined,
+    touchSessionBinding: () => undefined,
+  };
+  const daemon = await startEgressd({
+    adminToken: "admin-secret",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    sessionBindingStore: failingStore,
+  });
+  t.after(() => daemon.close());
+
+  const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
+    headers: { authorization: "Bearer admin-secret" },
+  });
+  assert.equal(metrics.status, 503);
+  assert.deepEqual(await metrics.json(), { error: "metrics unavailable" });
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
   );
 });
 
@@ -410,6 +572,31 @@ function proxyStatus(address: { host: string; port: number }, token: string): Pr
       port: address.port,
       headers: {
         "proxy-authorization": `Basic ${Buffer.from(`rotate:${token}`).toString("base64")}`,
+      },
+    });
+    outgoing.on("response", (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode ?? 0));
+    });
+    outgoing.on("error", reject);
+    outgoing.end();
+  });
+}
+
+function routedProxyStatus(
+  address: { host: string; port: number },
+  username: string,
+  token: string,
+  target: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request({
+      host: address.host,
+      method: "GET",
+      path: target,
+      port: address.port,
+      headers: {
+        "proxy-authorization": `Basic ${Buffer.from(`${username}:${token}`).toString("base64")}`,
       },
     });
     outgoing.on("response", (response) => {

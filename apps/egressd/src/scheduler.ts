@@ -71,6 +71,7 @@ export function validateSelectorUniqueness(
 }
 
 export class RotateScheduler {
+  readonly #drainingStates = new Set<CandidateState>();
   #states: CandidateState[] = [];
 
   constructor(candidates: readonly SchedulerCandidate[] = []) {
@@ -89,7 +90,13 @@ export class RotateScheduler {
     const nextKeys = new Set(candidates.map(candidateKey));
     for (const state of this.#states) {
       if (!nextKeys.has(candidateKey(state.candidate))) {
-        beginDraining(state, onDrained);
+        if (state.leasedConnections > 0) {
+          this.#drainingStates.add(state);
+        }
+        beginDraining(state, (candidate) => {
+          this.#drainingStates.delete(state);
+          onDrained?.(candidate);
+        });
       }
     }
     this.#states = candidates.map((candidate) => {
@@ -176,6 +183,10 @@ export class RotateScheduler {
 
   snapshot(): readonly SchedulerCandidate[] {
     return this.#states.map(({ candidate }) => ({ ...candidate }));
+  }
+
+  drainingCount(): number {
+    return this.#drainingStates.size;
   }
 
   healthStatus(id: string): NodeHealthStatus | undefined {

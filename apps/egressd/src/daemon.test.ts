@@ -741,6 +741,12 @@ test("rotate retries a different listener before CONNECT 200", { timeout: 2_000 
     /^HTTP\/1\.1 200 Connection Established/,
   );
   assert.deepEqual(secondSelections, [authority]);
+  const metrics = await fetch(`http://${daemon.address.host}:${daemon.address.port}/metrics`, {
+    headers: { authorization: "Bearer test-admin-token" },
+  });
+  const metricsBody = await metrics.text();
+  assert.match(metricsBody, /egresskit_connection_failures_total 1/);
+  assert.match(metricsBody, /egresskit_fallbacks_total 1/);
 });
 
 test("CONNECT failover uses three attempts by default and honors a bounded override", async (t) => {
@@ -1572,6 +1578,11 @@ test("a changed generation drains its listener before removal and port quarantin
   assert.equal(appliedConfigs[1]?.listeners[0]?.port, 20_001);
   assert.deepEqual(preservedListeners, [[], [`http://${oldListener.host}:${oldListener.port}/`]]);
   assert.deepEqual(removedListeners, []);
+  const drainingMetrics = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/metrics`,
+    { headers: { authorization: "Bearer test-admin-token" } },
+  );
+  assert.match(await drainingMetrics.text(), /egresskit_nodes\{status="draining"\} 1/);
   assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
 

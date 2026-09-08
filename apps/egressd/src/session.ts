@@ -93,6 +93,16 @@ export class SoftStickySessions {
     return this.#acquire(sessionKey, false, new Set());
   }
 
+  countActiveSessions(): number {
+    this.#store.deleteExpiredSessionBindings(
+      this.#clock.now(),
+      this.#absoluteTtlMs,
+      this.#idleTimeoutMs,
+      [...this.#activeConnections.keys()],
+    );
+    return this.#activeSessionCount();
+  }
+
   #acquire(
     sessionKey: string,
     rebindUnavailable: boolean,

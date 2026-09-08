@@ -111,6 +111,7 @@ export interface ControlState extends SessionBindingStore {
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   listDrainingListenerLeases(): PersistedListenerLease[];
+  operationStatusCounts(): Record<string, number>;
   loadProxyTokens(): PersistedProxyToken[] | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
   prepareNodeRevision(
@@ -201,6 +202,7 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     loadProxyTokens: () => loadProxyTokens(controlDatabase),
+    operationStatusCounts: () => operationStatusCounts(controlDatabase),
     prepareNodeRevision: (sourceId, imported, now) =>
       prepareNodeRevision(controlDatabase, sourceId, imported, now),
     releaseNodeGeneration: (logicalId, generation, listenerPort, reusableAfter) =>
@@ -250,6 +252,13 @@ function countSessionBindings(database: DatabaseSync): number {
   return (
     database.prepare("SELECT COUNT(*) AS count FROM session_bindings").get() as { count: number }
   ).count;
+}
+
+function operationStatusCounts(database: DatabaseSync): Record<string, number> {
+  const rows = database
+    .prepare("SELECT status, COUNT(*) AS count FROM operations GROUP BY status")
+    .all() as Array<{ count: number; status: string }>;
+  return Object.fromEntries(rows.map((row) => [row.status, row.count]));
 }
 
 function deleteExpiredSessionBindings(
