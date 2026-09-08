@@ -192,7 +192,7 @@ function runVersionProbe(path: string): Promise<void> {
       const output = Buffer.concat(chunks).toString("utf8");
       if (code !== 0) {
         finish(new Error(`version probe exited ${String(code)}`));
-      } else if (!/mihomo/i.test(output) || !output.includes(MIHOMO_VERSION)) {
+      } else if (!/mihomo/i.test(output) || !/(?:^|\s)v1\.19\.30(?:\s|$)/.test(output)) {
         finish(new Error(`version probe did not identify Mihomo ${MIHOMO_VERSION}`));
       } else {
         finish();

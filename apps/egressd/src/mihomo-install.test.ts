@@ -120,6 +120,14 @@ test("installer reports unsupported, download, checksum, and executable errors d
     assertMihomoExecutable(wrongVersion),
     (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
   );
+  for (const version of ["v1.19.300", "v1.19.30-dev"]) {
+    const prefixCollision = join(directory, version);
+    await writeFile(prefixCollision, `#!/bin/sh\necho Mihomo Meta ${version}\n`, { mode: 0o700 });
+    await assert.rejects(
+      assertMihomoExecutable(prefixCollision),
+      (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+    );
+  }
   const supported = join(directory, "supported");
   await writeFile(supported, "#!/bin/sh\necho Mihomo Meta v1.19.30\n", { mode: 0o700 });
   await assert.doesNotReject(assertMihomoExecutable(supported));
