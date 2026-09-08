@@ -16,8 +16,15 @@ interface OperationBody extends Record<string, unknown> {
   failure?: { reason: string; stage: string };
   history?: string[];
   operationId?: string;
+  revisionId?: number;
   status?: string;
   subscriptionId?: string;
+}
+
+interface RevisionBody extends OperationBody {
+  forced?: boolean;
+  nodeCount?: number;
+  suspiciousReason?: string;
 }
 
 test("remote subscription operations expose every successful processing stage and can refresh", async (t) => {
@@ -589,6 +596,211 @@ test("remote subscription downloads are bounded", async (t) => {
   assert.equal(failed.body.failure?.reason, "remote subscription exceeds 1 MiB");
 });
 
+test("revision layers remain distinct and a suspicious zero-node candidate requires force", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const applied: unknown[] = [];
+  const fixture = await startSubscriptionFixture(t, () => ({
+    body: "proxies: []\n",
+    status: 200,
+  }));
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (_url, options) => fetch(fixture, options),
+    host: "127.0.0.1",
+    mihomoRuntime: runtimeForAllNodes(applied),
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/empty" },
+    method: "POST",
+  });
+  const evaluated = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+  const revision = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}`,
+  );
+
+  assert.equal(evaluated.body.status, "succeeded");
+  assert.equal(revision.body.status, "suspicious");
+  assert.equal((revision.body as RevisionBody).nodeCount, 0);
+  assert.match((revision.body as RevisionBody).suspiciousReason ?? "", /zero nodes/);
+  assert.deepEqual(revision.body.history, [
+    "saved",
+    "downloaded",
+    "parsed",
+    "validated",
+    "suspicious",
+  ]);
+  assert.equal(applied.length, 0);
+
+  const unauthorizedForce = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  assert.equal(unauthorizedForce.status, 401);
+  assert.equal(applied.length, 0);
+
+  const forced = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}/force`,
+    { method: "POST" },
+  );
+  assert.equal(forced.status, 202);
+  const forcedOperation = await waitForTerminalOperation(
+    daemon.address,
+    forced.body.operationId as string,
+  );
+  const appliedRevision = await adminJson(
+    daemon.address,
+    `/revisions/${evaluated.body.revisionId as number}`,
+  );
+
+  assert.equal(forcedOperation.body.status, "succeeded");
+  assert.equal(forcedOperation.body.revisionId, evaluated.body.revisionId);
+  assert.equal((appliedRevision.body as RevisionBody).forced, true);
+  assert.equal(appliedRevision.body.status, "ready");
+  assert.deepEqual(appliedRevision.body.history, [
+    "saved",
+    "downloaded",
+    "parsed",
+    "validated",
+    "suspicious",
+    "accepted",
+    "ready",
+  ]);
+  assert.equal(appliedRevision.body.history?.includes("healthy"), false);
+  assert.equal(applied.length, 1);
+});
+
+test("minimum node count and abnormal shrinkage preserve the active revision", async (t) => {
+  await t.test("below configured minimum", async (subtest) => {
+    const applied: unknown[] = [];
+    const fixture = await startSubscriptionFixture(subtest, () => ({
+      body: subscriptionWithNodes(2),
+      status: 200,
+    }));
+    const daemon = await startEgressd({
+      adminToken: "admin-token",
+      fetchSubscription: async (_url, options) => fetch(fixture, options),
+      host: "127.0.0.1",
+      mihomoRuntime: runtimeForAllNodes(applied),
+      minimumSubscriptionNodes: 3,
+      port: 0,
+      stateDirectory: await temporaryStateDirectory(subtest),
+    });
+    subtest.after(() => daemon.close());
+
+    const created = await adminJson(daemon.address, "/subscriptions/remote", {
+      body: { url: "https://provider.example/below-minimum" },
+      method: "POST",
+    });
+    const operation = await waitForTerminalOperation(
+      daemon.address,
+      created.body.operationId as string,
+    );
+    const revision = await adminJson(
+      daemon.address,
+      `/revisions/${operation.body.revisionId as number}`,
+    );
+
+    assert.equal(revision.body.status, "suspicious");
+    assert.match((revision.body as RevisionBody).suspiciousReason ?? "", /minimum of 3/);
+    assert.equal(applied.length, 0);
+  });
+
+  await t.test("more than fifty percent shrinkage", async (subtest) => {
+    const stateDirectory = await temporaryStateDirectory(subtest);
+    const applied: unknown[] = [];
+    let request = 0;
+    const fixture = await startSubscriptionFixture(subtest, () => {
+      request += 1;
+      return { body: subscriptionWithNodes(request === 1 ? 4 : 1), status: 200 };
+    });
+    const daemon = await startEgressd({
+      adminToken: "admin-token",
+      checkMihomoListener: async () => undefined,
+      fetchSubscription: async (_url, options) => fetch(fixture, options),
+      host: "127.0.0.1",
+      mihomoRuntime: runtimeForAllNodes(applied),
+      port: 0,
+      stateDirectory,
+    });
+    const created = await adminJson(daemon.address, "/subscriptions/remote", {
+      body: { url: "https://provider.example/shrinking" },
+      method: "POST",
+    });
+    await waitForTerminalOperation(daemon.address, created.body.operationId as string);
+    const refreshed = await adminJson(
+      daemon.address,
+      `/subscriptions/${created.body.subscriptionId as string}/refresh`,
+      { method: "POST" },
+    );
+    const operation = await waitForTerminalOperation(
+      daemon.address,
+      refreshed.body.operationId as string,
+    );
+    const revision = await adminJson(
+      daemon.address,
+      `/revisions/${operation.body.revisionId as number}`,
+    );
+
+    assert.equal(revision.body.status, "suspicious");
+    assert.match((revision.body as RevisionBody).suspiciousReason ?? "", /more than 50%/);
+    assert.equal(applied.length, 1);
+    await daemon.close();
+    const state = await openControlState(stateDirectory);
+    assert.equal(state.loadActiveRevision()?.imported.nodes.length, 4);
+    await state.close();
+  });
+
+  await t.test("exactly fifty percent is accepted", async (subtest) => {
+    const applied: unknown[] = [];
+    let request = 0;
+    const fixture = await startSubscriptionFixture(subtest, () => {
+      request += 1;
+      return { body: subscriptionWithNodes(request === 1 ? 4 : 2), status: 200 };
+    });
+    const daemon = await startEgressd({
+      adminToken: "admin-token",
+      checkMihomoListener: async () => undefined,
+      fetchSubscription: async (_url, options) => fetch(fixture, options),
+      host: "127.0.0.1",
+      mihomoRuntime: runtimeForAllNodes(applied),
+      port: 0,
+      stateDirectory: await temporaryStateDirectory(subtest),
+    });
+    subtest.after(() => daemon.close());
+    const created = await adminJson(daemon.address, "/subscriptions/remote", {
+      body: { url: "https://provider.example/fifty-percent" },
+      method: "POST",
+    });
+    await waitForTerminalOperation(daemon.address, created.body.operationId as string);
+    const refreshed = await adminJson(
+      daemon.address,
+      `/subscriptions/${created.body.subscriptionId as string}/refresh`,
+      { method: "POST" },
+    );
+    const operation = await waitForTerminalOperation(
+      daemon.address,
+      refreshed.body.operationId as string,
+    );
+    const revision = await adminJson(
+      daemon.address,
+      `/revisions/${operation.body.revisionId as number}`,
+    );
+
+    assert.equal(revision.body.status, "ready");
+    assert.equal(applied.length, 2);
+  });
+});
+
 function successfulRuntime(applied: unknown[]): MihomoRuntime {
   return {
     apply: async (config) => {
@@ -596,6 +808,27 @@ function successfulRuntime(applied: unknown[]): MihomoRuntime {
       return new Map([["remote", new URL("http://127.0.0.1:20000")]]);
     },
   };
+}
+
+function runtimeForAllNodes(applied: unknown[]): MihomoRuntime {
+  return {
+    apply: async (config) => {
+      applied.push(config);
+      return new Map(
+        config.listeners.map((listener) => [
+          listener.proxy,
+          new URL(`http://${listener.listen}:${listener.port}`),
+        ]),
+      );
+    },
+  };
+}
+
+function subscriptionWithNodes(count: number): string {
+  return `proxies:\n${Array.from({ length: count }, (_, index) => {
+    const suffix = String(index + 1).padStart(12, "0");
+    return `  - { name: remote-${index + 1}, type: vless, server: proxy-${index + 1}.example.com, port: 443, uuid: 11111111-1111-4111-8111-${suffix} }`;
+  }).join("\n")}\n`;
 }
 
 async function temporaryStateDirectory(t: TestContext): Promise<string> {

@@ -27,6 +27,27 @@ export interface PersistedActiveRevision {
   source: SubscriptionIdentity;
 }
 
+export type SubscriptionRevisionStatus =
+  | "saved"
+  | "downloaded"
+  | "parsed"
+  | "validated"
+  | "suspicious"
+  | "accepted"
+  | "ready"
+  | "healthy";
+
+export interface PersistedSubscriptionRevision {
+  forced: boolean;
+  history: SubscriptionRevisionStatus[];
+  id: number;
+  imported?: ImportedVlessRevision;
+  nodeCount: number;
+  status: SubscriptionRevisionStatus;
+  subscriptionId: string;
+  suspiciousReason?: string;
+}
+
 export type OperationStatus =
   | "queued"
   | "fetching"
@@ -47,25 +68,33 @@ export interface SubscriptionOperation {
   failure?: { reason: string; stage: OperationProcessingStage };
   history: OperationStatus[];
   id: string;
+  revisionId?: number;
   status: OperationStatus;
   subscriptionId: string;
 }
 
 export interface ControlState {
+  advanceRevision(revisionId: number, status: SubscriptionRevisionStatus): void;
+  createForceOperation(revisionId: number): SubscriptionOperation;
   createRefreshOperation(subscriptionId: string): SubscriptionOperation;
   createRemoteSubscription(locator: string): {
     operationId: string;
+    revisionId: number;
     subscriptionId: string;
   };
   databasePath: string;
   failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
+  getRevision(revisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
   saveActiveRevision(input: {
     imported: ImportedVlessRevision;
+    revisionId?: number;
     source: SubscriptionIdentity;
   }): PersistedActiveRevision;
+  saveValidatedRevision(revisionId: number, imported: ImportedVlessRevision): void;
+  markRevisionSuspicious(revisionId: number, reason: string): void;
   settings(): {
     busyTimeoutMs: number;
     foreignKeys: number;
@@ -102,6 +131,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
 
   let closed = false;
   return {
+    advanceRevision: (revisionId, status) => advanceRevision(controlDatabase, revisionId, status),
+    createForceOperation: (revisionId) => createForceOperation(controlDatabase, revisionId),
     createRefreshOperation: (subscriptionId) =>
       createRefreshOperation(controlDatabase, subscriptionId),
     createRemoteSubscription: (locator) => createRemoteSubscription(controlDatabase, locator),
@@ -109,9 +140,14 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     failOperation: (operationId, stage, reason) =>
       failOperation(controlDatabase, operationId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
+    getRevision: (revisionId) => getRevision(controlDatabase, revisionId),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
+    saveValidatedRevision: (revisionId, imported) =>
+      saveValidatedRevision(controlDatabase, revisionId, imported),
+    markRevisionSuspicious: (revisionId, reason) =>
+      markRevisionSuspicious(controlDatabase, revisionId, reason),
     settings: () => ({
       busyTimeoutMs: (controlDatabase.prepare("PRAGMA busy_timeout").get() as { timeout: number })
         .timeout,
@@ -173,6 +209,10 @@ function migrate(database: DatabaseSync): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
       normalized_nodes_json TEXT NOT NULL,
+      mihomo_config_json TEXT,
+      lifecycle_status TEXT NOT NULL DEFAULT 'saved',
+      suspicious_reason TEXT,
+      forced INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS node_generations (
@@ -209,14 +249,53 @@ function migrate(database: DatabaseSync): void {
       status TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
-    PRAGMA user_version = 2;
   `);
+  ensureColumn(database, "subscription_revisions", "mihomo_config_json", "TEXT");
+  ensureColumn(
+    database,
+    "subscription_revisions",
+    "lifecycle_status",
+    "TEXT NOT NULL DEFAULT 'ready'",
+  );
+  ensureColumn(database, "subscription_revisions", "suspicious_reason", "TEXT");
+  ensureColumn(database, "subscription_revisions", "forced", "INTEGER NOT NULL DEFAULT 0");
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS revision_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      revision_id INTEGER NOT NULL REFERENCES subscription_revisions(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS operation_revisions (
+      operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE,
+      revision_id INTEGER NOT NULL REFERENCES subscription_revisions(id)
+    );
+    INSERT INTO revision_events (revision_id, status, created_at)
+      SELECT sr.id, sr.lifecycle_status, sr.created_at
+      FROM subscription_revisions sr
+      WHERE NOT EXISTS (
+        SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
+      );
+    PRAGMA user_version = 3;
+  `);
+}
+
+function ensureColumn(
+  database: DatabaseSync,
+  table: string,
+  column: string,
+  definition: string,
+): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((candidate) => candidate.name === column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 function createRemoteSubscription(
   database: DatabaseSync,
   locator: string,
-): { operationId: string; subscriptionId: string } {
+): { operationId: string; revisionId: number; subscriptionId: string } {
   const subscriptionId = randomUUID();
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
@@ -224,9 +303,10 @@ function createRemoteSubscription(
     database
       .prepare("INSERT INTO subscriptions (id, kind, locator) VALUES (?, 'remote', ?)")
       .run(subscriptionId, locator);
-    insertOperation(database, operationId, subscriptionId);
+    const revisionId = insertPendingRevision(database, subscriptionId);
+    insertOperation(database, operationId, subscriptionId, revisionId);
     database.exec("COMMIT");
-    return { operationId, subscriptionId };
+    return { operationId, revisionId, subscriptionId };
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -244,7 +324,8 @@ function createRefreshOperation(
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
   try {
-    insertOperation(database, operationId, subscriptionId);
+    const revisionId = insertPendingRevision(database, subscriptionId);
+    insertOperation(database, operationId, subscriptionId, revisionId);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -253,10 +334,45 @@ function createRefreshOperation(
   return getOperation(database, operationId) as SubscriptionOperation;
 }
 
+function createForceOperation(database: DatabaseSync, revisionId: number): SubscriptionOperation {
+  const revision = getRevision(database, revisionId);
+  if (revision?.status !== "suspicious" || !revision.imported) {
+    throw new Error(`suspicious revision not found: ${revisionId}`);
+  }
+  const operationId = randomUUID();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare("UPDATE subscription_revisions SET forced = 1 WHERE id = ?").run(revisionId);
+    insertOperation(database, operationId, revision.subscriptionId, revisionId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  return getOperation(database, operationId) as SubscriptionOperation;
+}
+
+function insertPendingRevision(database: DatabaseSync, subscriptionId: string): number {
+  const now = new Date().toISOString();
+  const inserted = database
+    .prepare(
+      `INSERT INTO subscription_revisions
+         (subscription_id, normalized_nodes_json, lifecycle_status, created_at)
+       VALUES (?, '[]', 'saved', ?)`,
+    )
+    .run(subscriptionId, now);
+  const revisionId = Number(inserted.lastInsertRowid);
+  database
+    .prepare("INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, 'saved', ?)")
+    .run(revisionId, now);
+  return revisionId;
+}
+
 function insertOperation(
   database: DatabaseSync,
   operationId: string,
   subscriptionId: string,
+  revisionId: number,
 ): void {
   const now = new Date().toISOString();
   database
@@ -271,6 +387,9 @@ function insertOperation(
       "INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, 'queued', ?)",
     )
     .run(operationId, now);
+  database
+    .prepare("INSERT INTO operation_revisions (operation_id, revision_id) VALUES (?, ?)")
+    .run(operationId, revisionId);
 }
 
 function getSubscription(
@@ -289,14 +408,18 @@ function getOperation(
 ): SubscriptionOperation | undefined {
   const row = database
     .prepare(
-      `SELECT id, subscription_id, status, failed_stage, failure_reason
-       FROM operations WHERE id = ?`,
+      `SELECT o.id, o.subscription_id, o.status, o.failed_stage, o.failure_reason,
+              orv.revision_id
+       FROM operations o
+       LEFT JOIN operation_revisions orv ON orv.operation_id = o.id
+       WHERE o.id = ?`,
     )
     .get(operationId) as
     | {
         failed_stage: OperationProcessingStage | null;
         failure_reason: string | null;
         id: string;
+        revision_id: number | null;
         status: OperationStatus;
         subscription_id: string;
       }
@@ -313,9 +436,111 @@ function getOperation(
       : {}),
     history: history.map((event) => event.status),
     id: row.id,
+    ...(row.revision_id === null ? {} : { revisionId: row.revision_id }),
     status: row.status,
     subscriptionId: row.subscription_id,
   };
+}
+
+function getRevision(
+  database: DatabaseSync,
+  revisionId: number,
+): PersistedSubscriptionRevision | undefined {
+  const row = database
+    .prepare(
+      `SELECT id, subscription_id, normalized_nodes_json, mihomo_config_json,
+              lifecycle_status, suspicious_reason, forced
+       FROM subscription_revisions WHERE id = ?`,
+    )
+    .get(revisionId) as
+    | {
+        forced: number;
+        id: number;
+        lifecycle_status: SubscriptionRevisionStatus;
+        mihomo_config_json: string | null;
+        normalized_nodes_json: string;
+        subscription_id: string;
+        suspicious_reason: string | null;
+      }
+    | undefined;
+  if (!row) {
+    return undefined;
+  }
+  const nodes = JSON.parse(row.normalized_nodes_json) as NormalizedVlessNode[];
+  const history = database
+    .prepare("SELECT status FROM revision_events WHERE revision_id = ? ORDER BY id")
+    .all(revisionId) as Array<{ status: SubscriptionRevisionStatus }>;
+  return {
+    forced: row.forced === 1,
+    history: history.map((event) => event.status),
+    id: row.id,
+    ...(row.mihomo_config_json === null
+      ? {}
+      : {
+          imported: {
+            mihomoConfig: JSON.parse(
+              row.mihomo_config_json,
+            ) as ImportedVlessRevision["mihomoConfig"],
+            nodes,
+          },
+        }),
+    nodeCount: nodes.length,
+    status: row.lifecycle_status,
+    subscriptionId: row.subscription_id,
+    ...(row.suspicious_reason === null ? {} : { suspiciousReason: row.suspicious_reason }),
+  };
+}
+
+function advanceRevision(
+  database: DatabaseSync,
+  revisionId: number,
+  status: SubscriptionRevisionStatus,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database
+      .prepare("UPDATE subscription_revisions SET lifecycle_status = ? WHERE id = ?")
+      .run(status, revisionId);
+    if (result.changes !== 1) {
+      throw new Error(`subscription revision not found: ${revisionId}`);
+    }
+    database
+      .prepare("INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, ?, ?)")
+      .run(revisionId, status, now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function saveValidatedRevision(
+  database: DatabaseSync,
+  revisionId: number,
+  imported: ImportedVlessRevision,
+): void {
+  const result = database
+    .prepare(
+      `UPDATE subscription_revisions
+       SET normalized_nodes_json = ?, mihomo_config_json = ?
+       WHERE id = ?`,
+    )
+    .run(JSON.stringify(imported.nodes), JSON.stringify(imported.mihomoConfig), revisionId);
+  if (result.changes !== 1) {
+    throw new Error(`subscription revision not found: ${revisionId}`);
+  }
+  advanceRevision(database, revisionId, "validated");
+}
+
+function markRevisionSuspicious(database: DatabaseSync, revisionId: number, reason: string): void {
+  const result = database
+    .prepare("UPDATE subscription_revisions SET suspicious_reason = ? WHERE id = ?")
+    .run(reason, revisionId);
+  if (result.changes !== 1) {
+    throw new Error(`subscription revision not found: ${revisionId}`);
+  }
+  advanceRevision(database, revisionId, "suspicious");
 }
 
 function transitionOperation(
@@ -387,7 +612,11 @@ function interruptUnfinishedOperations(database: DatabaseSync): void {
 
 function saveActiveRevision(
   database: DatabaseSync,
-  input: { imported: ImportedVlessRevision; source: SubscriptionIdentity },
+  input: {
+    imported: ImportedVlessRevision;
+    revisionId?: number;
+    source: SubscriptionIdentity;
+  },
 ): PersistedActiveRevision {
   const nodes = input.imported.nodes.map((node) => {
     const listener = input.imported.mihomoConfig.listeners.find(
@@ -412,14 +641,35 @@ function saveActiveRevision(
          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, locator = excluded.locator`,
       )
       .run(input.source.id, input.source.kind, input.source.locator);
-    const insertedRevision = database
-      .prepare(
-        `INSERT INTO subscription_revisions
-           (subscription_id, normalized_nodes_json, created_at)
-         VALUES (?, ?, ?)`,
-      )
-      .run(input.source.id, JSON.stringify(input.imported.nodes), new Date().toISOString());
-    const subscriptionRevisionId = Number(insertedRevision.lastInsertRowid);
+    const subscriptionRevisionId =
+      input.revisionId ??
+      Number(
+        database
+          .prepare(
+            `INSERT INTO subscription_revisions
+               (subscription_id, normalized_nodes_json, mihomo_config_json, lifecycle_status,
+                created_at)
+             VALUES (?, ?, ?, 'ready', ?)`,
+          )
+          .run(
+            input.source.id,
+            JSON.stringify(input.imported.nodes),
+            JSON.stringify(input.imported.mihomoConfig),
+            new Date().toISOString(),
+          ).lastInsertRowid,
+      );
+    if (input.revisionId !== undefined) {
+      const revision = getRevision(database, input.revisionId);
+      if (!revision || revision.subscriptionId !== input.source.id) {
+        throw new Error(`subscription revision not found: ${input.revisionId}`);
+      }
+    } else {
+      database
+        .prepare(
+          "INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, 'ready', ?)",
+        )
+        .run(subscriptionRevisionId, new Date().toISOString());
+    }
     const insertNode = database.prepare(
       `INSERT INTO node_generations
          (revision_id, logical_id, generation, listener_port, normalized_node_json)

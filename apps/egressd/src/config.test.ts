@@ -70,3 +70,16 @@ test("state directory configures durable daemon control state", () => {
   assert.throws(() => loadConfig({ EGRESSKIT_STATE_DIRECTORY: "" }), /must not be empty/);
   assert.equal(loadConfig({ XDG_STATE_HOME: "/tmp/state" }).stateDirectory, "/tmp/state/egresskit");
 });
+
+test("minimum subscription nodes is a positive configurable integer", () => {
+  assert.equal(
+    loadConfig({ EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES: "3" }).minimumSubscriptionNodes,
+    3,
+  );
+  for (const value of ["0", "-1", "1.5", "many"]) {
+    assert.throws(
+      () => loadConfig({ EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES: value }),
+      /positive integer/,
+    );
+  }
+});

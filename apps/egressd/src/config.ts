@@ -10,8 +10,20 @@ export interface EgressdConfig {
   host: string;
   port: number;
   mihomoListener?: URL;
+  minimumSubscriptionNodes?: number;
   proxyAuthentication: ProxyAuthentication;
   stateDirectory: string;
+}
+
+function parsePositiveInteger(name: string, value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function parsePort(value: string | undefined): number {
@@ -59,6 +71,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     (environment.XDG_STATE_HOME
       ? join(environment.XDG_STATE_HOME, "egresskit")
       : join(homedir(), ".local", "state", "egresskit"));
+  const minimumSubscriptionNodes = parsePositiveInteger(
+    "EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES",
+    environment.EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES,
+  );
 
   return {
     ...(environment.EGRESSKIT_ADMIN_TOKEN === undefined
@@ -66,6 +82,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
       : { adminToken: environment.EGRESSKIT_ADMIN_TOKEN }),
     ...(allowUnsafeUnauthenticatedProxy ? { allowUnsafeUnauthenticatedProxy: true as const } : {}),
     host,
+    ...(minimumSubscriptionNodes === undefined ? {} : { minimumSubscriptionNodes }),
     port: parsePort(environment.EGRESSKIT_PORT),
     stateDirectory,
     ...(mihomoListener === undefined ? {} : { mihomoListener }),

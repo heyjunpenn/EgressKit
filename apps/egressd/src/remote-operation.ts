@@ -23,12 +23,19 @@ export interface RemoteOperationRunnerOptions {
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   fetchTimeoutMs?: number;
   clock?: RemoteOperationClock;
+  minimumNodes?: number;
   state: ControlState;
 }
 
 export function validateRemoteSubscriptionTimeout(fetchTimeoutMs: number | undefined): void {
   if (fetchTimeoutMs !== undefined && (!Number.isFinite(fetchTimeoutMs) || fetchTimeoutMs <= 0)) {
     throw new Error("remote subscription fetch timeout must be positive");
+  }
+}
+
+export function validateMinimumSubscriptionNodes(minimumNodes: number | undefined): void {
+  if (minimumNodes !== undefined && (!Number.isInteger(minimumNodes) || minimumNodes < 1)) {
+    throw new Error("minimum subscription nodes must be a positive integer");
   }
 }
 
@@ -41,6 +48,7 @@ export class RemoteOperationRunner {
 
   constructor(options: RemoteOperationRunnerOptions) {
     validateRemoteSubscriptionTimeout(options.fetchTimeoutMs);
+    validateMinimumSubscriptionNodes(options.minimumNodes);
     this.#options = options;
   }
 
@@ -48,6 +56,14 @@ export class RemoteOperationRunner {
     setImmediate(() => {
       this.#queue = this.#queue
         .then(() => this.#process(operationId, subscriptionId))
+        .catch(() => undefined);
+    });
+  }
+
+  enqueueForce(operationId: string, revisionId: number): void {
+    setImmediate(() => {
+      this.#queue = this.#queue
+        .then(() => this.#processForce(operationId, revisionId))
         .catch(() => undefined);
     });
   }
@@ -66,6 +82,11 @@ export class RemoteOperationRunner {
     }
     let stage: OperationProcessingStage = "queued";
     try {
+      const operation = this.#options.state.getOperation(operationId);
+      if (operation?.revisionId === undefined) {
+        throw new Error(`subscription revision not found for operation: ${operationId}`);
+      }
+      const revisionId = operation.revisionId;
       const subscription = this.#options.state.getSubscription(subscriptionId);
       if (subscription?.kind !== "remote") {
         throw new Error(`remote subscription not found: ${subscriptionId}`);
@@ -73,36 +94,97 @@ export class RemoteOperationRunner {
       stage = "fetching";
       this.#options.state.transitionOperation(operationId, stage);
       const source = await this.#downloadWithRetries(subscription.locator);
+      this.#options.state.advanceRevision(revisionId, "downloaded");
       if (this.#shuttingDown) {
         return;
       }
       stage = "parsing";
       this.#options.state.transitionOperation(operationId, stage);
       parse(source);
+      this.#options.state.advanceRevision(revisionId, "parsed");
       stage = "validating";
       this.#options.state.transitionOperation(operationId, stage);
       const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
-      if (revision.nodes.length === 0) {
-        throw new Error("subscription contains no VLESS nodes");
-      }
-      stage = "applying";
-      this.#options.state.transitionOperation(operationId, stage);
-      await this.#options.activateRevision(revision, subscription, () => {
-        if (!this.#shuttingDown) {
-          stage = "checking";
-          this.#options.state.transitionOperation(operationId, stage);
-        }
-      });
-      if (this.#shuttingDown) {
+      this.#options.state.saveValidatedRevision(revisionId, revision);
+      const suspiciousReason = this.#suspiciousReason(revision, subscription.id);
+      if (suspiciousReason) {
+        this.#options.state.markRevisionSuspicious(revisionId, suspiciousReason);
+        this.#options.state.transitionOperation(operationId, "succeeded");
         return;
       }
-      this.#options.state.saveActiveRevision({ imported: revision, source: subscription });
-      this.#options.state.transitionOperation(operationId, "succeeded");
+      await this.#apply(operationId, revisionId, revision, subscription, (next) => {
+        stage = next;
+      });
     } catch (error) {
       if (!this.#shuttingDown) {
         this.#options.state.failOperation(operationId, stage, operationFailureReason(stage, error));
       }
     }
+  }
+
+  async #processForce(operationId: string, revisionId: number): Promise<void> {
+    let stage: OperationProcessingStage = "queued";
+    try {
+      const revision = this.#options.state.getRevision(revisionId);
+      if (!revision?.imported) {
+        throw new Error(`subscription revision not found: ${revisionId}`);
+      }
+      const subscription = this.#options.state.getSubscription(revision.subscriptionId);
+      if (subscription?.kind !== "remote") {
+        throw new Error(`remote subscription not found: ${revision.subscriptionId}`);
+      }
+      await this.#apply(operationId, revisionId, revision.imported, subscription, (next) => {
+        stage = next;
+      });
+    } catch (error) {
+      if (!this.#shuttingDown) {
+        this.#options.state.failOperation(operationId, stage, operationFailureReason(stage, error));
+      }
+    }
+  }
+
+  async #apply(
+    operationId: string,
+    revisionId: number,
+    revision: ImportedVlessRevision,
+    subscription: SubscriptionIdentity,
+    setStage: (stage: OperationProcessingStage) => void,
+  ): Promise<void> {
+    setStage("applying");
+    this.#options.state.transitionOperation(operationId, "applying");
+    await this.#options.activateRevision(revision, subscription, () => {
+      if (!this.#shuttingDown) {
+        this.#options.state.advanceRevision(revisionId, "accepted");
+        setStage("checking");
+        this.#options.state.transitionOperation(operationId, "checking");
+      }
+    });
+    if (this.#shuttingDown) {
+      return;
+    }
+    this.#options.state.saveActiveRevision({
+      imported: revision,
+      revisionId,
+      source: subscription,
+    });
+    this.#options.state.advanceRevision(revisionId, "ready");
+    this.#options.state.transitionOperation(operationId, "succeeded");
+  }
+
+  #suspiciousReason(revision: ImportedVlessRevision, subscriptionId: string): string | undefined {
+    const nodeCount = revision.nodes.length;
+    if (nodeCount === 0) {
+      return "subscription revision contains zero nodes";
+    }
+    const minimumNodes = this.#options.minimumNodes ?? 1;
+    if (nodeCount < minimumNodes) {
+      return `subscription revision contains ${nodeCount} nodes, below the minimum of ${minimumNodes}`;
+    }
+    const active = this.#options.state.loadActiveRevision();
+    if (active?.source.id === subscriptionId && nodeCount < active.imported.nodes.length * 0.5) {
+      return "subscription revision shrank by more than 50%";
+    }
+    return undefined;
   }
 
   async #downloadWithRetries(locator: string): Promise<string> {
