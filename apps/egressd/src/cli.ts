@@ -2,6 +2,7 @@
 
 import { loadConfig } from "./config.js";
 import { startEgressd } from "./daemon.js";
+import { checkMihomoConfig } from "./mihomo-runtime.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
@@ -18,6 +19,7 @@ async function main(): Promise<void> {
               const node = mihomoConfig.proxies[0];
               return new Map(node ? [[node.name, config.mihomoListener as URL]] : []);
             },
+            check: checkMihomoConfig,
             removeListener: async () => {
               throw new Error("the configured external Mihomo listener cannot be removed");
             },
