@@ -5,6 +5,14 @@ import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription
 
 const MAXIMUM_SUBSCRIPTION_BYTES = 1024 * 1024;
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const MAXIMUM_FETCH_ATTEMPTS = 3;
+const MAXIMUM_RETRY_AFTER_MS = 60_000;
+const RETRY_BACKOFF_MS = 1_000;
+
+export interface RemoteOperationClock {
+  now(): number;
+  sleep(milliseconds: number, signal: AbortSignal): Promise<void>;
+}
 
 export interface RemoteOperationRunnerOptions {
   activateRevision(
@@ -14,6 +22,7 @@ export interface RemoteOperationRunnerOptions {
   ): Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   fetchTimeoutMs?: number;
+  clock?: RemoteOperationClock;
   state: ControlState;
 }
 
@@ -26,6 +35,7 @@ export function validateRemoteSubscriptionTimeout(fetchTimeoutMs: number | undef
 export class RemoteOperationRunner {
   readonly #controllers = new Set<AbortController>();
   readonly #options: RemoteOperationRunnerOptions;
+  readonly #shutdownController = new AbortController();
   #queue = Promise.resolve();
   #shuttingDown = false;
 
@@ -44,6 +54,7 @@ export class RemoteOperationRunner {
 
   close(): void {
     this.#shuttingDown = true;
+    this.#shutdownController.abort();
     for (const controller of this.#controllers) {
       controller.abort();
     }
@@ -61,7 +72,7 @@ export class RemoteOperationRunner {
       }
       stage = "fetching";
       this.#options.state.transitionOperation(operationId, stage);
-      const source = await this.#download(subscription.locator);
+      const source = await this.#downloadWithRetries(subscription.locator);
       if (this.#shuttingDown) {
         return;
       }
@@ -94,11 +105,30 @@ export class RemoteOperationRunner {
     }
   }
 
+  async #downloadWithRetries(locator: string): Promise<string> {
+    for (let attempt = 0; attempt < MAXIMUM_FETCH_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.#download(locator);
+      } catch (error) {
+        if (
+          this.#shuttingDown ||
+          !(error instanceof RetryableOperationError) ||
+          attempt === MAXIMUM_FETCH_ATTEMPTS - 1
+        ) {
+          throw error;
+        }
+        const delay = error.retryAfterMs ?? RETRY_BACKOFF_MS * 2 ** attempt;
+        await (this.#options.clock ?? systemClock).sleep(delay, this.#shutdownController.signal);
+      }
+    }
+    throw new Error("remote subscription retry limit is invalid");
+  }
+
   async #download(locator: string): Promise<string> {
     const controller = new AbortController();
     this.#controllers.add(controller);
     const timeout = setTimeout(
-      () => controller.abort(new SafeOperationError("remote subscription request timed out")),
+      () => controller.abort(new RetryableOperationError("remote subscription request timed out")),
       this.#options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
     );
     try {
@@ -106,9 +136,29 @@ export class RemoteOperationRunner {
         signal: controller.signal,
       });
       if (!response.ok) {
-        throw new SafeOperationError(`remote subscription returned HTTP ${response.status}`);
+        const reason = `remote subscription returned HTTP ${response.status}`;
+        if (isRetryableStatus(response.status)) {
+          throw new RetryableOperationError(
+            reason,
+            response.status === 429
+              ? retryAfterMilliseconds(
+                  response.headers.get("retry-after"),
+                  (this.#options.clock ?? systemClock).now(),
+                )
+              : undefined,
+          );
+        }
+        throw new SafeOperationError(reason);
       }
       return await readRemoteSubscription(response, controller);
+    } catch (error) {
+      if (error instanceof SafeOperationError) {
+        throw error;
+      }
+      if (controller.signal.reason instanceof SafeOperationError) {
+        throw controller.signal.reason;
+      }
+      throw new RetryableOperationError("remote subscription request failed");
     } finally {
       clearTimeout(timeout);
       this.#controllers.delete(controller);
@@ -117,6 +167,52 @@ export class RemoteOperationRunner {
 }
 
 class SafeOperationError extends Error {}
+
+class RetryableOperationError extends SafeOperationError {
+  constructor(
+    message: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+  }
+}
+
+const systemClock: RemoteOperationClock = {
+  now: () => Date.now(),
+  sleep: (milliseconds, signal) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      const timeout = setTimeout(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      }, milliseconds);
+      const abort = () => {
+        clearTimeout(timeout);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abort, { once: true });
+    }),
+};
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function retryAfterMilliseconds(value: string | null, now: number): number | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  const seconds = /^\d+$/.test(value.trim()) ? Number(value) : undefined;
+  const milliseconds =
+    seconds === undefined ? Date.parse(value) - now : Math.min(seconds * 1_000, Number.MAX_VALUE);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > MAXIMUM_RETRY_AFTER_MS) {
+    return undefined;
+  }
+  return milliseconds;
+}
 
 function operationFailureReason(stage: OperationProcessingStage, error: unknown): string {
   if (error instanceof SafeOperationError) {
