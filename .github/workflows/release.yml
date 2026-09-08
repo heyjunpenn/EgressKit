@@ -1,6 +1,7 @@
 name: Release artifacts
 
 on:
+  pull_request:
   workflow_dispatch:
   push:
     tags:
@@ -8,9 +9,15 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca
+
   host-artifacts:
     name: ${{ matrix.name }}
     strategy:
@@ -27,15 +34,18 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
       - run: pnpm --filter @egresskit/egressd build
+      - name: Stamp tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node release/set-package-version.mjs "$GITHUB_REF_NAME" apps/egressd/package.json
       - name: Assemble CLI and daemon archive
         shell: bash
         run: |
@@ -43,32 +53,104 @@ jobs:
           test -f apps/egressd/dist/cli.js
           pnpm --filter @egresskit/egressd pack --pack-destination release
           mv release/egresskit-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: egresskit-${{ matrix.name }}
           path: release/egresskit-${{ matrix.name }}.tgz
 
-  docker:
+  docker-validation:
+    name: docker-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            platform: linux/amd64
+          - name: arm64
+            platform: linux/arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        if: startsWith(github.ref, 'refs/tags/v')
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: egresskit:validation-${{ matrix.name }}
+      - name: Probe runtime and container boundary
+        shell: bash
+        run: |
+          image="egresskit:validation-${{ matrix.name }}"
+          docker run --rm --entrypoint mihomo "$image" -v | grep -F 'Mihomo Meta v1.19.30'
+          docker run --rm --entrypoint sh "$image" -c \
+            'test -r /usr/share/licenses/egresskit/LICENSE && test -r /usr/share/licenses/egresskit/THIRD_PARTY_NOTICES.md && test -r /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt'
+          container=$(docker run --detach --publish 127.0.0.1::8787 \
+            --env EGRESSKIT_ADMIN_TOKEN=validation-admin \
+            --env EGRESSKIT_PROXY_TOKEN=validation-proxy \
+            "$image")
+          trap 'docker rm --force "$container" >/dev/null' EXIT
+          port=$(docker port "$container" 8787/tcp | sed 's/.*://')
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent "http://127.0.0.1:${port}/live" | grep -F '"status":"live"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$container"
+          exit 1
+
+  docker-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: docker-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ghcr.io/heyjunpenn/egresskit
           tags: type=ref,event=tag
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
+          provenance: mode=max
+          sbom: true
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-artifacts, docker-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: egresskit-*
+          path: release-assets
+          merge-multiple: true
+      - name: Attach archives to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/*.tgz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/*.tgz --verify-tag --generate-notes
+          fi

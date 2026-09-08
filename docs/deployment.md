@@ -15,6 +15,10 @@ Windows 不在 v1 的正式支持范围。发布流水线会在四种受支持�
 `pnpm verify`、构建 `egresskit` CLI 与 `egressd` daemon，并分别保存构建归档。Docker
 manifest 同时包含 `linux/amd64` 与 `linux/arm64`。
 
+带版本的 GitHub Release 附件是 v1 CLI 和 daemon 归档的正式下载渠道；项目不从 npm registry
+发布。归档内部 package version 必须与 `v` 前缀 release tag 完全一致。容器镜像从同一 tag 发布到
+`ghcr.io/heyjunpenn/egresskit`，并附带构建 provenance 与 SBOM。
+
 ## State-directory security
 
 状态目录是敏感数据边界。SQLite 数据库按产品决策使用明文存储，不启用 SQLCipher、字段加密，
@@ -35,7 +39,11 @@ manifest 同时包含 `linux/amd64` 与 `linux/arm64`。
 ```sh
 docker run --rm \
   -v egresskit-state:/var/lib/egresskit \
+  -p 127.0.0.1:8787:8787 \
   -e EGRESSKIT_ADMIN_TOKEN='replace-me' \
-  -e EGRESSKIT_PROXY_TOKENS='replace-me' \
+  -e EGRESSKIT_PROXY_TOKEN='replace-me' \
   ghcr.io/heyjunpenn/egresskit:VERSION
 ```
+
+镜像内的 daemon 监听 `0.0.0.0:8787` 以穿过容器网络；上述端口映射只把服务暴露到宿主机
+loopback。若要对其他网络开放端口，必须保留代理认证，并由部署者额外配置防火墙和访问控制。

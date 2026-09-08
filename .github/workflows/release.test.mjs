@@ -7,6 +7,7 @@ const workflowUrl = new URL("./release.yml", import.meta.url);
 test("the release workflow builds both commands on every supported host architecture", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
 
+  assert.match(workflow, /pull_request:/);
   for (const runner of ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15-intel", "macos-15"]) {
     assert.match(workflow, new RegExp(`runner: ${runner}`));
   }
@@ -15,4 +16,11 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /dist\/cli\.js/);
   assert.match(workflow, /docker\/build-push-action/);
   assert.match(workflow, /linux\/amd64,linux\/arm64/);
+  assert.match(workflow, /gh release (create|upload)/);
+  assert.doesNotMatch(workflow, /uses: [^\n]+@v\d/);
+  assert.match(workflow, /packages: write/);
+  assert.match(workflow, /contents: write/);
+  assert.match(workflow, /actionlint/);
+  assert.match(workflow, /load: true/);
+  assert.match(workflow, /127\.0\.0\.1::8787/);
 });

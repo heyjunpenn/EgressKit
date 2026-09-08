@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -39,6 +41,7 @@ test("the packaged release contains both built entry points and legal files", as
   );
   const archive = stdout.trim().split("\n").at(-1);
   assert.ok(archive);
+  const installation = await mkdtemp(join(tmpdir(), "egresskit-package-install-"));
   try {
     const { stdout: listing } = await execFileAsync("tar", ["-tzf", archive], { cwd: root });
 
@@ -51,7 +54,29 @@ test("the packaged release contains both built entry points and legal files", as
     ]) {
       assert.match(listing, new RegExp(`^${path}$`, "m"));
     }
+
+    await execFileAsync("npm", ["install", "--ignore-scripts", "--no-package-lock", archive], {
+      cwd: installation,
+    });
+    const binDirectory = join(installation, "node_modules", ".bin");
+    await assert.rejects(
+      execFileAsync(join(binDirectory, "egresskit"), ["runtime", "install", "--destination"]),
+      (error) => error.code === 1 && error.stderr.includes("--destination requires a path"),
+    );
+    await assert.rejects(
+      execFileAsync(join(binDirectory, "egressd"), [], {
+        env: {
+          ...process.env,
+          EGRESSKIT_ADMIN_TOKEN: "package-test-admin",
+          EGRESSKIT_HOST: "0.0.0.0",
+          EGRESSKIT_PROXY_TOKEN: "",
+        },
+      }),
+      (error) =>
+        error.code === 1 && error.stderr.includes("EGRESSKIT_PROXY_TOKEN must not be empty"),
+    );
   } finally {
     await unlink(archive);
+    await rm(installation, { recursive: true, force: true });
   }
 });
