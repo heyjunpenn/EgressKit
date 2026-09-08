@@ -289,6 +289,24 @@ test("a second daemon cannot own the same state directory", async (t) => {
   );
 });
 
+test("an invalid remote timeout does not retain the state directory lock", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-daemon-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+
+  await assert.rejects(
+    startEgressd({
+      host: "127.0.0.1",
+      port: 0,
+      remoteSubscriptionTimeoutMs: 0,
+      stateDirectory,
+    }),
+    /remote subscription fetch timeout must be positive/,
+  );
+
+  const retried = await startEgressd({ host: "127.0.0.1", port: 0, stateDirectory });
+  await retried.close();
+});
+
 test("HTTP proxy requests require valid standard Basic proxy credentials", async (t) => {
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);

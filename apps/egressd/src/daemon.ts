@@ -15,6 +15,7 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
+import { RemoteOperationRunner, validateRemoteSubscriptionTimeout } from "./remote-operation.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
 import { openControlState, type PersistedNodeGeneration } from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
@@ -26,12 +27,15 @@ export interface MihomoRuntime {
 export interface EgressdOptions {
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: boolean;
+  checkMihomoListener?: (listener: URL) => Promise<void>;
+  fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   host: string;
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
   port: number;
   proxyAuthentication?: ProxyAuthentication;
+  remoteSubscriptionTimeoutMs?: number;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
   stateDirectory?: string;
 }
@@ -65,6 +69,7 @@ function closeServer(server: Server): Promise<void> {
 }
 
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
+  validateRemoteSubscriptionTimeout(options.remoteSubscriptionTimeoutMs);
   if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
     if (!options.allowUnsafeUnauthenticatedProxy) {
       throw new Error("refusing to disable proxy authentication on a non-loopback host");
@@ -93,22 +98,26 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const activateRevision = async (
     revision: ImportedVlessRevision,
     persistedNodes?: readonly PersistedNodeGeneration[],
+    logicalIdPrefix = "local",
+    checking?: () => void,
   ): Promise<void> => {
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
     }
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
+    checking?.();
     for (const node of revision.nodes) {
       const listener = listeners.get(node.name);
       if (!listener || !isLoopbackHttpUrl(listener)) {
         throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
       }
+      await (options.checkMihomoListener ?? checkListenerReady)(listener);
     }
     scheduler.replaceCandidates(
       revision.nodes.map((node) => {
         const id =
           persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
-          localLogicalNodeId(node.name);
+          `${logicalIdPrefix}:${node.name}`;
         return createSchedulerCandidate(
           id,
           listeners.get(node.name) as URL,
@@ -140,6 +149,20 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     });
     return revision;
   };
+
+  const remoteOperations = state
+    ? new RemoteOperationRunner({
+        activateRevision: (revision, subscription, checking) =>
+          activateRevision(revision, undefined, subscription.id, checking),
+        ...(options.fetchSubscription === undefined
+          ? {}
+          : { fetchSubscription: options.fetchSubscription }),
+        ...(options.remoteSubscriptionTimeoutMs === undefined
+          ? {}
+          : { fetchTimeoutMs: options.remoteSubscriptionTimeoutMs }),
+        state,
+      })
+    : undefined;
 
   const server = createServer((incoming, response) => {
     if (incoming.method === "GET" && incoming.url === "/live") {
@@ -176,6 +199,77 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           response.writeHead(status, { "content-type": "application/json" });
           response.end(JSON.stringify({ error: message }));
         });
+      return;
+    }
+
+    if (incoming.method === "POST" && incoming.url === "/subscriptions/remote") {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      readBody(incoming)
+        .then((body) => parseRemoteSubscriptionRequest(body))
+        .then((url) => state.createRemoteSubscription(url))
+        .then((created) => {
+          writeJson(response, 202, { ...created, status: "queued" });
+          remoteOperations?.enqueue(created.operationId, created.subscriptionId);
+        })
+        .catch((error: unknown) => {
+          writeJson(response, 422, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      return;
+    }
+
+    const operationMatch = incoming.url?.match(/^\/operations\/([^/]+)$/);
+    if (incoming.method === "GET" && operationMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      const operation = state?.getOperation(operationMatch[1] as string);
+      if (!operation) {
+        writeJson(response, 404, { error: "operation not found" });
+        return;
+      }
+      writeJson(response, 200, {
+        ...(operation.failure ? { failure: operation.failure } : {}),
+        history: operation.history,
+        operationId: operation.id,
+        status: operation.status,
+        subscriptionId: operation.subscriptionId,
+      });
+      return;
+    }
+
+    const refreshMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)\/refresh$/);
+    if (incoming.method === "POST" && refreshMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      try {
+        const operation = state.createRefreshOperation(refreshMatch[1] as string);
+        writeJson(response, 202, {
+          operationId: operation.id,
+          status: operation.status,
+          subscriptionId: operation.subscriptionId,
+        });
+        remoteOperations?.enqueue(operation.id, operation.subscriptionId);
+      } catch (error) {
+        writeJson(response, 404, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
 
@@ -282,6 +376,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
+      remoteOperations?.close();
       try {
         await closeServer(server);
       } finally {
@@ -290,10 +385,6 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     },
     importLocalSubscription,
   };
-}
-
-function localLogicalNodeId(normalizedNodeName: string): string {
-  return `local:${normalizedNodeName}`;
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {
@@ -311,6 +402,55 @@ function readBody(incoming: IncomingMessage): Promise<string> {
     });
     incoming.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     incoming.on("error", reject);
+  });
+}
+
+function parseRemoteSubscriptionRequest(body: string): string {
+  const document = JSON.parse(body) as { url?: unknown };
+  if (typeof document.url !== "string") {
+    throw new Error("remote subscription URL is required");
+  }
+  const url = new URL(document.url);
+  if (url.protocol !== "https:") {
+    throw new Error("remote subscription URL must use HTTPS");
+  }
+  return document.url;
+}
+
+function isAuthorizedAdmin(incoming: IncomingMessage, adminToken: string | undefined): boolean {
+  return Boolean(adminToken && incoming.headers.authorization === `Bearer ${adminToken}`);
+}
+
+function rejectAdminAuthentication(response: import("node:http").ServerResponse): void {
+  response.writeHead(401, { "www-authenticate": "Bearer" });
+  response.end();
+}
+
+function writeJson(
+  response: import("node:http").ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+): void {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+function checkListenerReady(listener: URL): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(Number(listener.port || 80), listener.hostname);
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Mihomo listener readiness timed out"));
+    }, 1_000);
+    socket.once("connect", () => {
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
   });
 }
 
