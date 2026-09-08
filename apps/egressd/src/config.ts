@@ -11,6 +11,8 @@ export interface EgressdConfig {
   port: number;
   mihomoListener?: URL;
   minimumSubscriptionNodes?: number;
+  preconnectAttempts?: number;
+  preconnectTimeoutMs?: number;
   proxyAuthentication: ProxyAuthentication;
   sessionAbsoluteTtlMs?: number;
   sessionIdleTimeoutMs?: number;
@@ -26,6 +28,21 @@ function parsePositiveInteger(name: string, value: string | undefined): number |
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseBoundedPositiveInteger(
+  name: string,
+  value: string | undefined,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`${name} must be between 1 and ${maximum}`);
   }
   return parsed;
 }
@@ -79,6 +96,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     "EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES",
     environment.EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES,
   );
+  const preconnectAttempts = parseBoundedPositiveInteger(
+    "EGRESSKIT_PRECONNECT_ATTEMPTS",
+    environment.EGRESSKIT_PRECONNECT_ATTEMPTS,
+    10,
+  );
+  const preconnectTimeoutMs = parseBoundedPositiveInteger(
+    "EGRESSKIT_PRECONNECT_TIMEOUT_MS",
+    environment.EGRESSKIT_PRECONNECT_TIMEOUT_MS,
+    60_000,
+  );
   const sessionAbsoluteTtlMs = parsePositiveInteger(
     "EGRESSKIT_SESSION_ABSOLUTE_TTL_MS",
     environment.EGRESSKIT_SESSION_ABSOLUTE_TTL_MS,
@@ -104,6 +131,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     host,
     ...(minimumSubscriptionNodes === undefined ? {} : { minimumSubscriptionNodes }),
     port: parsePort(environment.EGRESSKIT_PORT),
+    ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
+    ...(preconnectTimeoutMs === undefined ? {} : { preconnectTimeoutMs }),
     stateDirectory,
     ...(mihomoListener === undefined ? {} : { mihomoListener }),
     proxyAuthentication:

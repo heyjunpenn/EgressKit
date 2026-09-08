@@ -4,8 +4,9 @@ import {
   type IncomingMessage,
   request,
   type Server,
+  type ServerResponse,
 } from "node:http";
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
@@ -59,6 +60,8 @@ export interface EgressdOptions {
   mihomoRuntime?: MihomoRuntime;
   minimumSubscriptionNodes?: number;
   port: number;
+  preconnectAttempts?: number;
+  preconnectTimeoutMs?: number;
   proxyAuthentication?: ProxyAuthentication;
   remoteSubscriptionTimeoutMs?: number;
   remoteOperationClock?: RemoteOperationClock;
@@ -103,6 +106,8 @@ function closeServer(server: Server): Promise<void> {
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
   validateRemoteSubscriptionTimeout(options.remoteSubscriptionTimeoutMs);
   validateMinimumSubscriptionNodes(options.minimumSubscriptionNodes);
+  validatePreconnectAttempts(options.preconnectAttempts);
+  validatePreconnectTimeout(options.preconnectTimeoutMs);
   if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
     if (!options.allowUnsafeUnauthenticatedProxy) {
       throw new Error("refusing to disable proxy authentication on a non-loopback host");
@@ -156,12 +161,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     throw error;
   }
 
-  const acquireRoute = (route: ProxyRoute) => {
+  const acquireRoute = (route: ProxyRoute, excludedIds: ReadonlySet<string> = new Set()) => {
     if (route.mode === "rotate") {
-      return scheduler.acquire();
+      return scheduler.acquire(excludedIds);
     }
     if (route.mode === "sticky") {
-      return softStickySessions.acquire(route.sessionKey);
+      return softStickySessions.acquire(route.sessionKey, excludedIds);
     }
     if (route.mode === "strict") {
       return softStickySessions.acquireStrict(route.sessionKey);
@@ -170,6 +175,47 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return scheduler.acquireBySelector(route.selector);
     }
     return "not-implemented" as const;
+  };
+
+  const acquirePreconnectedRoute = async (
+    route: ProxyRoute,
+    signal: AbortSignal,
+    confirmConnection?: (socket: Socket) => Promise<void>,
+  ): Promise<{ lease: SchedulerLease; socket: Socket } | "not-implemented" | undefined> => {
+    const attemptedIds = new Set<string>();
+    const maximumAttempts = isFallbackRoute(route) ? (options.preconnectAttempts ?? 3) : 1;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      const lease = acquireRoute(route, attemptedIds);
+      if (lease === "not-implemented" || lease === undefined) {
+        return lease;
+      }
+      attemptedIds.add(lease.candidate.id);
+      const startedAt = Date.now();
+      try {
+        const socket = await connectMihomoListener(
+          lease.candidate.listener,
+          options.preconnectTimeoutMs ?? 10_000,
+          signal,
+        );
+        try {
+          await confirmConnection?.(socket);
+        } catch (error) {
+          socket.destroy();
+          throw error;
+        }
+        lease.reportConnectionSuccess(Date.now() - startedAt);
+        return { lease, socket };
+      } catch (error) {
+        if (!(error instanceof ClientCancelledError)) {
+          lease.reportConnectionFailure();
+        }
+        lease.release();
+        if (error instanceof ClientCancelledError) {
+          throw error;
+        }
+      }
+    }
+    return undefined;
   };
 
   const activateRevisionUnlocked = async (
@@ -489,56 +535,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       response.end();
       return;
     }
-    let lease: SchedulerLease | "not-implemented" | undefined;
-    try {
-      lease = acquireRoute(route);
-    } catch (error) {
-      if (error instanceof SessionCapacityError) {
-        response.writeHead(429);
-        response.end();
-        return;
-      }
-      response.writeHead(503);
-      response.end();
-      return;
-    }
-    if (lease === "not-implemented") {
-      response.writeHead(501);
-      response.end();
-      return;
-    }
-    if (!lease) {
-      response.writeHead(502);
-      response.end();
-      return;
-    }
-
-    const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
-    const upstream = request(
-      lease.candidate.listener,
-      {
-        headers: {
-          ...forwardedHeaders,
-          via: appendVia(incoming.headers.via, "1.1 egresskit"),
-        },
-        method: incoming.method,
-        path: incoming.url,
-      },
-      (upstreamResponse) => {
-        upstreamResponse.once("close", lease.release);
-        response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-        upstreamResponse.pipe(response);
-      },
-    );
-    upstream.on("error", () => {
-      lease.release();
-      if (!response.headersSent) {
-        response.writeHead(502);
-      }
-      response.end();
-    });
-    response.once("close", lease.release);
-    incoming.pipe(upstream);
+    void forwardHttpProxyRequest(incoming, response, route, acquirePreconnectedRoute);
   });
   server.on("connect", (incoming, clientSocket, head) => {
     const route = authorizeProxyRequest(
@@ -549,27 +546,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       rejectConnectProxyAuthentication(clientSocket);
       return;
     }
-    let lease: SchedulerLease | "not-implemented" | undefined;
-    try {
-      lease = acquireRoute(route);
-    } catch (error) {
-      if (error instanceof SessionCapacityError) {
-        clientSocket.end("HTTP/1.1 429 Too Many Requests\r\n\r\n");
-        return;
-      }
-      clientSocket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
-      return;
-    }
-    if (lease === "not-implemented") {
-      clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
-      return;
-    }
-    if (!lease) {
-      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      return;
-    }
-    clientSocket.once("close", lease.release);
-    handleConnect(incoming, clientSocket, head, lease.candidate.listener);
+    void forwardConnectRequest(
+      incoming,
+      clientSocket,
+      head,
+      route,
+      acquirePreconnectedRoute,
+      options.preconnectTimeoutMs ?? 10_000,
+    );
   });
 
   try {
@@ -730,70 +714,265 @@ function checkListenerReady(listener: URL): Promise<void> {
   });
 }
 
-function handleConnect(
+type PreconnectedRoute = { lease: SchedulerLease; socket: Socket };
+type PreconnectedRouteAcquirer = (
+  route: ProxyRoute,
+  signal: AbortSignal,
+  confirmConnection?: (socket: Socket) => Promise<void>,
+) => Promise<PreconnectedRoute | "not-implemented" | undefined>;
+
+async function forwardHttpProxyRequest(
   incoming: IncomingMessage,
-  clientSocket: Duplex,
-  head: Buffer,
-  mihomoListener: URL | undefined,
-): void {
-  if (!mihomoListener || !incoming.url) {
-    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+  response: ServerResponse,
+  route: ProxyRoute,
+  acquirePreconnectedRoute: PreconnectedRouteAcquirer,
+): Promise<void> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new ClientCancelledError());
+  incoming.once("aborted", cancel);
+  response.once("close", cancel);
+  let connected: PreconnectedRoute | "not-implemented" | undefined;
+  try {
+    connected = await acquirePreconnectedRoute(route, controller.signal);
+  } catch (error) {
+    incoming.off("aborted", cancel);
+    response.off("close", cancel);
+    if (error instanceof ClientCancelledError) {
+      return;
+    }
+    response.writeHead(error instanceof SessionCapacityError ? 429 : 503);
+    response.end();
+    return;
+  }
+  incoming.off("aborted", cancel);
+  response.off("close", cancel);
+  if (connected === "not-implemented") {
+    response.writeHead(501);
+    response.end();
+    return;
+  }
+  if (!connected) {
+    response.writeHead(502);
+    response.end();
     return;
   }
 
-  const listenerPort = Number(mihomoListener.port || 80);
-  const listenerSocket = connect(listenerPort, mihomoListener.hostname);
-  let tunnelEstablished = false;
-  listenerSocket.on("connect", () => {
-    listenerSocket.write(
-      `CONNECT ${incoming.url} HTTP/1.1\r\nHost: ${incoming.url}\r\nVia: 1.1 egresskit\r\n\r\n`,
+  const { lease, socket } = connected;
+  const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
+  const upstream = request(
+    {
+      agent: false,
+      createConnection: () => socket,
+      headers: {
+        ...forwardedHeaders,
+        via: appendVia(incoming.headers.via, "1.1 egresskit"),
+      },
+      host: lease.candidate.listener.hostname,
+      method: incoming.method,
+      path: incoming.url,
+      port: Number(lease.candidate.listener.port || 80),
+    },
+    (upstreamResponse) => {
+      upstreamResponse.once("close", lease.release);
+      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    },
+  );
+  upstream.on("error", () => {
+    lease.release();
+    if (!response.headersSent) {
+      response.writeHead(502);
+    }
+    response.end();
+  });
+  response.once("close", lease.release);
+  incoming.pipe(upstream);
+}
+
+async function forwardConnectRequest(
+  incoming: IncomingMessage,
+  clientSocket: Duplex,
+  head: Buffer,
+  route: ProxyRoute,
+  acquirePreconnectedRoute: PreconnectedRouteAcquirer,
+  preconnectTimeoutMs: number,
+): Promise<void> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new ClientCancelledError());
+  clientSocket.once("close", cancel);
+  let connected: PreconnectedRoute | "not-implemented" | undefined;
+  let handshake: ConnectHandshake | undefined;
+  try {
+    connected = await acquirePreconnectedRoute(route, controller.signal, async (socket) => {
+      handshake = await performConnectHandshake(
+        socket,
+        incoming.url ?? "",
+        preconnectTimeoutMs,
+        controller.signal,
+      );
+    });
+  } catch (error) {
+    clientSocket.off("close", cancel);
+    if (error instanceof ClientCancelledError) {
+      return;
+    }
+    clientSocket.end(
+      error instanceof SessionCapacityError
+        ? "HTTP/1.1 429 Too Many Requests\r\n\r\n"
+        : "HTTP/1.1 503 Service Unavailable\r\n\r\n",
     );
-  });
+    return;
+  }
+  clientSocket.off("close", cancel);
+  if (connected === "not-implemented") {
+    clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
+    return;
+  }
+  if (!connected) {
+    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    return;
+  }
+  if (!handshake) {
+    connected.socket.destroy();
+    connected.lease.release();
+    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    return;
+  }
+  clientSocket.once("close", connected.lease.release);
+  clientSocket.write(handshake.header);
+  if (head.length > 0) {
+    connected.socket.write(head);
+  }
+  if (handshake.remaining.length > 0) {
+    clientSocket.write(handshake.remaining);
+  }
+  clientSocket.pipe(connected.socket);
+  connected.socket.pipe(clientSocket);
+  clientSocket.on("error", () => connected.socket.destroy());
+  clientSocket.once("close", () => connected.socket.destroy());
+  connected.socket.once("close", () => clientSocket.destroy());
+}
 
-  let responseHead = Buffer.alloc(0);
-  const receiveResponseHead = (chunk: Buffer): void => {
-    responseHead = Buffer.concat([responseHead, chunk]);
-    const end = responseHead.indexOf("\r\n\r\n");
-    if (end === -1) {
-      if (responseHead.length > 64 * 1024) {
-        listenerSocket.destroy(new Error("Mihomo CONNECT response headers are too large"));
-      }
-      return;
-    }
+class ClientCancelledError extends Error {}
 
-    listenerSocket.off("data", receiveResponseHead);
-    const header = responseHead.subarray(0, end + 4);
-    const remaining = responseHead.subarray(end + 4);
-    clientSocket.write(header);
-    if (!header.toString("latin1").startsWith("HTTP/1.1 200")) {
-      clientSocket.end(remaining);
-      listenerSocket.end();
-      return;
-    }
-
-    tunnelEstablished = true;
-    if (head.length > 0) {
-      listenerSocket.write(head);
-    }
-    if (remaining.length > 0) {
-      clientSocket.write(remaining);
-    }
-    clientSocket.pipe(listenerSocket);
-    listenerSocket.pipe(clientSocket);
-  };
-  listenerSocket.on("data", receiveResponseHead);
-  listenerSocket.on("error", () => {
-    if (!clientSocket.destroyed) {
-      if (tunnelEstablished) {
-        clientSocket.destroy();
+function connectMihomoListener(
+  listener: URL,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(Number(listener.port || 80), listener.hostname);
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      finish(new Error("Mihomo listener connection timed out"));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+    };
+    const finish = (error?: Error) => {
+      cleanup();
+      if (error) {
+        reject(error);
       } else {
-        clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        resolve(socket);
       }
+    };
+    const onAbort = () => {
+      socket.destroy();
+      finish(new ClientCancelledError());
+    };
+    const onConnect = () => finish();
+    const onError = (error: Error) => finish(error);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    if (signal.aborted) {
+      onAbort();
     }
   });
-  clientSocket.on("error", () => listenerSocket.destroy());
-  clientSocket.once("close", () => listenerSocket.destroy());
-  listenerSocket.once("close", () => clientSocket.destroy());
+}
+
+interface ConnectHandshake {
+  header: Buffer;
+  remaining: Buffer;
+}
+
+function performConnectHandshake(
+  listenerSocket: Socket,
+  authority: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<ConnectHandshake> {
+  return new Promise((resolve, reject) => {
+    let responseHead = Buffer.alloc(0);
+    const timeout = setTimeout(
+      () => finish(new Error("Mihomo CONNECT response timed out")),
+      timeoutMs,
+    );
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      listenerSocket.off("data", onData);
+      listenerSocket.off("error", onError);
+      listenerSocket.off("close", onClose);
+    };
+    const finish = (error: Error | undefined, result?: ConnectHandshake) => {
+      cleanup();
+      if (error) {
+        reject(error);
+      } else if (result) {
+        resolve(result);
+      }
+    };
+    const onAbort = () => finish(new ClientCancelledError());
+    const onError = (error: Error) => finish(error);
+    const onClose = () => finish(new Error("Mihomo closed before CONNECT was established"));
+    const onData = (chunk: Buffer) => {
+      responseHead = Buffer.concat([responseHead, chunk]);
+      const end = responseHead.indexOf("\r\n\r\n");
+      if (end === -1) {
+        if (responseHead.length > 64 * 1024) {
+          finish(new Error("Mihomo CONNECT response headers are too large"));
+        }
+        return;
+      }
+      const header = responseHead.subarray(0, end + 4);
+      if (!header.toString("latin1").startsWith("HTTP/1.1 200")) {
+        finish(new Error("Mihomo rejected CONNECT before tunnel establishment"));
+        return;
+      }
+      finish(undefined, { header, remaining: responseHead.subarray(end + 4) });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    listenerSocket.on("data", onData);
+    listenerSocket.once("error", onError);
+    listenerSocket.once("close", onClose);
+    listenerSocket.write(
+      `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nVia: 1.1 egresskit\r\n\r\n`,
+    );
+    if (signal.aborted) {
+      onAbort();
+    }
+  });
+}
+
+function isFallbackRoute(route: ProxyRoute): boolean {
+  return route.mode === "rotate" || route.mode === "sticky";
+}
+
+function validatePreconnectAttempts(value: number | undefined): void {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 10)) {
+    throw new Error("pre-connect attempts must be an integer between 1 and 10");
+  }
+}
+
+function validatePreconnectTimeout(value: number | undefined): void {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 60_000)) {
+    throw new Error("pre-connect timeout must be an integer between 1 and 60000 milliseconds");
+  }
 }
 
 function isAbsoluteHttpUrl(value: string | undefined): value is string {

@@ -103,3 +103,22 @@ test("explicit selectors are unique, exact, and never fall back", () => {
     /duplicate scheduler selector/,
   );
 });
+
+test("pre-connect retries exclude attempted nodes and record connection outcomes", () => {
+  const scheduler = new RotateScheduler([candidate("first"), candidate("second")]);
+
+  const first = scheduler.acquire();
+  assert.equal(first?.candidate.id, "first");
+  first?.reportConnectionFailure();
+  first?.release();
+
+  const fallback = scheduler.acquire(new Set(["first"]));
+  assert.equal(fallback?.candidate.id, "second");
+  fallback?.reportConnectionSuccess(12);
+  fallback?.release();
+
+  assert.equal(scheduler.acquire(new Set(["first", "second"])), undefined);
+  const snapshot = scheduler.snapshot();
+  assert.equal(snapshot.find(({ id }) => id === "first")?.consecutiveFailures, 1);
+  assert.equal(snapshot.find(({ id }) => id === "second")?.consecutiveFailures, 0);
+});

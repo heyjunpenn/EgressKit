@@ -3,7 +3,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import type { SchedulerLease } from "./scheduler.js";
 
 export interface SessionScheduler {
-  acquire(): SchedulerLease | undefined;
+  acquire(excludedIds?: ReadonlySet<string>): SchedulerLease | undefined;
   acquireById(id: string): SchedulerLease | undefined;
 }
 
@@ -82,15 +82,22 @@ export class SoftStickySessions {
     this.#hmacKey = this.#store.loadOrCreateSessionHmacKey();
   }
 
-  acquire(sessionKey: string): SchedulerLease | undefined {
-    return this.#acquire(sessionKey, true);
+  acquire(
+    sessionKey: string,
+    excludedIds: ReadonlySet<string> = new Set(),
+  ): SchedulerLease | undefined {
+    return this.#acquire(sessionKey, true, excludedIds);
   }
 
   acquireStrict(sessionKey: string): SchedulerLease | undefined {
-    return this.#acquire(sessionKey, false);
+    return this.#acquire(sessionKey, false, new Set());
   }
 
-  #acquire(sessionKey: string, rebindUnavailable: boolean): SchedulerLease | undefined {
+  #acquire(
+    sessionKey: string,
+    rebindUnavailable: boolean,
+    excludedIds: ReadonlySet<string>,
+  ): SchedulerLease | undefined {
     const identity = createHmac("sha256", this.#hmacKey).update(sessionKey).digest("hex");
     const now = this.#clock.now();
     this.#store.deleteExpiredSessionBindings(now, this.#absoluteTtlMs, this.#idleTimeoutMs, [
@@ -103,7 +110,10 @@ export class SoftStickySessions {
     }
 
     let binding = this.#store.getSessionBinding(identity);
-    let lease = binding ? this.#scheduler.acquireById(binding.logicalNodeId) : undefined;
+    let lease =
+      binding && !excludedIds.has(binding.logicalNodeId)
+        ? this.#scheduler.acquireById(binding.logicalNodeId)
+        : undefined;
     if (binding && !lease && !rebindUnavailable) {
       this.#store.touchSessionBinding(identity, now);
       return undefined;
@@ -116,7 +126,7 @@ export class SoftStickySessions {
       ) {
         throw new SessionCapacityError("active session limit reached");
       }
-      lease = this.#scheduler.acquire();
+      lease = this.#scheduler.acquire(excludedIds);
       if (!lease) {
         return undefined;
       }
@@ -144,6 +154,8 @@ export class SoftStickySessions {
     let released = false;
     return {
       candidate: lease.candidate,
+      reportConnectionFailure: lease.reportConnectionFailure,
+      reportConnectionSuccess: lease.reportConnectionSuccess,
       release: () => {
         if (released) {
           return;

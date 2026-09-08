@@ -4,7 +4,7 @@ import { createHmac } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { request } from "node:http";
-import { connect } from "node:net";
+import { connect, createServer as createTcpServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
@@ -509,6 +509,264 @@ test("sent GET, HEAD, and POST requests are not replayed to another listener", {
     `HEAD http://${target.host}:${target.port}/failed`,
     `POST http://${target.host}:${target.port}/failed`,
   ]);
+});
+
+test("soft sticky retries a different listener before sending HTTP and keeps the successful binding", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-http-failover-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const unavailable = await startSimulatedMihomoListener();
+  await unavailable.close();
+  const secondRequests: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, [], secondRequests, "second");
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    checkMihomoListener: async () => undefined,
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    stateDirectory,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first", "second"]), 201);
+  const headers = {
+    "proxy-authorization": basicProxyAuthorization("sticky.preconnect", "proxy-secret"),
+  };
+  const targetUrl = `http://${target.host}:${target.port}/preconnect`;
+
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "POST", "once", headers), 200);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", "", headers), 200);
+  assert.deepEqual(secondRequests, [`POST ${targetUrl}`, `GET ${targetUrl}`]);
+  assert.deepEqual(
+    observedRequests.map(({ body }) => body),
+    ["once", ""],
+  );
+});
+
+test("rotate retries a different listener before CONNECT 200", { timeout: 2_000 }, async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  const faults = new ConnectionFaultPlan();
+  faults.failNext("before-target-connect");
+  const unavailable = await startSimulatedMihomoListener(faults);
+  t.after(() => unavailable.close());
+  const secondSelections: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, secondSelections);
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    checkMihomoListener: async () => undefined,
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first", "second"]), 201);
+  const authority = `${target.host}:${target.port}`;
+
+  assert.match(
+    await sendConnectRequest(daemon.address, authority),
+    /^HTTP\/1\.1 200 Connection Established/,
+  );
+  assert.deepEqual(secondSelections, [authority]);
+});
+
+test("CONNECT failover uses three attempts by default and honors a bounded override", async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  const faultPlans = Array.from({ length: 3 }, () => {
+    const plan = new ConnectionFaultPlan();
+    plan.failNext("before-target-connect");
+    plan.failNext("before-target-connect");
+    return plan;
+  });
+  const failedListeners = await Promise.all(
+    faultPlans.map((plan) => startSimulatedMihomoListener(plan)),
+  );
+  for (const listener of failedListeners) {
+    t.after(() => listener.close());
+  }
+  const fourthSelections: string[] = [];
+  const fourth = await startSimulatedMihomoListener(undefined, fourthSelections);
+  t.after(() => fourth.close());
+  const listeners = new Map([
+    ["one", new URL(`http://${failedListeners[0]?.host}:${failedListeners[0]?.port}`)],
+    ["two", new URL(`http://${failedListeners[1]?.host}:${failedListeners[1]?.port}`)],
+    ["three", new URL(`http://${failedListeners[2]?.host}:${failedListeners[2]?.port}`)],
+    ["four", new URL(`http://${fourth.host}:${fourth.port}`)],
+  ]);
+  const startDaemon = (preconnectAttempts?: number) =>
+    startEgressd({
+      adminToken: "test-admin-token",
+      host: "127.0.0.1",
+      port: 0,
+      ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
+      proxyAuthentication: false,
+      mihomoRuntime: { apply: async () => listeners },
+    });
+  const source = `proxies:
+  - { name: one, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+  - { name: two, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+  - { name: three, type: vless, server: three.example.com, port: 443, uuid: 33333333-3333-4333-8333-333333333333 }
+  - { name: four, type: vless, server: four.example.com, port: 443, uuid: 44444444-4444-4444-8444-444444444444 }
+`;
+  const authority = `${target.host}:${target.port}`;
+
+  const defaultDaemon = await startDaemon();
+  assert.equal((await defaultDaemon.importLocalSubscription(source)).nodes.length, 4);
+  assert.match(await sendConnectRequest(defaultDaemon.address, authority), /^HTTP\/1\.1 502/);
+  assert.deepEqual(fourthSelections, []);
+  await defaultDaemon.close();
+
+  const configuredDaemon = await startDaemon(4);
+  t.after(() => configuredDaemon.close());
+  assert.equal((await configuredDaemon.importLocalSubscription(source)).nodes.length, 4);
+  assert.match(
+    await sendConnectRequest(configuredDaemon.address, authority),
+    /^HTTP\/1\.1 200 Connection Established/,
+  );
+  assert.deepEqual(fourthSelections, [authority]);
+
+  await assert.rejects(startDaemon(11), /between 1 and 10/);
+});
+
+test("strict sticky and explicit node routes never use another candidate", async (t) => {
+  const faults = new ConnectionFaultPlan();
+  faults.failNext("before-target-connect");
+  faults.failNext("before-target-connect");
+  const first = await startSimulatedMihomoListener(faults);
+  t.after(() => first.close());
+  const secondSelections: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, secondSelections);
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first", "second"]), 201);
+
+  assert.match(
+    await sendConnectRequest(
+      daemon.address,
+      "strict.example:443",
+      basicProxyAuthorization("strict.no-fallback", "proxy-secret"),
+    ),
+    /^HTTP\/1\.1 502/,
+  );
+  assert.match(
+    await sendConnectRequest(
+      daemon.address,
+      "node.example:443",
+      basicProxyAuthorization("node.local%3Afirst", "proxy-secret"),
+    ),
+    /^HTTP\/1\.1 502/,
+  );
+  assert.deepEqual(secondSelections, []);
+});
+
+test("CONNECT timeout retries, while client cancellation stops without trying another node", async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  let timeoutConnections = 0;
+  const timeoutListener = await startHangingTcpListener(() => {
+    timeoutConnections += 1;
+  });
+  t.after(() => timeoutListener.close());
+  const timeoutFallbackSelections: string[] = [];
+  const timeoutFallback = await startSimulatedMihomoListener(undefined, timeoutFallbackSelections);
+  t.after(() => timeoutFallback.close());
+  const timeoutDaemon = await startEgressd({
+    adminToken: "test-admin-token",
+    checkMihomoListener: async () => undefined,
+    host: "127.0.0.1",
+    port: 0,
+    preconnectTimeoutMs: 20,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${timeoutListener.host}:${timeoutListener.port}`)],
+          ["second", new URL(`http://${timeoutFallback.host}:${timeoutFallback.port}`)],
+        ]),
+    },
+  });
+  t.after(() => timeoutDaemon.close());
+  assert.equal(await importLocalNodes(timeoutDaemon.address, ["first", "second"]), 201);
+  assert.match(
+    await sendConnectRequest(timeoutDaemon.address, `${target.host}:${target.port}`),
+    /^HTTP\/1\.1 200 Connection Established/,
+  );
+  assert.equal(timeoutConnections, 1);
+  assert.deepEqual(timeoutFallbackSelections, [`${target.host}:${target.port}`]);
+  await timeoutDaemon.close();
+
+  let cancelledConnections = 0;
+  const cancelledListener = await startHangingTcpListener(() => {
+    cancelledConnections += 1;
+  });
+  t.after(() => cancelledListener.close());
+  const cancellationFallbackSelections: string[] = [];
+  const cancellationFallback = await startSimulatedMihomoListener(
+    undefined,
+    cancellationFallbackSelections,
+  );
+  t.after(() => cancellationFallback.close());
+  const cancellationDaemon = await startEgressd({
+    adminToken: "test-admin-token",
+    checkMihomoListener: async () => undefined,
+    host: "127.0.0.1",
+    port: 0,
+    preconnectTimeoutMs: 100,
+    proxyAuthentication: false,
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${cancelledListener.host}:${cancelledListener.port}`)],
+          ["second", new URL(`http://${cancellationFallback.host}:${cancellationFallback.port}`)],
+        ]),
+    },
+  });
+  t.after(() => cancellationDaemon.close());
+  assert.equal(await importLocalNodes(cancellationDaemon.address, ["first", "second"]), 201);
+
+  const cancelled = connect(cancellationDaemon.address.port, cancellationDaemon.address.host);
+  await once(cancelled, "connect");
+  cancelled.write("CONNECT cancel.example:443 HTTP/1.1\r\nHost: cancel.example:443\r\n\r\n");
+  while (cancelledConnections < 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  cancelled.destroy();
+  await once(cancelled, "close");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(cancelledConnections, 1);
+  assert.deepEqual(cancellationFallbackSelections, []);
 });
 
 test("an upstream failure after CONNECT 200 only closes the tunnel", {
@@ -1166,6 +1424,41 @@ function sendConnectRequest(
     });
     socket.on("error", reject);
   });
+}
+
+async function startHangingTcpListener(onConnection: () => void): Promise<{
+  close(): Promise<void>;
+  host: string;
+  port: number;
+}> {
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    onConnection();
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("hanging listener did not bind a TCP address");
+  }
+  return {
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+    host: "127.0.0.1",
+    port: address.port,
+  };
 }
 
 function openConnectTunnel(
