@@ -14,6 +14,7 @@ import { redactSubscriptionUrl } from "./control-cli.js";
 import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
 import { MihomoCrashRecovery, type MihomoRecoveryClock } from "./mihomo-recovery.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
+import { EgressdMetrics, subscriptionLogOrigin } from "./observability.js";
 import {
   authorizeProxyRequest,
   type ProxyAuthentication,
@@ -111,12 +112,25 @@ export interface ConnectionOutcome {
   result: "failure" | "success";
 }
 
-export interface EgressdLogEvent {
-  event: "egressd.proxy_auth.disabled";
-  exposure: "non-loopback";
-  host: string;
-  level: "warn";
-}
+export type EgressdLogEvent =
+  | {
+      event: "egressd.proxy_auth.disabled";
+      exposure: "non-loopback";
+      host: string;
+      level: "warn";
+    }
+  | {
+      event: "egressd.connection";
+      latencyMs?: number;
+      level: "info" | "warn";
+      result: "failure" | "success";
+    }
+  | { attempt: number; event: "egressd.fallback"; level: "info" }
+  | {
+      event: "egressd.subscription.remote.created";
+      level: "info";
+      subscriptionOrigin: string;
+    };
 
 export interface RunningEgressd {
   address: {
@@ -205,6 +219,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   validateMinimumSubscriptionNodes(options.minimumSubscriptionNodes);
   validatePreconnectAttempts(options.preconnectAttempts);
   validatePreconnectTimeout(options.preconnectTimeoutMs);
+  const metrics = new EgressdMetrics();
+  const emitLog = (event: EgressdLogEvent) => {
+    try {
+      (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
+    } catch {
+      // Observability hooks must not affect daemon behavior.
+    }
+  };
   if (
     options.adminToken &&
     options.proxyAuthentication &&
@@ -229,7 +251,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       host: options.host,
       level: "warn",
     };
-    (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
+    emitLog(event);
   }
   const proxyTokenRegistry =
     options.proxyAuthentication === false
@@ -380,6 +402,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     const attemptedIds = new Set<string>();
     const maximumAttempts = isFallbackRoute(route) ? (options.preconnectAttempts ?? 3) : 1;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      if (attempt > 0) {
+        metrics.recordFallback();
+        emitLog({ attempt: attempt + 1, event: "egressd.fallback", level: "info" });
+      }
       const lease = acquireRoute(route, attemptedIds);
       if (lease === "not-implemented" || lease === undefined) {
         return lease;
@@ -390,6 +416,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         } else {
           healthController?.recordConnectionSuccess(outcome.nodeId);
         }
+        metrics.recordConnection(outcome);
+        emitLog({
+          event: "egressd.connection",
+          ...(outcome.latencyMs === undefined ? {} : { latencyMs: outcome.latencyMs }),
+          level: outcome.result === "success" ? "info" : "warn",
+          result: outcome.result,
+        });
         options.onConnectionOutcome?.(outcome);
       });
       attemptedIds.add(observedLease.candidate.id);
@@ -671,6 +704,36 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      if (incoming.method === "GET" && incoming.url === "/metrics") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        try {
+          const nodeStatuses: Record<string, number> = {};
+          for (const candidate of scheduler.snapshot()) {
+            const status = scheduler.healthStatus(candidate.id) ?? "healthy";
+            nodeStatuses[status] = (nodeStatuses[status] ?? 0) + 1;
+          }
+          const draining = scheduler.drainingCount();
+          if (draining > 0) {
+            nodeStatuses.draining = draining;
+          }
+          const body = metrics.render({
+            activeSessions: softStickySessions.countActiveSessions(),
+            nodeStatuses,
+            operationStatuses: state?.operationStatusCounts() ?? {},
+          });
+          response.writeHead(200, {
+            "content-type": "text/plain; version=0.0.4; charset=utf-8",
+          });
+          response.end(body);
+        } catch {
+          writeJson(response, 503, { error: "metrics unavailable" });
+        }
+        return;
+      }
+
       if (incoming.method === "POST" && incoming.url === "/subscriptions/local") {
         if (
           !options.adminToken ||
@@ -695,9 +758,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           })
           .catch((error: unknown) => {
             const message = error instanceof Error ? error.message : String(error);
-            const status = message.includes("runtime") || message.includes("listener") ? 503 : 422;
-            response.writeHead(status, { "content-type": "application/json" });
-            response.end(JSON.stringify({ error: message }));
+            const runtimeUnavailable = message.includes("runtime") || message.includes("listener");
+            writeJson(response, runtimeUnavailable ? 503 : 422, {
+              error: runtimeUnavailable
+                ? "local subscription runtime unavailable"
+                : "local subscription is invalid",
+            });
           });
         return;
       }
@@ -713,7 +779,18 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         }
         readBody(incoming)
           .then((body) => parseRemoteSubscriptionRequest(body))
-          .then((url) => state.createRemoteSubscription(url))
+          .then((url) => ({
+            created: state.createRemoteSubscription(url),
+            subscriptionOrigin: subscriptionLogOrigin(url),
+          }))
+          .then(({ created, subscriptionOrigin }) => {
+            emitLog({
+              event: "egressd.subscription.remote.created",
+              level: "info",
+              subscriptionOrigin,
+            });
+            return created;
+          })
           .then((created) => {
             writeJson(response, 202, {
               operationId: created.operationId,
@@ -723,11 +800,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
             });
             remoteOperations?.enqueue(created.operationId, created.subscriptionId);
           })
-          .catch((error: unknown) => {
-            writeJson(response, 422, {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          });
+          .catch(() =>
+            writeJson(response, 422, { error: "remote subscription request is invalid" }),
+          );
         return;
       }
 
