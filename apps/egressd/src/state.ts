@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { PersistedProxyToken } from "./proxy-auth.js";
 import type { PersistedSessionBinding, SessionBindingStore } from "./session.js";
 import type { ImportedVlessRevision, NormalizedVlessNode } from "./subscription.js";
 
@@ -110,6 +111,7 @@ export interface ControlState extends SessionBindingStore {
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   listDrainingListenerLeases(): PersistedListenerLease[];
+  loadProxyTokens(): PersistedProxyToken[] | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
   prepareNodeRevision(
     sourceId: string,
@@ -129,6 +131,7 @@ export interface ControlState extends SessionBindingStore {
     subscriptionRevisionId?: number;
   }): PersistedActiveRevision;
   saveNodeAlias(logicalNodeId: string, alias: string): void;
+  saveProxyTokens(tokens: readonly PersistedProxyToken[]): void;
   saveValidatedRevision(subscriptionRevisionId: number, imported: ImportedVlessRevision): void;
   markRevisionAccepted(subscriptionRevisionId: number, operationId: string): void;
   markRevisionSuspicious(subscriptionRevisionId: number, operationId: string, reason: string): void;
@@ -197,12 +200,14 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     listDrainingListenerLeases: () => listDrainingListenerLeases(controlDatabase),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
+    loadProxyTokens: () => loadProxyTokens(controlDatabase),
     prepareNodeRevision: (sourceId, imported, now) =>
       prepareNodeRevision(controlDatabase, sourceId, imported, now),
     releaseNodeGeneration: (logicalId, generation, listenerPort, reusableAfter) =>
       releaseNodeGeneration(controlDatabase, logicalId, generation, listenerPort, reusableAfter),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
     saveNodeAlias: (logicalNodeId, alias) => saveNodeAlias(controlDatabase, logicalNodeId, alias),
+    saveProxyTokens: (tokens) => saveProxyTokens(controlDatabase, tokens),
     saveValidatedRevision: (subscriptionRevisionId, imported) =>
       saveValidatedRevision(controlDatabase, subscriptionRevisionId, imported),
     saveSessionBinding: (identity, binding) =>
@@ -344,6 +349,45 @@ function loadOrCreateSessionHmacKey(database: DatabaseSync): Buffer {
   return key;
 }
 
+function loadProxyTokens(database: DatabaseSync): PersistedProxyToken[] | undefined {
+  const initialized = database
+    .prepare("SELECT 1 FROM daemon_metadata WHERE key = 'proxy_tokens_initialized'")
+    .get();
+  if (!initialized) {
+    return undefined;
+  }
+  const rows = database
+    .prepare("SELECT id, token_hash, expires_at FROM proxy_tokens ORDER BY id")
+    .all() as Array<{ expires_at: number | null; id: string; token_hash: Uint8Array }>;
+  return rows.map((row) => ({
+    ...(row.expires_at === null ? {} : { expiresAt: row.expires_at }),
+    hash: Buffer.from(row.token_hash).toString("hex"),
+    id: row.id,
+  }));
+}
+
+function saveProxyTokens(database: DatabaseSync, tokens: readonly PersistedProxyToken[]): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare("DELETE FROM proxy_tokens").run();
+    const insert = database.prepare(
+      "INSERT INTO proxy_tokens (id, token_hash, expires_at) VALUES (?, ?, ?)",
+    );
+    for (const token of tokens) {
+      insert.run(token.id, Buffer.from(token.hash, "hex"), token.expiresAt ?? null);
+    }
+    database
+      .prepare(
+        "INSERT OR REPLACE INTO daemon_metadata (key, value) VALUES ('proxy_tokens_initialized', '1')",
+      )
+      .run();
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function saveSessionBinding(
   database: DatabaseSync,
   identity: string,
@@ -451,6 +495,11 @@ function migrate(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS daemon_metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS proxy_tokens (
+      id TEXT PRIMARY KEY,
+      token_hash BLOB NOT NULL,
+      expires_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS node_aliases (
       alias TEXT PRIMARY KEY,

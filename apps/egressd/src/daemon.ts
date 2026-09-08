@@ -18,6 +18,7 @@ import {
   authorizeProxyRequest,
   type ProxyAuthentication,
   type ProxyRoute,
+  ProxyTokenRegistry,
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
@@ -41,6 +42,7 @@ import {
   SoftStickySessions,
 } from "./session.js";
 import {
+  type ControlState,
   NodeAliasConflictError,
   NodeAliasTargetNotFoundError,
   nodeGeneration,
@@ -204,6 +206,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   validatePreconnectAttempts(options.preconnectAttempts);
   validatePreconnectTimeout(options.preconnectTimeoutMs);
   if (
+    options.adminToken &&
+    options.proxyAuthentication &&
+    "tokens" in options.proxyAuthentication &&
+    options.proxyAuthentication.tokens.includes(options.adminToken)
+  ) {
+    throw new Error("admin and proxy tokens must be distinct");
+  }
+  if (
     (options.mihomoRuntime?.onUnexpectedExit === undefined) !==
     (options.mihomoRuntime?.restart === undefined)
   ) {
@@ -221,6 +231,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     };
     (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
   }
+  const proxyTokenRegistry =
+    options.proxyAuthentication === false
+      ? undefined
+      : new ProxyTokenRegistry({
+          initialTokens:
+            options.proxyAuthentication && "tokens" in options.proxyAuthentication
+              ? options.proxyAuthentication.tokens
+              : [],
+        });
+  const activeProxyAuthentication: ProxyAuthentication =
+    options.proxyAuthentication === false ? false : (proxyTokenRegistry as ProxyTokenRegistry);
   const scheduler = new RotateScheduler(
     options.mihomoListener
       ? [
@@ -258,6 +279,20 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     );
   }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  try {
+    const persistedProxyTokens = state?.loadProxyTokens();
+    if (proxyTokenRegistry && persistedProxyTokens !== undefined) {
+      proxyTokenRegistry.restore(persistedProxyTokens);
+    } else if (state && proxyTokenRegistry) {
+      state.saveProxyTokens(proxyTokenRegistry.persistedSnapshot());
+    }
+    if (options.adminToken && proxyTokenRegistry?.matches(options.adminToken)) {
+      throw new Error("admin and proxy tokens must be distinct");
+    }
+  } catch (error) {
+    await state?.close();
+    throw error;
+  }
   const closeRuntimeAndState = async () => {
     try {
       await options.mihomoRuntime?.close?.();
@@ -696,6 +731,68 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      if (incoming.method === "GET" && incoming.url === "/proxy-tokens") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        writeJson(response, 200, { tokens: proxyTokenRegistry?.snapshot() ?? [] });
+        return;
+      }
+
+      if (incoming.method === "POST" && incoming.url === "/proxy-tokens") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!proxyTokenRegistry) {
+          writeJson(response, 409, { error: "proxy authentication is disabled" });
+          return;
+        }
+        readBody(incoming)
+          .then(parseProxyTokenRequest)
+          .then((token) => {
+            if (token === options.adminToken) {
+              throw new Error("admin and proxy tokens must be distinct");
+            }
+            const added = commitProxyTokenMutation(proxyTokenRegistry, state, () =>
+              proxyTokenRegistry.add(token),
+            );
+            writeJson(response, 201, added);
+          })
+          .catch(() => writeJson(response, 422, { error: "proxy token request is invalid" }));
+        return;
+      }
+
+      const proxyTokenMatch = incoming.url?.match(/^\/proxy-tokens\/([^/]+)$/);
+      if (incoming.method === "DELETE" && proxyTokenMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!proxyTokenRegistry) {
+          writeJson(response, 409, { error: "proxy authentication is disabled" });
+          return;
+        }
+        readBody(incoming)
+          .then(parseProxyTokenRevocationRequest)
+          .then((graceMs) => {
+            const id = proxyTokenMatch[1] as string;
+            const revoked = commitProxyTokenMutation(proxyTokenRegistry, state, () =>
+              proxyTokenRegistry.revoke(id, graceMs),
+            );
+            if (!revoked) {
+              writeJson(response, 404, { error: "proxy token not found" });
+              return;
+            }
+            writeJson(response, 202, { ...revoked, tokenId: id });
+          })
+          .catch(() =>
+            writeJson(response, 422, { error: "proxy token revocation request is invalid" }),
+          );
+        return;
+      }
+
       const subscriptionMatch = incoming.url?.match(/^\/subscriptions\/([^/]+)$/);
       if (incoming.method === "GET" && subscriptionMatch) {
         if (!isAuthorizedAdmin(incoming, options.adminToken)) {
@@ -872,7 +969,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
 
       const route = authorizeProxyRequest(
         incoming.headers["proxy-authorization"],
-        options.proxyAuthentication,
+        activeProxyAuthentication,
       );
       if (route === undefined) {
         rejectHttpProxyAuthentication(response);
@@ -900,7 +997,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   server.on("connect", (incoming, clientSocket, head) => {
     const route = authorizeProxyRequest(
       incoming.headers["proxy-authorization"],
-      options.proxyAuthentication,
+      activeProxyAuthentication,
     );
     if (route === undefined) {
       rejectConnectProxyAuthentication(clientSocket);
@@ -1148,6 +1245,38 @@ function parseRemoteSubscriptionRequest(body: string): string {
     throw new Error("remote subscription URL must use HTTPS");
   }
   return document.url;
+}
+
+function commitProxyTokenMutation<T>(
+  registry: ProxyTokenRegistry,
+  state: ControlState | undefined,
+  mutate: () => T,
+): T {
+  const checkpoint = registry.persistedSnapshot();
+  const result = mutate();
+  try {
+    state?.saveProxyTokens(registry.persistedSnapshot());
+    return result;
+  } catch (error) {
+    registry.restore(checkpoint);
+    throw error;
+  }
+}
+
+function parseProxyTokenRequest(body: string): string {
+  const document = JSON.parse(body) as { token?: unknown };
+  if (typeof document.token !== "string" || document.token.length === 0) {
+    throw new Error("proxy token is required");
+  }
+  return document.token;
+}
+
+function parseProxyTokenRevocationRequest(body: string): number {
+  const document = JSON.parse(body) as { graceMs?: unknown };
+  if (!Number.isInteger(document.graceMs) || (document.graceMs as number) < 0) {
+    throw new Error("graceMs must be a non-negative integer");
+  }
+  return document.graceMs as number;
 }
 
 function parseNodeAliasRequest(body: string): string {
