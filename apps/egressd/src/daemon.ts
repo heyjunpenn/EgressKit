@@ -10,6 +10,7 @@ import { connect, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
 import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
+import { MihomoCrashRecovery, type MihomoRecoveryClock } from "./mihomo-recovery.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
   authorizeProxyRequest,
@@ -54,7 +55,10 @@ export interface MihomoRuntime {
     context: MihomoApplyContext,
   ): Promise<ReadonlyMap<string, URL>>;
   check(config: ImportedVlessRevision["mihomoConfig"]): Promise<void>;
+  close?(): Promise<void>;
+  onUnexpectedExit?(listener: () => void): () => void;
   removeListener(listener: URL): Promise<void>;
+  restart?(signal: AbortSignal): Promise<void>;
 }
 
 export interface MihomoApplyContext {
@@ -75,6 +79,7 @@ export interface EgressdOptions {
   host: string;
   log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
+  mihomoRecoveryClock?: MihomoRecoveryClock;
   mihomoRuntime?: MihomoRuntime;
   minimumSubscriptionNodes?: number;
   onConnectionOutcome?: (outcome: ConnectionOutcome) => void;
@@ -150,6 +155,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   validateMinimumSubscriptionNodes(options.minimumSubscriptionNodes);
   validatePreconnectAttempts(options.preconnectAttempts);
   validatePreconnectTimeout(options.preconnectTimeoutMs);
+  if (
+    (options.mihomoRuntime?.onUnexpectedExit === undefined) !==
+    (options.mihomoRuntime?.restart === undefined)
+  ) {
+    throw new Error("Mihomo runtime recovery requires both onUnexpectedExit and restart");
+  }
   if (options.proxyAuthentication === false && !isLoopbackHost(options.host)) {
     if (!options.allowUnsafeUnauthenticatedProxy) {
       throw new Error("refusing to disable proxy authentication on a non-loopback host");
@@ -199,6 +210,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     );
   }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const closeRuntimeAndState = async () => {
+    try {
+      await options.mihomoRuntime?.close?.();
+    } finally {
+      await state?.close();
+    }
+  };
   const runtimeGenerations = new Map<string, RuntimeGeneration>();
   const retirementOperations = new Set<Promise<void>>();
   const runtimeConfiguration: RuntimeConfigurationState = {
@@ -207,6 +225,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     previous: undefined,
     status: options.mihomoListener === undefined ? "not-ready" : "ready",
   };
+  let runtimeAvailable = true;
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
   try {
@@ -245,12 +264,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         : { store: options.sessionBindingStore }),
     });
   } catch (error) {
-    await state?.close();
+    await closeRuntimeAndState();
     throw error;
   }
 
   const acquireRoute = (route: ProxyRoute, excludedIds: ReadonlySet<string> = new Set()) => {
-    if (runtimeConfiguration.status === "failed") {
+    if (runtimeConfiguration.status === "failed" || !runtimeAvailable) {
       return undefined;
     }
     if (route.mode === "rotate") {
@@ -465,7 +484,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       await withControlPlaneLock(() => activateRevisionUnlocked(restored.imported, restored.nodes));
     }
   } catch (error) {
-    await state?.close();
+    await closeRuntimeAndState();
     throw error;
   }
 
@@ -483,6 +502,49 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     });
     return state?.loadActiveRevision()?.imported ?? revision;
   };
+
+  let stopWatchingRuntime: () => void = () => undefined;
+  let crashRecovery: MihomoCrashRecovery | undefined;
+  const recoverableRuntime = options.mihomoRuntime;
+  if (recoverableRuntime?.onUnexpectedExit && recoverableRuntime.restart) {
+    crashRecovery = new MihomoCrashRecovery({
+      ...(options.mihomoRecoveryClock === undefined ? {} : { clock: options.mihomoRecoveryClock }),
+      onReady: () => {
+        runtimeAvailable = true;
+      },
+      onUnavailable: () => {
+        runtimeAvailable = false;
+      },
+      restart: (signal) =>
+        withControlPlaneLock(async () => {
+          if (signal.aborted) {
+            throw signal.reason;
+          }
+          await recoverableRuntime.restart?.(signal);
+          if (signal.aborted) {
+            throw signal.reason;
+          }
+          for (const { listener } of scheduler.snapshot()) {
+            if (signal.aborted) {
+              throw signal.reason;
+            }
+            await (options.checkMihomoListener ?? checkListenerReady)(listener);
+            if (signal.aborted) {
+              throw signal.reason;
+            }
+          }
+        }),
+    });
+    try {
+      stopWatchingRuntime = recoverableRuntime.onUnexpectedExit(() =>
+        crashRecovery?.unexpectedExit(),
+      );
+    } catch (error) {
+      await crashRecovery.close();
+      await closeRuntimeAndState();
+      throw error;
+    }
+  }
 
   const remoteOperations = state
     ? new RemoteOperationRunner({
@@ -513,7 +575,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     }
 
     if (incoming.method === "GET" && incoming.url === "/ready") {
-      const ready = runtimeConfiguration.status === "ready" && scheduler.snapshot().length > 0;
+      const ready =
+        runtimeAvailable &&
+        runtimeConfiguration.status === "ready" &&
+        scheduler.snapshot().length > 0;
       writeJson(response, ready ? 200 : 503, { status: ready ? "ready" : "not-ready" });
       return;
     }
@@ -737,6 +802,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     }
     void forwardHttpProxyRequest(incoming, response, route, acquirePreconnectedRoute);
   });
+
+  const closeStartupResources = async () => {
+    stopWatchingRuntime();
+    await remoteOperations?.close();
+    await crashRecovery?.close();
+    await closeRuntimeAndState();
+  };
   server.on("connect", (incoming, clientSocket, head) => {
     const route = authorizeProxyRequest(
       incoming.headers["proxy-authorization"],
@@ -765,14 +837,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       });
     });
   } catch (error) {
-    await state?.close();
+    await closeStartupResources();
     throw error;
   }
 
   const address = server.address();
   if (!address || typeof address === "string") {
     await closeServer(server);
-    await state?.close();
+    await closeStartupResources();
     throw new Error("egressd did not bind a TCP address");
   }
 
@@ -808,6 +880,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
       closed = true;
+      stopWatchingRuntime();
+      const recoveryClosing = crashRecovery?.close();
       if (healthCheckTimer) {
         clearInterval(healthCheckTimer);
       }
@@ -815,17 +889,26 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (healthCheckRun) {
         await waitForBoundedCompletion(healthCheckRun, 1_000);
       }
-      remoteOperations?.close();
+      const operationsClosing = remoteOperations?.close();
       try {
         await closeServer(server);
+        await operationsClosing;
+        if (recoveryClosing) {
+          await waitForBoundedCompletion(recoveryClosing, 1_000);
+        }
         if (retirementOperations.size > 0) {
           await waitForBoundedCompletion(
             Promise.allSettled([...retirementOperations]).then(() => undefined),
             1_000,
           );
         }
+        await withControlPlaneLock(() => undefined);
       } finally {
-        await state?.close();
+        try {
+          await options.mihomoRuntime?.close?.();
+        } finally {
+          await state?.close();
+        }
       }
     },
     healthSnapshot: () => healthController?.snapshot() ?? [],

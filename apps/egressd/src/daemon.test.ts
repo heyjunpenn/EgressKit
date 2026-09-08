@@ -357,6 +357,44 @@ test("an unavailable remote source does not block startup from its last valid sn
   await reopenedState.close();
 });
 
+test("startup closes its Mihomo runtime when a restored revision cannot become ready", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-startup-cleanup-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const imported = importLocalVlessYaml(
+    "proxies:\n  - { name: primary, type: vless, server: primary.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n",
+    { firstListenerPort: 20_000 },
+  );
+  const state = await openControlState(stateDirectory);
+  state.saveActiveRevision({
+    imported,
+    source: { id: "local", kind: "local", locator: "inline" },
+  });
+  await state.close();
+  let closeCalls = 0;
+
+  await assert.rejects(
+    startEgressd({
+      checkMihomoListener: async () => {
+        throw new Error("listener never became ready");
+      },
+      host: "127.0.0.1",
+      mihomoRuntime: {
+        apply: async () => new Map([["primary", new URL("http://127.0.0.1:20000")]]),
+        check: async () => undefined,
+        close: async () => {
+          closeCalls += 1;
+        },
+        removeListener: async () => undefined,
+      },
+      port: 0,
+      proxyAuthentication: false,
+      stateDirectory,
+    }),
+    /listener never became ready/,
+  );
+  assert.equal(closeCalls, 1);
+});
+
 test("a second daemon cannot own the same state directory", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-daemon-state-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));
@@ -1842,6 +1880,74 @@ test("a rejected candidate preserves a configured active listener", async (t) =>
     200,
   );
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "configured");
+});
+
+test("a Mihomo crash keeps Node live, rejects new proxy traffic, and becomes ready after restart", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const listener = await startSimulatedMihomoListener(undefined, [], [], "restarted");
+  t.after(() => listener.close());
+  let unexpectedExit: (() => void) | undefined;
+  let finishRestart: (() => void) | undefined;
+  const restart = new Promise<void>((resolve) => {
+    finishRestart = resolve;
+  });
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    mihomoListener: new URL(`http://${listener.host}:${listener.port}`),
+    mihomoRuntime: {
+      apply: async () => new Map(),
+      check: async () => undefined,
+      onUnexpectedExit: (listener_) => {
+        unexpectedExit = listener_;
+        return () => {
+          unexpectedExit = undefined;
+        };
+      },
+      removeListener: async () => undefined,
+      restart: () => restart,
+    },
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => daemon.close());
+  assert.ok(unexpectedExit);
+
+  unexpectedExit();
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
+  );
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/ready`)).status,
+    503,
+  );
+  assert.equal(
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/runtime-down`,
+      "GET",
+      "",
+    ),
+    502,
+  );
+
+  finishRestart?.();
+  await waitFor(async () => {
+    const response = await fetch(`http://${daemon.address.host}:${daemon.address.port}/ready`);
+    return response.status === 200;
+  });
+  assert.equal(
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/runtime-restarted`,
+      "GET",
+      "",
+    ),
+    200,
+  );
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "restarted");
 });
 
 function sendProxyRequest(

@@ -54,7 +54,13 @@ export class RemoteOperationRunner {
   }
 
   enqueue(operationId: string, subscriptionId: string): void {
+    if (this.#shuttingDown) {
+      return;
+    }
     setImmediate(() => {
+      if (this.#shuttingDown) {
+        return;
+      }
       this.#queue = this.#queue
         .then(() => this.#process(operationId, subscriptionId))
         .catch(() => undefined);
@@ -62,19 +68,26 @@ export class RemoteOperationRunner {
   }
 
   enqueueForce(operationId: string, subscriptionRevisionId: number): void {
+    if (this.#shuttingDown) {
+      return;
+    }
     setImmediate(() => {
+      if (this.#shuttingDown) {
+        return;
+      }
       this.#queue = this.#queue
         .then(() => this.#processForce(operationId, subscriptionRevisionId))
         .catch(() => undefined);
     });
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.#shuttingDown = true;
     this.#shutdownController.abort();
     for (const controller of this.#controllers) {
       controller.abort();
     }
+    await this.#queue;
   }
 
   async #process(operationId: string, subscriptionId: string): Promise<void> {

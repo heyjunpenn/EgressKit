@@ -132,6 +132,62 @@ test("remote operations are serialized in creation order", async (t) => {
   assert.equal(maximumActiveRequests, 1);
 });
 
+test("daemon shutdown waits for an in-flight remote activation before closing runtime", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const fixture = await startSubscriptionFixture(t, () => ({
+    body: VALID_SUBSCRIPTION,
+    status: 200,
+  }));
+  let releaseApply: (() => void) | undefined;
+  const applyHeld = new Promise<void>((resolve) => {
+    releaseApply = resolve;
+  });
+  let markApplyStarted: (() => void) | undefined;
+  const applyStarted = new Promise<void>((resolve) => {
+    markApplyStarted = resolve;
+  });
+  const events: string[] = [];
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (_url, options) => fetch(fixture, options),
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async () => {
+        markApplyStarted?.();
+        await applyHeld;
+        events.push("apply-finished");
+        return new Map([["remote", new URL("http://127.0.0.1:20000")]]);
+      },
+      check: async () => undefined,
+      close: async () => {
+        events.push("runtime-closed");
+      },
+      removeListener: async () => undefined,
+    },
+    port: 0,
+    stateDirectory,
+  });
+  await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/held" },
+    method: "POST",
+  });
+  await applyStarted;
+
+  let shutdownFinished = false;
+  const shutdown = daemon.close().then(() => {
+    shutdownFinished = true;
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  const finishedWhileApplyHeld = shutdownFinished;
+  const eventsWhileApplyHeld = [...events];
+  releaseApply?.();
+  await shutdown;
+  assert.equal(finishedWhileApplyHeld, false);
+  assert.deepEqual(eventsWhileApplyHeld, []);
+  assert.deepEqual(events, ["apply-finished", "runtime-closed"]);
+});
+
 test("a hung source times out without permanently blocking later operations", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   let requestNumber = 0;
