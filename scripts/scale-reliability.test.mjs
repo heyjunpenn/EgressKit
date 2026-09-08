@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { percentile, runBenchmark, verdict } from "./scale-reliability.mjs";
+import {
+  closeAll,
+  countOpenTunnels,
+  percentile,
+  runBenchmark,
+  soakReliabilityVerdict,
+  verdict,
+} from "./scale-reliability.mjs";
 
 test("percentile uses the nearest-rank observation without inventing samples", () => {
   assert.equal(percentile([9, 1, 5, 3], 0.95), 9);
@@ -11,6 +18,56 @@ test("percentile uses the nearest-rank observation without inventing samples", (
 test("benchmark verdicts distinguish measured capability from unmet targets", () => {
   assert.deepEqual(verdict(100, 100), { measured: 100, passed: true, target: 100 });
   assert.deepEqual(verdict(99, 100), { measured: 99, passed: false, target: 100 });
+});
+
+test("concurrent CONNECT count excludes tunnels closed before the barrier", () => {
+  assert.equal(
+    countOpenTunnels([
+      { socket: { destroyed: false, readable: true, writable: true } },
+      { socket: { destroyed: true, readable: false, writable: false } },
+      { socket: { destroyed: false, readable: false, writable: true } },
+    ]),
+    1,
+  );
+});
+
+test("soak reliability requires every concurrency seam to be observed", () => {
+  const complete = {
+    connectAttempts: 1,
+    connectFailures: 0,
+    drainingCycles: 3,
+    mihomoRestarts: 3,
+    sqliteWalReads: 1,
+    subscriptionUpdates: 3,
+  };
+  assert.equal(soakReliabilityVerdict(complete, 60, 60, "wal").passed, true);
+  for (const override of [
+    { drainingCycles: 2 },
+    { mihomoRestarts: 2 },
+    { sqliteWalReads: 0 },
+    { subscriptionUpdates: 2 },
+  ]) {
+    assert.equal(soakReliabilityVerdict({ ...complete, ...override }, 60, 60, "wal").passed, false);
+  }
+  assert.equal(soakReliabilityVerdict(complete, 60, 60, "delete").passed, false);
+});
+
+test("cleanup attempts every resource and reports all failures", async () => {
+  const attempted = [];
+  await assert.rejects(
+    closeAll([
+      () => {
+        attempted.push("first");
+        throw new Error("first failed");
+      },
+      async () => {
+        attempted.push("second");
+        throw new Error("second failed");
+      },
+    ]),
+    (error) => error instanceof AggregateError && error.errors.length === 2,
+  );
+  assert.deepEqual(attempted, ["first", "second"]);
 });
 
 test("soak duration rejects zero, negative, non-numeric, and short runs", async () => {

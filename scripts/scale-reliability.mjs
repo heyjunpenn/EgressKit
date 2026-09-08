@@ -16,6 +16,42 @@ export function verdict(measured, target) {
   return { measured, passed: measured >= target, target };
 }
 
+export function countOpenTunnels(tunnels) {
+  return tunnels.filter(
+    ({ socket }) => !socket.destroyed && socket.readable === true && socket.writable === true,
+  ).length;
+}
+
+export function soakReliabilityVerdict(soak, elapsedSeconds, requestedSeconds, journalMode) {
+  const measuredSuccessRate =
+    soak.connectAttempts === 0
+      ? 0
+      : Number(((soak.connectAttempts - soak.connectFailures) / soak.connectAttempts).toFixed(6));
+  return {
+    measuredSuccessRate,
+    passed:
+      soak.connectAttempts > 0 &&
+      soak.connectFailures === 0 &&
+      elapsedSeconds >= requestedSeconds &&
+      soak.subscriptionUpdates >= 3 &&
+      soak.drainingCycles >= 3 &&
+      soak.mihomoRestarts >= 3 &&
+      soak.sqliteWalReads > 0 &&
+      journalMode === "wal",
+    target: "zero CONNECT failures with every required soak seam observed",
+  };
+}
+
+export async function closeAll(cleanups) {
+  const results = await Promise.allSettled(
+    cleanups.map((cleanup) => Promise.resolve().then(cleanup)),
+  );
+  const errors = results
+    .filter((result) => result.status === "rejected")
+    .map((result) => result.reason);
+  if (errors.length > 0) throw new AggregateError(errors, "benchmark cleanup failed");
+}
+
 const yamlForNodes = (count, revision = 0) =>
   `proxies:\n${Array.from({ length: count }, (_, index) => {
     const suffix = String(index + revision * count)
@@ -42,6 +78,7 @@ async function startConnectListener() {
   await once(server, "listening");
   const address = server.address();
   return {
+    activeConnections: () => sockets.size,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve, reject) => {
@@ -68,7 +105,10 @@ async function openTunnel(address) {
       if (error) {
         socket.destroy();
         reject(error);
-      } else resolve(value);
+      } else {
+        socket.on("error", () => undefined);
+        resolve(value);
+      }
     };
     const onError = (error) => finish(error);
     const onClose = () => finish(Object.assign(new Error("CONNECT closed"), { code: "CLOSED" }));
@@ -158,10 +198,10 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
       scaleDatabase.close();
       scaleDatabase = undefined;
     } finally {
-      scaleDatabase?.close();
-      await Promise.allSettled([
-        scaleDaemon?.close(),
-        ...scaleListeners.map((listener) => listener.close()),
+      await closeAll([
+        ...(scaleDatabase ? [async () => scaleDatabase.close()] : []),
+        ...(scaleDaemon ? [async () => scaleDaemon.close()] : []),
+        ...scaleListeners.map((listener) => async () => listener.close()),
       ]);
     }
 
@@ -225,7 +265,13 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
     const tunnels = tunnelResults
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value);
-    const concurrentConnects = tunnels.length;
+    await new Promise((resolve) => setImmediate(resolve));
+    const clientOpenTunnels = countOpenTunnels(tunnels);
+    const upstreamOpenTunnels = listeners.reduce(
+      (total, listener) => total + listener.activeConnections(),
+      0,
+    );
+    const concurrentConnects = Math.min(clientOpenTunnels, upstreamOpenTunnels);
     for (const tunnel of tunnels) tunnel.socket.destroy();
 
     const candidate = schedulerModule.createSchedulerCandidate(
@@ -279,17 +325,20 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
           await new Promise((resolve) => setTimeout(resolve, 15_000));
           if (Date.now() >= deadline) break;
           const heldTunnel = await openTunnel(daemon.address);
-          await daemon.importLocalSubscription(yamlForNodes(100, soak.subscriptionUpdates + 1));
-          soak.subscriptionUpdates += 1;
-          const draining = Number(
-            database
-              .prepare(
-                "SELECT COUNT(*) AS count FROM listener_port_leases WHERE status = 'draining'",
-              )
-              .get().count,
-          );
-          if (draining > 0) soak.drainingCycles += 1;
-          heldTunnel.socket.destroy();
+          try {
+            await daemon.importLocalSubscription(yamlForNodes(100, soak.subscriptionUpdates + 1));
+            soak.subscriptionUpdates += 1;
+            const draining = Number(
+              database
+                .prepare(
+                  "SELECT COUNT(*) AS count FROM listener_port_leases WHERE status = 'draining'",
+                )
+                .get().count,
+            );
+            if (draining > 0) soak.drainingCycles += 1;
+          } finally {
+            heldTunnel.socket.destroy();
+          }
           unexpectedExit?.();
         }
       })(),
@@ -310,19 +359,12 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
           targetMaximum: 20,
         },
         subscriptionNodes: verdict(persistedSubscriptionNodes, 500),
-        soakReliability: {
-          measuredSuccessRate:
-            soak.connectAttempts === 0
-              ? 0
-              : Number(
-                  ((soak.connectAttempts - soak.connectFailures) / soak.connectAttempts).toFixed(6),
-                ),
-          passed:
-            soak.connectAttempts > 0 &&
-            soak.connectFailures === 0 &&
-            soakElapsedSeconds >= soakSeconds,
-          target: "zero CONNECT failures during the fixed soak",
-        },
+        soakReliability: soakReliabilityVerdict(
+          soakResult,
+          soakElapsedSeconds,
+          soakSeconds,
+          sqliteJournalMode,
+        ),
       },
       raw: {
         directConnectP95Ms: Number(percentile(directSamples, 0.95).toFixed(3)),
@@ -336,12 +378,12 @@ export async function runBenchmark({ soakSeconds = 60 } = {}) {
     };
     return result;
   } finally {
-    try {
-      database?.close();
-    } finally {
-      await Promise.allSettled([daemon?.close(), ...listeners.map((listener) => listener.close())]);
-      await rm(temporaryDirectory, { force: true, recursive: true });
-    }
+    await closeAll([
+      ...(database ? [async () => database.close()] : []),
+      ...(daemon ? [async () => daemon.close()] : []),
+      ...listeners.map((listener) => async () => listener.close()),
+      async () => rm(temporaryDirectory, { force: true, recursive: true }),
+    ]);
   }
 }
 
