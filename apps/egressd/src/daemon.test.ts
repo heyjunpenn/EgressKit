@@ -831,7 +831,7 @@ test("strict sticky fails on a missing bound node, preserves it, and isolates ne
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);
   t.after(() => target.close());
-  const { daemon } = await startTwoExitDaemon(t, undefined, {
+  const { daemon, secondSelections } = await startTwoExitDaemon(t, undefined, {
     proxyAuthentication: { tokens: ["proxy-secret"] },
     stateDirectory,
   });
@@ -847,6 +847,17 @@ test("strict sticky fails on a missing bound node, preserves it, and isolates ne
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
   assert.equal(await importLocalNodes(daemon.address, ["second"]), 201);
   assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", "", strictA), 502);
+  const tunnelTarget = await startHttpsTarget([]);
+  t.after(() => tunnelTarget.close());
+  assert.match(
+    await sendConnectRequest(
+      daemon.address,
+      `${tunnelTarget.host}:${tunnelTarget.port}`,
+      strictA["proxy-authorization"],
+    ),
+    /^HTTP\/1\.1 502 Bad Gateway/,
+  );
+  assert.deepEqual(secondSelections, []);
   assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", "", strictB), 200);
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "second");
 
@@ -872,7 +883,11 @@ test("explicit node ID and alias routing is deterministic and never mutates stic
     });
 
   assert.equal(await requestThrough("sticky.session-a"), 200);
-  assert.equal(await requestThrough("node.second"), 200);
+  assert.equal(await requestThrough("node.second"), 502);
+  assert.equal(await setNodeAlias(daemon.address, "local:first", "primary"), 200);
+  assert.equal(await setNodeAlias(daemon.address, "local:second", "primary"), 409);
+  assert.equal(await setNodeAlias(daemon.address, "local:second", "backup"), 200);
+  assert.equal(await requestThrough("node.backup"), 200);
   assert.equal(await requestThrough("node.local%3Afirst"), 200);
   assert.deepEqual(
     observedRequests.map((entry) => entry.headers["x-egresskit-test-exit"]),
@@ -885,15 +900,85 @@ test("explicit node ID and alias routing is deterministic and never mutates stic
     await sendConnectRequest(
       daemon.address,
       authority,
-      basicProxyAuthorization("node.second", "proxy-secret"),
+      basicProxyAuthorization("node.backup", "proxy-secret"),
     ),
     /^HTTP\/1\.1 200 Connection Established/,
   );
   assert.deepEqual(secondSelections, [authority]);
 
   assert.equal(await importLocalNodes(daemon.address, ["first"]), 201);
-  assert.equal(await requestThrough("node.second"), 502);
+  assert.equal(await requestThrough("node.backup"), 502);
+  assert.match(
+    await sendConnectRequest(
+      daemon.address,
+      authority,
+      basicProxyAuthorization("node.backup", "proxy-secret"),
+    ),
+    /^HTTP\/1\.1 502 Bad Gateway/,
+  );
+  assert.deepEqual(secondSelections, [authority]);
   assert.equal(await requestThrough("sticky.session-a"), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
+});
+
+test("alias conflicts are rejected before runtime apply and preserve the active exit", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-alias-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const first = await startSimulatedMihomoListener(undefined, [], [], "first");
+  t.after(() => first.close());
+  let applyCount = 0;
+  const options = {
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["proxy-secret"] } as const,
+    stateDirectory,
+    mihomoRuntime: {
+      apply: async () => {
+        applyCount += 1;
+        return new Map([["first", new URL(`http://${first.host}:${first.port}`)]]);
+      },
+    },
+  };
+  const daemon = await startEgressd(options);
+  t.after(() => daemon.close());
+  assert.equal(await importLocalNodes(daemon.address, ["first"]), 201);
+  assert.equal(await setNodeAlias(daemon.address, "local:first", "local:second"), 200);
+
+  assert.equal(await importLocalNodes(daemon.address, ["second"]), 422);
+  assert.equal(applyCount, 1);
+  assert.equal(
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/preserved`,
+      "GET",
+      "",
+      {
+        "proxy-authorization": basicProxyAuthorization("node.local%3Asecond", "proxy-secret"),
+      },
+    ),
+    200,
+  );
+  assert.equal(observedRequests[0]?.headers["x-egresskit-test-exit"], "first");
+
+  await daemon.close();
+  const restarted = await startEgressd(options);
+  t.after(() => restarted.close());
+  assert.equal(
+    await sendProxyRequest(
+      restarted.address,
+      `http://${target.host}:${target.port}/restored-alias`,
+      "GET",
+      "",
+      {
+        "proxy-authorization": basicProxyAuthorization("node.local%3Asecond", "proxy-secret"),
+      },
+    ),
+    200,
+  );
   assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "first");
 });
 
@@ -959,6 +1044,21 @@ async function importLocalNodes(
     headers: { authorization: "Bearer test-admin-token" },
     body: `proxies:\n${names.map((name) => nodes[name]).join("\n")}\n`,
   }).then((response) => response.status);
+}
+
+function setNodeAlias(
+  daemon: { host: string; port: number },
+  logicalNodeId: string,
+  alias: string,
+): Promise<number> {
+  return fetch(
+    `http://${daemon.host}:${daemon.port}/nodes/${encodeURIComponent(logicalNodeId)}/alias`,
+    {
+      method: "PUT",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: JSON.stringify({ alias }),
+    },
+  ).then((response) => response.status);
 }
 
 function sendConnectRequest(

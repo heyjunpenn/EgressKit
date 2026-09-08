@@ -27,6 +27,7 @@ import {
   RotateScheduler,
   type SchedulerLease,
   type SchedulerSignals,
+  validateSelectorUniqueness,
 } from "./scheduler.js";
 import {
   type SessionBindingStore,
@@ -35,6 +36,8 @@ import {
   SoftStickySessions,
 } from "./session.js";
 import {
+  NodeAliasConflictError,
+  NodeAliasTargetNotFoundError,
   openControlState,
   type PersistedNodeGeneration,
   RevisionForceConflictError,
@@ -177,6 +180,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
     }
+    const identities = revision.nodes.map((node) => ({
+      id:
+        persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
+        `${logicalIdPrefix}:${node.name}`,
+      node,
+    }));
+    const aliases = state?.getNodeAliases() ?? new Map<string, string>();
+    validateSelectorUniqueness(
+      identities.map(({ id }) => ({ id })),
+      [...aliases.values()],
+    );
     const listeners = await options.mihomoRuntime.apply(revision.mihomoConfig);
     checking?.();
     for (const node of revision.nodes) {
@@ -187,15 +201,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       await (options.checkMihomoListener ?? checkListenerReady)(listener);
     }
     scheduler.replaceCandidates(
-      revision.nodes.map((node) => {
-        const id =
-          persistedNodes?.find((persisted) => persisted.node.name === node.name)?.logicalId ??
-          `${logicalIdPrefix}:${node.name}`;
+      identities.map(({ id, node }) => {
+        const alias = aliases.get(id);
         return createSchedulerCandidate(
           id,
           listeners.get(node.name) as URL,
           options.schedulerSignals?.get(id),
-          [node.name],
+          alias === undefined ? [] : [alias],
         );
       }),
     );
@@ -357,6 +369,40 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           ? {}
           : { suspiciousReason: revision.suspiciousReason }),
       });
+      return;
+    }
+
+    const nodeAliasMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/alias$/);
+    if (incoming.method === "PUT" && nodeAliasMatch) {
+      if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+        rejectAdminAuthentication(response);
+        return;
+      }
+      if (!state) {
+        writeJson(response, 503, { error: "durable control state is not configured" });
+        return;
+      }
+      readBody(incoming)
+        .then(parseNodeAliasRequest)
+        .then((alias) => {
+          const logicalNodeId = decodeURIComponent(nodeAliasMatch[1] as string);
+          state.saveNodeAlias(logicalNodeId, alias);
+          if (!scheduler.setSelectors(logicalNodeId, [alias])) {
+            throw new NodeAliasTargetNotFoundError(`active node not found: ${logicalNodeId}`);
+          }
+          writeJson(response, 200, { alias, nodeId: logicalNodeId });
+        })
+        .catch((error: unknown) => {
+          const status =
+            error instanceof NodeAliasConflictError
+              ? 409
+              : error instanceof NodeAliasTargetNotFoundError
+                ? 404
+                : 422;
+          writeJson(response, status, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
       return;
     }
 
@@ -577,6 +623,22 @@ function parseRemoteSubscriptionRequest(body: string): string {
     throw new Error("remote subscription URL must use HTTPS");
   }
   return document.url;
+}
+
+function parseNodeAliasRequest(body: string): string {
+  const document = JSON.parse(body) as { alias?: unknown };
+  if (
+    typeof document.alias !== "string" ||
+    document.alias.length === 0 ||
+    document.alias.length > 128 ||
+    [...document.alias].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127;
+    })
+  ) {
+    throw new Error("node alias must be between 1 and 128 printable characters");
+  }
+  return document.alias;
 }
 
 function isAuthorizedAdmin(incoming: IncomingMessage, adminToken: string | undefined): boolean {

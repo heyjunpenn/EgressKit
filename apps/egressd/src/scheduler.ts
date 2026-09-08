@@ -41,6 +41,24 @@ interface CandidateState {
   leasedConnections: number;
 }
 
+export function validateSelectorUniqueness(
+  candidates: readonly Pick<SchedulerCandidate, "id" | "selectors">[],
+  reservedSelectors: readonly string[] = [],
+): void {
+  const selectors = new Set(reservedSelectors);
+  if (selectors.size !== reservedSelectors.length) {
+    throw new Error("duplicate scheduler selector");
+  }
+  for (const candidate of candidates) {
+    for (const selector of [candidate.id, ...(candidate.selectors ?? [])]) {
+      if (selectors.has(selector)) {
+        throw new Error(`duplicate scheduler selector: ${selector}`);
+      }
+      selectors.add(selector);
+    }
+  }
+}
+
 export class RotateScheduler {
   #states: CandidateState[] = [];
 
@@ -49,20 +67,9 @@ export class RotateScheduler {
   }
 
   replaceCandidates(candidates: readonly SchedulerCandidate[]): void {
-    const ids = new Set<string>();
-    const selectors = new Set<string>();
+    validateSelectorUniqueness(candidates);
     this.#states = candidates.map((candidate) => {
       validateCandidate(candidate);
-      if (ids.has(candidate.id)) {
-        throw new Error(`duplicate scheduler candidate: ${candidate.id}`);
-      }
-      ids.add(candidate.id);
-      for (const selector of [candidate.id, ...(candidate.selectors ?? [])]) {
-        if (selectors.has(selector)) {
-          throw new Error(`duplicate scheduler selector: ${selector}`);
-        }
-        selectors.add(selector);
-      }
       return { candidate, currentWeight: 0, leasedConnections: 0 };
     });
   }
@@ -117,6 +124,19 @@ export class RotateScheduler {
       return undefined;
     }
     return lease(state);
+  }
+
+  setSelectors(id: string, selectors: readonly string[]): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) {
+      return false;
+    }
+    const candidates = this.#states.map(({ candidate }) =>
+      candidate.id === id ? { ...candidate, selectors } : candidate,
+    );
+    validateSelectorUniqueness(candidates);
+    state.candidate = { ...state.candidate, selectors };
+    return true;
   }
 }
 
