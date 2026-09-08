@@ -15,6 +15,7 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
+import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -30,6 +31,7 @@ export interface EgressdOptions {
   mihomoRuntime?: MihomoRuntime;
   port: number;
   proxyAuthentication?: ProxyAuthentication;
+  schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
 }
 
 export interface EgressdLogEvent {
@@ -73,7 +75,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     };
     (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
   }
-  let activeMihomoListener = options.mihomoListener;
+  const scheduler = new RotateScheduler(
+    options.mihomoListener
+      ? [
+          createSchedulerCandidate(
+            "configured",
+            options.mihomoListener,
+            options.schedulerSignals?.get("configured"),
+          ),
+        ]
+      : [],
+  );
   const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
     if (!options.mihomoRuntime) {
       throw new Error("Mihomo runtime is not configured");
@@ -89,11 +101,16 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
       }
     }
-    const selected = listeners.get(revision.nodes[0]?.name ?? "");
-    if (!selected) {
-      throw new Error("Mihomo runtime did not start the imported listener");
-    }
-    activeMihomoListener = selected;
+    scheduler.replaceCandidates(
+      revision.nodes.map((node) => {
+        const id = localLogicalNodeId(node.name);
+        return createSchedulerCandidate(
+          id,
+          listeners.get(node.name) as URL,
+          options.schedulerSignals?.get(id),
+        );
+      }),
+    );
     return revision;
   };
 
@@ -135,25 +152,35 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return;
     }
 
-    if (
-      authorizeProxyRequest(
-        incoming.headers["proxy-authorization"],
-        options.proxyAuthentication,
-      ) === undefined
-    ) {
+    const route = authorizeProxyRequest(
+      incoming.headers["proxy-authorization"],
+      options.proxyAuthentication,
+    );
+    if (route === undefined) {
       rejectHttpProxyAuthentication(response);
       return;
     }
+    if (route.mode !== "rotate") {
+      response.writeHead(501);
+      response.end();
+      return;
+    }
 
-    if (!activeMihomoListener || !isAbsoluteHttpUrl(incoming.url)) {
-      response.writeHead(activeMihomoListener ? 400 : 502);
+    if (!isAbsoluteHttpUrl(incoming.url)) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const lease = scheduler.acquire();
+    if (!lease) {
+      response.writeHead(502);
       response.end();
       return;
     }
 
     const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
     const upstream = request(
-      activeMihomoListener,
+      lease.candidate.listener,
       {
         headers: {
           ...forwardedHeaders,
@@ -163,29 +190,41 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         path: incoming.url,
       },
       (upstreamResponse) => {
+        upstreamResponse.once("close", lease.release);
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(response);
       },
     );
     upstream.on("error", () => {
+      lease.release();
       if (!response.headersSent) {
         response.writeHead(502);
       }
       response.end();
     });
+    response.once("close", lease.release);
     incoming.pipe(upstream);
   });
   server.on("connect", (incoming, clientSocket, head) => {
-    if (
-      authorizeProxyRequest(
-        incoming.headers["proxy-authorization"],
-        options.proxyAuthentication,
-      ) === undefined
-    ) {
+    const route = authorizeProxyRequest(
+      incoming.headers["proxy-authorization"],
+      options.proxyAuthentication,
+    );
+    if (route === undefined) {
       rejectConnectProxyAuthentication(clientSocket);
       return;
     }
-    handleConnect(incoming, clientSocket, head, activeMihomoListener);
+    if (route.mode !== "rotate") {
+      clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
+      return;
+    }
+    const lease = scheduler.acquire();
+    if (!lease) {
+      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      return;
+    }
+    clientSocket.once("close", lease.release);
+    handleConnect(incoming, clientSocket, head, lease.candidate.listener);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -207,6 +246,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     close: () => closeServer(server),
     importLocalSubscription,
   };
+}
+
+function localLogicalNodeId(normalizedNodeName: string): string {
+  return `local:${normalizedNodeName}`;
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {
