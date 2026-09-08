@@ -57,11 +57,13 @@ export class TargetReputation {
     this.#pruneExpired(now);
     const expiresAt = now + ttlMs;
     const entries = this.#entries.get(digest) ?? new Map<string, number>();
-    if (!entries.has(feedback.nodeId)) this.#size += 1;
+    if (!entries.has(feedback.nodeId)) {
+      if (this.#size >= this.#maximumEntries) this.#evictSoonest();
+      this.#size += 1;
+    }
     entries.set(feedback.nodeId, expiresAt);
     this.#entries.set(digest, entries);
     this.#pushDeadline({ digest, expiresAt, nodeId: feedback.nodeId });
-    while (this.#size > this.#maximumEntries) this.#evictSoonest();
     if (this.#deadlines.length > this.#maximumEntries * 2) this.#rebuildDeadlines();
     return { expiresAt, nodeId: feedback.nodeId, status: "recorded" };
   }

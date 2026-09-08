@@ -2324,6 +2324,12 @@ test("authorized target feedback is opt-in, temporary, and scoped without leakin
   );
   assert.equal(
     await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
+      "proxy-authorization": basicProxyAuthorization("strict.new-reputation", "proxy-secret"),
+    }),
+    200,
+  );
+  assert.equal(
+    await sendProxyRequest(daemon.address, targetUrl, "GET", "", {
       "proxy-authorization": basicProxyAuthorization("node.local%3Afirst", "proxy-secret"),
     }),
     502,

@@ -58,3 +58,19 @@ test("expired one-time targets are globally reclaimed within a hard capacity", (
     1,
   );
 });
+
+test("a recorded response always retains the newly accepted feedback at capacity", () => {
+  const reputation = new TargetReputation({ maximumEntries: 1, now: () => 0 });
+  reputation.record({ nodeId: "old", outcome: 403, target: "old.example", ttlMs: 60_000 });
+
+  const recorded = reputation.record({
+    nodeId: "new",
+    outcome: 429,
+    target: "new.example",
+    ttlMs: 1,
+  });
+
+  assert.equal(recorded.status, "recorded");
+  assert.equal(reputation.excludedNodeIds("old.example").size, 0);
+  assert.deepEqual([...reputation.excludedNodeIds("new.example")], ["new"]);
+});

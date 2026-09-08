@@ -398,12 +398,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return softStickySessions.acquire(route.sessionKey, excludedIds);
     }
     if (route.mode === "strict") {
-      const lease = softStickySessions.acquireStrict(route.sessionKey);
-      if (lease && excludedIds.has(lease.candidate.id)) {
-        lease.release();
-        return undefined;
-      }
-      return lease;
+      return softStickySessions.acquireStrict(route.sessionKey, excludedIds);
     }
     if (route.mode === "node") {
       const lease = scheduler.acquireBySelector(route.selector);
