@@ -4,16 +4,16 @@ import { join } from "node:path";
 
 import { loadConfig } from "./config.js";
 import { startEgressd } from "./daemon.js";
-import { assertMihomoExecutable } from "./mihomo-install.js";
+import { resolveMihomoBinary } from "./mihomo-install.js";
 import { checkMihomoConfig, ManagedMihomoRuntime } from "./mihomo-runtime.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
-  if (config.mihomoBinary) await assertMihomoExecutable(config.mihomoBinary);
+  const mihomoBinary = await resolveMihomoBinary(config.stateDirectory, config.mihomoBinary);
   const mihomoRuntime =
     config.mihomoListener === undefined
       ? new ManagedMihomoRuntime({
-          ...(config.mihomoBinary === undefined ? {} : { binary: config.mihomoBinary }),
+          binary: mihomoBinary,
           directory: join(config.stateDirectory, "mihomo-runtime"),
         })
       : {
@@ -24,7 +24,8 @@ async function main(): Promise<void> {
             const node = mihomoConfig.proxies[0];
             return new Map(node ? [[node.name, config.mihomoListener as URL]] : []);
           },
-          check: checkMihomoConfig,
+          check: (mihomoConfig: Parameters<typeof checkMihomoConfig>[0]) =>
+            checkMihomoConfig(mihomoConfig, { binary: mihomoBinary }),
           removeListener: async () => {
             throw new Error("the configured external Mihomo listener cannot be removed");
           },

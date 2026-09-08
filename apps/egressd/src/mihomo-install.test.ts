@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,6 +11,7 @@ import {
   assertMihomoExecutable,
   installMihomo,
   MihomoInstallError,
+  resolveMihomoBinary,
   runMihomoInstallCommand,
   supportedMihomoAsset,
 } from "./mihomo-install.js";
@@ -60,6 +61,7 @@ test("installer downloads one pinned official asset, verifies it, and writes an 
       requests.push(String(url));
       return new Response(new Uint8Array(archive));
     },
+    validateExecutable: async () => undefined,
   });
 
   assert.deepEqual(requests, [
@@ -96,4 +98,80 @@ test("installer reports unsupported, download, checksum, and executable errors d
     assertMihomoExecutable(nonExecutable),
     (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
   );
+  await assert.rejects(
+    assertMihomoExecutable(directory),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+  );
+  const invalidExecutable = join(directory, "invalid");
+  await writeFile(invalidExecutable, "not an executable", { mode: 0o700 });
+  await assert.rejects(
+    assertMihomoExecutable(invalidExecutable),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+  );
+});
+
+test("daemon binary resolution discovers the default explicit installation", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-binary-resolution-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const installed = join(stateDirectory, "mihomo", "mihomo");
+  await mkdir(join(stateDirectory, "mihomo"));
+  await writeFile(installed, "binary", { mode: 0o700 });
+
+  assert.equal(
+    await resolveMihomoBinary(stateDirectory, undefined, async () => undefined),
+    installed,
+  );
+  assert.equal(await resolveMihomoBinary(join(stateDirectory, "missing")), "mihomo");
+});
+
+test("bounded downloads and failed executable validation preserve an existing destination", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "egresskit-install-bounds-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const destination = join(directory, "mihomo");
+  await writeFile(destination, "old-binary", { mode: 0o700 });
+  const oversized = gzipSync("new-binary");
+
+  await assert.rejects(
+    installMihomo({
+      asset: {
+        archive: "mihomo-test.gz",
+        sha256: createHash("sha256").update(oversized).digest("hex"),
+      },
+      destination,
+      fetch: async () => new Response(new Uint8Array(oversized)),
+      maximumArchiveBytes: oversized.length - 1,
+    }),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "download-failed",
+  );
+  assert.equal(await readFile(destination, "utf8"), "old-binary");
+
+  await assert.rejects(
+    installMihomo({
+      asset: {
+        archive: "mihomo-test.gz",
+        sha256: createHash("sha256").update(oversized).digest("hex"),
+      },
+      destination,
+      fetch: async () => new Response(new Uint8Array(oversized)),
+      maximumBinaryBytes: 3,
+    }),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "download-failed",
+  );
+  assert.equal(await readFile(destination, "utf8"), "old-binary");
+
+  await assert.rejects(
+    installMihomo({
+      asset: {
+        archive: "mihomo-test.gz",
+        sha256: createHash("sha256").update(oversized).digest("hex"),
+      },
+      destination,
+      fetch: async () => new Response(new Uint8Array(oversized)),
+      validateExecutable: async () => {
+        throw new MihomoInstallError("not-executable", "injected validation failure");
+      },
+    }),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+  );
+  assert.equal(await readFile(destination, "utf8"), "old-binary");
 });
