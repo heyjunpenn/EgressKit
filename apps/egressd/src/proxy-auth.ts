@@ -1,8 +1,137 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
-export type ProxyAuthentication = false | { tokens: readonly string[] };
+export type ProxyAuthentication =
+  | false
+  | { matches(token: string): boolean }
+  | { tokens: readonly string[] };
+
+interface StoredProxyToken {
+  expiresAt?: number;
+  hash: Buffer;
+  id: string;
+}
+
+export interface PersistedProxyToken {
+  expiresAt?: number;
+  hash: string;
+  id: string;
+}
+
+const MAX_PROXY_TOKEN_GRACE_MS = 30 * 24 * 60 * 60 * 1_000;
+
+export class ProxyTokenRegistry {
+  readonly #now: () => number;
+  readonly #tokens = new Map<string, StoredProxyToken>();
+
+  constructor(
+    options: {
+      initialTokens?: readonly string[];
+      now?: () => number;
+      persistedTokens?: readonly PersistedProxyToken[];
+    } = {},
+  ) {
+    this.#now = options.now ?? Date.now;
+    for (const token of options.persistedTokens ?? []) {
+      const hash = Buffer.from(token.hash, "hex");
+      if (hash.length !== 32) {
+        throw new Error("persisted proxy token hash is invalid");
+      }
+      this.#tokens.set(token.id, {
+        ...(token.expiresAt === undefined ? {} : { expiresAt: token.expiresAt }),
+        hash,
+        id: token.id,
+      });
+    }
+    for (const token of options.initialTokens ?? []) {
+      this.add(token);
+    }
+  }
+
+  add(token: string): { id: string; status: "active" } {
+    const hash = tokenHash(token);
+    for (const stored of this.#tokens.values()) {
+      if (timingSafeEqual(stored.hash, hash)) {
+        delete stored.expiresAt;
+        return { id: stored.id, status: "active" };
+      }
+    }
+    const stored: StoredProxyToken = { hash, id: randomUUID() };
+    this.#tokens.set(stored.id, stored);
+    return { id: stored.id, status: "active" };
+  }
+
+  revoke(
+    id: string,
+    graceMs: number,
+  ): { expiresAt: number; status: "grace" } | { status: "revoked" } | undefined {
+    if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > MAX_PROXY_TOKEN_GRACE_MS) {
+      throw new Error("proxy token graceMs is outside the supported range");
+    }
+    const stored = this.#tokens.get(id);
+    if (!stored) {
+      return undefined;
+    }
+    if (graceMs === 0) {
+      this.#tokens.delete(id);
+      return { status: "revoked" };
+    }
+    stored.expiresAt = this.#now() + graceMs;
+    return { expiresAt: stored.expiresAt, status: "grace" };
+  }
+
+  matches(token: string): boolean {
+    this.#removeExpired();
+    if (!token) {
+      return false;
+    }
+    const hash = tokenHash(token);
+    return [...this.#tokens.values()].some((stored) => timingSafeEqual(hash, stored.hash));
+  }
+
+  snapshot(): Array<{ expiresAt?: number; id: string; status: "active" | "grace" }> {
+    this.#removeExpired();
+    return [...this.#tokens.values()].map(({ expiresAt, id }) => ({
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      id,
+      status: expiresAt === undefined ? "active" : "grace",
+    }));
+  }
+
+  persistedSnapshot(): PersistedProxyToken[] {
+    this.#removeExpired();
+    return [...this.#tokens.values()].map(({ expiresAt, hash, id }) => ({
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      hash: hash.toString("hex"),
+      id,
+    }));
+  }
+
+  restore(tokens: readonly PersistedProxyToken[]): void {
+    this.#tokens.clear();
+    for (const token of tokens) {
+      const hash = Buffer.from(token.hash, "hex");
+      if (hash.length !== 32) {
+        throw new Error("persisted proxy token hash is invalid");
+      }
+      this.#tokens.set(token.id, {
+        ...(token.expiresAt === undefined ? {} : { expiresAt: token.expiresAt }),
+        hash,
+        id: token.id,
+      });
+    }
+  }
+
+  #removeExpired(): void {
+    const now = this.#now();
+    for (const [id, stored] of this.#tokens) {
+      if (stored.expiresAt !== undefined && stored.expiresAt <= now) {
+        this.#tokens.delete(id);
+      }
+    }
+  }
+}
 
 export type ProxyRoute =
   | { mode: "rotate" }
@@ -20,7 +149,7 @@ export function authorizeProxyRequest(
   }
   const credentials = parseBasicProxyCredentials(authorization);
   const route = credentials ? parseProxyUsername(credentials.username) : undefined;
-  if (!credentials || !route || !matchesToken(credentials.password, authentication?.tokens ?? [])) {
+  if (!credentials || !route || !matchesAuthentication(credentials.password, authentication)) {
     return undefined;
   }
   return route;
@@ -37,11 +166,27 @@ export function rejectConnectProxyAuthentication(socket: Duplex): void {
   );
 }
 
-function matchesToken(password: string, tokens: readonly string[]): boolean {
-  const passwordHash = createHash("sha256").update(password).digest();
-  return tokens.some((token) =>
-    timingSafeEqual(passwordHash, createHash("sha256").update(token).digest()),
+function matchesAuthentication(
+  password: string,
+  authentication: Exclude<ProxyAuthentication, false> | undefined,
+): boolean {
+  if (!password) {
+    return false;
+  }
+  if (authentication && "matches" in authentication) {
+    return authentication.matches(password);
+  }
+  const passwordHash = tokenHash(password);
+  return (authentication?.tokens ?? []).some((token) =>
+    timingSafeEqual(passwordHash, tokenHash(token)),
   );
+}
+
+function tokenHash(token: string): Buffer {
+  if (!token) {
+    throw new Error("proxy token must not be empty");
+  }
+  return createHash("sha256").update(token).digest();
 }
 
 function parseBasicProxyCredentials(
