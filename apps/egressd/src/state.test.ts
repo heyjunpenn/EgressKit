@@ -44,7 +44,7 @@ test("control state restores the last active subscription revision and node gene
   t.after(() => reopened.close());
   const restored = reopened.loadActiveRevision();
   assert.deepEqual(restored, saved);
-  assert.equal(restored?.revisionId, 1);
+  assert.equal(restored?.runtimeRevisionId, 1);
   assert.equal(restored?.source.kind, "local");
   assert.deepEqual(restored?.nodes, [
     {

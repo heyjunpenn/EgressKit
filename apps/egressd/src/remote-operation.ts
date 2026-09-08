@@ -60,10 +60,10 @@ export class RemoteOperationRunner {
     });
   }
 
-  enqueueForce(operationId: string, revisionId: number): void {
+  enqueueForce(operationId: string, subscriptionRevisionId: number): void {
     setImmediate(() => {
       this.#queue = this.#queue
-        .then(() => this.#processForce(operationId, revisionId))
+        .then(() => this.#processForce(operationId, subscriptionRevisionId))
         .catch(() => undefined);
     });
   }
@@ -83,10 +83,10 @@ export class RemoteOperationRunner {
     let stage: OperationProcessingStage = "queued";
     try {
       const operation = this.#options.state.getOperation(operationId);
-      if (operation?.revisionId === undefined) {
+      if (operation?.subscriptionRevisionId === undefined) {
         throw new Error(`subscription revision not found for operation: ${operationId}`);
       }
-      const revisionId = operation.revisionId;
+      const subscriptionRevisionId = operation.subscriptionRevisionId;
       const subscription = this.#options.state.getSubscription(subscriptionId);
       if (subscription?.kind !== "remote") {
         throw new Error(`remote subscription not found: ${subscriptionId}`);
@@ -94,25 +94,28 @@ export class RemoteOperationRunner {
       stage = "fetching";
       this.#options.state.transitionOperation(operationId, stage);
       const source = await this.#downloadWithRetries(subscription.locator);
-      this.#options.state.advanceRevision(revisionId, "downloaded");
+      this.#options.state.advanceRevision(subscriptionRevisionId, "downloaded");
       if (this.#shuttingDown) {
         return;
       }
       stage = "parsing";
       this.#options.state.transitionOperation(operationId, stage);
       parse(source);
-      this.#options.state.advanceRevision(revisionId, "parsed");
+      this.#options.state.advanceRevision(subscriptionRevisionId, "parsed");
       stage = "validating";
       this.#options.state.transitionOperation(operationId, stage);
       const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
-      this.#options.state.saveValidatedRevision(revisionId, revision);
+      this.#options.state.saveValidatedRevision(subscriptionRevisionId, revision);
       const suspiciousReason = this.#suspiciousReason(revision, subscription.id);
       if (suspiciousReason) {
-        this.#options.state.markRevisionSuspicious(revisionId, suspiciousReason);
-        this.#options.state.transitionOperation(operationId, "succeeded");
+        this.#options.state.markRevisionSuspicious(
+          subscriptionRevisionId,
+          operationId,
+          suspiciousReason,
+        );
         return;
       }
-      await this.#apply(operationId, revisionId, revision, subscription, (next) => {
+      await this.#apply(operationId, subscriptionRevisionId, revision, subscription, (next) => {
         stage = next;
       });
     } catch (error) {
@@ -122,20 +125,26 @@ export class RemoteOperationRunner {
     }
   }
 
-  async #processForce(operationId: string, revisionId: number): Promise<void> {
+  async #processForce(operationId: string, subscriptionRevisionId: number): Promise<void> {
     let stage: OperationProcessingStage = "queued";
     try {
-      const revision = this.#options.state.getRevision(revisionId);
-      if (!revision?.imported) {
-        throw new Error(`subscription revision not found: ${revisionId}`);
+      const revision = this.#options.state.getRevision(subscriptionRevisionId);
+      if (!revision?.imported || revision.status !== "suspicious" || !revision.forced) {
+        throw new Error(`subscription revision is not pending force: ${subscriptionRevisionId}`);
       }
       const subscription = this.#options.state.getSubscription(revision.subscriptionId);
       if (subscription?.kind !== "remote") {
         throw new Error(`remote subscription not found: ${revision.subscriptionId}`);
       }
-      await this.#apply(operationId, revisionId, revision.imported, subscription, (next) => {
-        stage = next;
-      });
+      await this.#apply(
+        operationId,
+        subscriptionRevisionId,
+        revision.imported,
+        subscription,
+        (next) => {
+          stage = next;
+        },
+      );
     } catch (error) {
       if (!this.#shuttingDown) {
         this.#options.state.failOperation(operationId, stage, operationFailureReason(stage, error));
@@ -145,7 +154,7 @@ export class RemoteOperationRunner {
 
   async #apply(
     operationId: string,
-    revisionId: number,
+    subscriptionRevisionId: number,
     revision: ImportedVlessRevision,
     subscription: SubscriptionIdentity,
     setStage: (stage: OperationProcessingStage) => void,
@@ -154,9 +163,8 @@ export class RemoteOperationRunner {
     this.#options.state.transitionOperation(operationId, "applying");
     await this.#options.activateRevision(revision, subscription, () => {
       if (!this.#shuttingDown) {
-        this.#options.state.advanceRevision(revisionId, "accepted");
+        this.#options.state.markRevisionAccepted(subscriptionRevisionId, operationId);
         setStage("checking");
-        this.#options.state.transitionOperation(operationId, "checking");
       }
     });
     if (this.#shuttingDown) {
@@ -164,11 +172,10 @@ export class RemoteOperationRunner {
     }
     this.#options.state.saveActiveRevision({
       imported: revision,
-      revisionId,
+      operationId,
       source: subscription,
+      subscriptionRevisionId,
     });
-    this.#options.state.advanceRevision(revisionId, "ready");
-    this.#options.state.transitionOperation(operationId, "succeeded");
   }
 
   #suspiciousReason(revision: ImportedVlessRevision, subscriptionId: string): string | undefined {

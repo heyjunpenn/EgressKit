@@ -22,7 +22,11 @@ import {
   validateRemoteSubscriptionTimeout,
 } from "./remote-operation.js";
 import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
-import { openControlState, type PersistedNodeGeneration } from "./state.js";
+import {
+  openControlState,
+  type PersistedNodeGeneration,
+  RevisionForceConflictError,
+} from "./state.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -229,7 +233,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         .then((body) => parseRemoteSubscriptionRequest(body))
         .then((url) => state.createRemoteSubscription(url))
         .then((created) => {
-          writeJson(response, 202, { ...created, status: "queued" });
+          writeJson(response, 202, {
+            operationId: created.operationId,
+            revisionId: created.subscriptionRevisionId,
+            status: "queued",
+            subscriptionId: created.subscriptionId,
+          });
           remoteOperations?.enqueue(created.operationId, created.subscriptionId);
         })
         .catch((error: unknown) => {
@@ -255,7 +264,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(operation.failure ? { failure: operation.failure } : {}),
         history: operation.history,
         operationId: operation.id,
-        ...(operation.revisionId === undefined ? {} : { revisionId: operation.revisionId }),
+        ...(operation.subscriptionRevisionId === undefined
+          ? {}
+          : { revisionId: operation.subscriptionRevisionId }),
         status: operation.status,
         subscriptionId: operation.subscriptionId,
       });
@@ -277,7 +288,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         forced: revision.forced,
         history: revision.history,
         nodeCount: revision.nodeCount,
-        revisionId: revision.id,
+        revisionId: revision.subscriptionRevisionId,
         status: revision.status,
         subscriptionId: revision.subscriptionId,
         ...(revision.suspiciousReason === undefined
@@ -301,13 +312,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         const operation = state.createForceOperation(Number(forceRevisionMatch[1]));
         writeJson(response, 202, {
           operationId: operation.id,
-          revisionId: operation.revisionId,
+          revisionId: operation.subscriptionRevisionId,
           status: operation.status,
           subscriptionId: operation.subscriptionId,
         });
-        remoteOperations.enqueueForce(operation.id, operation.revisionId as number);
+        remoteOperations.enqueueForce(operation.id, operation.subscriptionRevisionId as number);
       } catch (error) {
-        writeJson(response, 404, {
+        writeJson(response, error instanceof RevisionForceConflictError ? 409 : 404, {
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -328,7 +339,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         const operation = state.createRefreshOperation(refreshMatch[1] as string);
         writeJson(response, 202, {
           operationId: operation.id,
-          revisionId: operation.revisionId,
+          revisionId: operation.subscriptionRevisionId,
           status: operation.status,
           subscriptionId: operation.subscriptionId,
         });

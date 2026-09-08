@@ -23,7 +23,7 @@ export interface PersistedNodeGeneration {
 export interface PersistedActiveRevision {
   imported: ImportedVlessRevision;
   nodes: PersistedNodeGeneration[];
-  revisionId: number;
+  runtimeRevisionId: number;
   source: SubscriptionIdentity;
 }
 
@@ -40,7 +40,7 @@ export type SubscriptionRevisionStatus =
 export interface PersistedSubscriptionRevision {
   forced: boolean;
   history: SubscriptionRevisionStatus[];
-  id: number;
+  subscriptionRevisionId: number;
   imported?: ImportedVlessRevision;
   nodeCount: number;
   status: SubscriptionRevisionStatus;
@@ -68,33 +68,35 @@ export interface SubscriptionOperation {
   failure?: { reason: string; stage: OperationProcessingStage };
   history: OperationStatus[];
   id: string;
-  revisionId?: number;
+  subscriptionRevisionId?: number;
   status: OperationStatus;
   subscriptionId: string;
 }
 
 export interface ControlState {
-  advanceRevision(revisionId: number, status: SubscriptionRevisionStatus): void;
-  createForceOperation(revisionId: number): SubscriptionOperation;
+  advanceRevision(subscriptionRevisionId: number, status: SubscriptionRevisionStatus): void;
+  createForceOperation(subscriptionRevisionId: number): SubscriptionOperation;
   createRefreshOperation(subscriptionId: string): SubscriptionOperation;
   createRemoteSubscription(locator: string): {
     operationId: string;
-    revisionId: number;
+    subscriptionRevisionId: number;
     subscriptionId: string;
   };
   databasePath: string;
   failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
-  getRevision(revisionId: number): PersistedSubscriptionRevision | undefined;
+  getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
   loadActiveRevision(): PersistedActiveRevision | undefined;
   saveActiveRevision(input: {
     imported: ImportedVlessRevision;
-    revisionId?: number;
+    operationId?: string;
     source: SubscriptionIdentity;
+    subscriptionRevisionId?: number;
   }): PersistedActiveRevision;
-  saveValidatedRevision(revisionId: number, imported: ImportedVlessRevision): void;
-  markRevisionSuspicious(revisionId: number, reason: string): void;
+  saveValidatedRevision(subscriptionRevisionId: number, imported: ImportedVlessRevision): void;
+  markRevisionAccepted(subscriptionRevisionId: number, operationId: string): void;
+  markRevisionSuspicious(subscriptionRevisionId: number, operationId: string, reason: string): void;
   settings(): {
     busyTimeoutMs: number;
     foreignKeys: number;
@@ -131,8 +133,10 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
 
   let closed = false;
   return {
-    advanceRevision: (revisionId, status) => advanceRevision(controlDatabase, revisionId, status),
-    createForceOperation: (revisionId) => createForceOperation(controlDatabase, revisionId),
+    advanceRevision: (subscriptionRevisionId, status) =>
+      advanceRevision(controlDatabase, subscriptionRevisionId, status),
+    createForceOperation: (subscriptionRevisionId) =>
+      createForceOperation(controlDatabase, subscriptionRevisionId),
     createRefreshOperation: (subscriptionId) =>
       createRefreshOperation(controlDatabase, subscriptionId),
     createRemoteSubscription: (locator) => createRemoteSubscription(controlDatabase, locator),
@@ -140,14 +144,16 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     failOperation: (operationId, stage, reason) =>
       failOperation(controlDatabase, operationId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
-    getRevision: (revisionId) => getRevision(controlDatabase, revisionId),
+    getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
-    saveValidatedRevision: (revisionId, imported) =>
-      saveValidatedRevision(controlDatabase, revisionId, imported),
-    markRevisionSuspicious: (revisionId, reason) =>
-      markRevisionSuspicious(controlDatabase, revisionId, reason),
+    saveValidatedRevision: (subscriptionRevisionId, imported) =>
+      saveValidatedRevision(controlDatabase, subscriptionRevisionId, imported),
+    markRevisionAccepted: (subscriptionRevisionId, operationId) =>
+      markRevisionAccepted(controlDatabase, subscriptionRevisionId, operationId),
+    markRevisionSuspicious: (subscriptionRevisionId, operationId, reason) =>
+      markRevisionSuspicious(controlDatabase, subscriptionRevisionId, operationId, reason),
     settings: () => ({
       busyTimeoutMs: (controlDatabase.prepare("PRAGMA busy_timeout").get() as { timeout: number })
         .timeout,
@@ -295,7 +301,7 @@ function ensureColumn(
 function createRemoteSubscription(
   database: DatabaseSync,
   locator: string,
-): { operationId: string; revisionId: number; subscriptionId: string } {
+): { operationId: string; subscriptionId: string; subscriptionRevisionId: number } {
   const subscriptionId = randomUUID();
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
@@ -303,10 +309,10 @@ function createRemoteSubscription(
     database
       .prepare("INSERT INTO subscriptions (id, kind, locator) VALUES (?, 'remote', ?)")
       .run(subscriptionId, locator);
-    const revisionId = insertPendingRevision(database, subscriptionId);
-    insertOperation(database, operationId, subscriptionId, revisionId);
+    const subscriptionRevisionId = insertPendingRevision(database, subscriptionId);
+    insertOperation(database, operationId, subscriptionId, subscriptionRevisionId);
     database.exec("COMMIT");
-    return { operationId, revisionId, subscriptionId };
+    return { operationId, subscriptionId, subscriptionRevisionId };
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -324,8 +330,8 @@ function createRefreshOperation(
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
   try {
-    const revisionId = insertPendingRevision(database, subscriptionId);
-    insertOperation(database, operationId, subscriptionId, revisionId);
+    const subscriptionRevisionId = insertPendingRevision(database, subscriptionId);
+    insertOperation(database, operationId, subscriptionId, subscriptionRevisionId);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -334,16 +340,37 @@ function createRefreshOperation(
   return getOperation(database, operationId) as SubscriptionOperation;
 }
 
-function createForceOperation(database: DatabaseSync, revisionId: number): SubscriptionOperation {
-  const revision = getRevision(database, revisionId);
-  if (revision?.status !== "suspicious" || !revision.imported) {
-    throw new Error(`suspicious revision not found: ${revisionId}`);
-  }
+export class RevisionForceConflictError extends Error {}
+
+function createForceOperation(
+  database: DatabaseSync,
+  subscriptionRevisionId: number,
+): SubscriptionOperation {
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
   try {
-    database.prepare("UPDATE subscription_revisions SET forced = 1 WHERE id = ?").run(revisionId);
-    insertOperation(database, operationId, revision.subscriptionId, revisionId);
+    const claimed = database
+      .prepare(
+        `UPDATE subscription_revisions SET forced = 1
+         WHERE id = ? AND lifecycle_status = 'suspicious' AND forced = 0`,
+      )
+      .run(subscriptionRevisionId);
+    if (claimed.changes !== 1) {
+      const exists = database
+        .prepare("SELECT 1 FROM subscription_revisions WHERE id = ?")
+        .get(subscriptionRevisionId);
+      if (exists) {
+        throw new RevisionForceConflictError(
+          `revision is not available for force: ${subscriptionRevisionId}`,
+        );
+      }
+      throw new Error(`suspicious revision not found: ${subscriptionRevisionId}`);
+    }
+    const revision = getRevision(database, subscriptionRevisionId);
+    if (!revision?.imported) {
+      throw new Error(`suspicious revision not found: ${subscriptionRevisionId}`);
+    }
+    insertOperation(database, operationId, revision.subscriptionId, subscriptionRevisionId);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -361,18 +388,18 @@ function insertPendingRevision(database: DatabaseSync, subscriptionId: string): 
        VALUES (?, '[]', 'saved', ?)`,
     )
     .run(subscriptionId, now);
-  const revisionId = Number(inserted.lastInsertRowid);
+  const subscriptionRevisionId = Number(inserted.lastInsertRowid);
   database
     .prepare("INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, 'saved', ?)")
-    .run(revisionId, now);
-  return revisionId;
+    .run(subscriptionRevisionId, now);
+  return subscriptionRevisionId;
 }
 
 function insertOperation(
   database: DatabaseSync,
   operationId: string,
   subscriptionId: string,
-  revisionId: number,
+  subscriptionRevisionId: number,
 ): void {
   const now = new Date().toISOString();
   database
@@ -389,7 +416,7 @@ function insertOperation(
     .run(operationId, now);
   database
     .prepare("INSERT INTO operation_revisions (operation_id, revision_id) VALUES (?, ?)")
-    .run(operationId, revisionId);
+    .run(operationId, subscriptionRevisionId);
 }
 
 function getSubscription(
@@ -436,7 +463,7 @@ function getOperation(
       : {}),
     history: history.map((event) => event.status),
     id: row.id,
-    ...(row.revision_id === null ? {} : { revisionId: row.revision_id }),
+    ...(row.revision_id === null ? {} : { subscriptionRevisionId: row.revision_id }),
     status: row.status,
     subscriptionId: row.subscription_id,
   };
@@ -444,7 +471,7 @@ function getOperation(
 
 function getRevision(
   database: DatabaseSync,
-  revisionId: number,
+  subscriptionRevisionId: number,
 ): PersistedSubscriptionRevision | undefined {
   const row = database
     .prepare(
@@ -452,7 +479,7 @@ function getRevision(
               lifecycle_status, suspicious_reason, forced
        FROM subscription_revisions WHERE id = ?`,
     )
-    .get(revisionId) as
+    .get(subscriptionRevisionId) as
     | {
         forced: number;
         id: number;
@@ -469,11 +496,11 @@ function getRevision(
   const nodes = JSON.parse(row.normalized_nodes_json) as NormalizedVlessNode[];
   const history = database
     .prepare("SELECT status FROM revision_events WHERE revision_id = ? ORDER BY id")
-    .all(revisionId) as Array<{ status: SubscriptionRevisionStatus }>;
+    .all(subscriptionRevisionId) as Array<{ status: SubscriptionRevisionStatus }>;
   return {
     forced: row.forced === 1,
     history: history.map((event) => event.status),
-    id: row.id,
+    subscriptionRevisionId: row.id,
     ...(row.mihomo_config_json === null
       ? {}
       : {
@@ -493,21 +520,12 @@ function getRevision(
 
 function advanceRevision(
   database: DatabaseSync,
-  revisionId: number,
+  subscriptionRevisionId: number,
   status: SubscriptionRevisionStatus,
 ): void {
-  const now = new Date().toISOString();
   database.exec("BEGIN IMMEDIATE");
   try {
-    const result = database
-      .prepare("UPDATE subscription_revisions SET lifecycle_status = ? WHERE id = ?")
-      .run(status, revisionId);
-    if (result.changes !== 1) {
-      throw new Error(`subscription revision not found: ${revisionId}`);
-    }
-    database
-      .prepare("INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, ?, ?)")
-      .run(revisionId, status, now);
+    writeRevisionStatus(database, subscriptionRevisionId, status, new Date().toISOString());
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -517,30 +535,89 @@ function advanceRevision(
 
 function saveValidatedRevision(
   database: DatabaseSync,
-  revisionId: number,
+  subscriptionRevisionId: number,
   imported: ImportedVlessRevision,
 ): void {
-  const result = database
-    .prepare(
-      `UPDATE subscription_revisions
-       SET normalized_nodes_json = ?, mihomo_config_json = ?
-       WHERE id = ?`,
-    )
-    .run(JSON.stringify(imported.nodes), JSON.stringify(imported.mihomoConfig), revisionId);
-  if (result.changes !== 1) {
-    throw new Error(`subscription revision not found: ${revisionId}`);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database
+      .prepare(
+        `UPDATE subscription_revisions
+         SET normalized_nodes_json = ?, mihomo_config_json = ?
+         WHERE id = ?`,
+      )
+      .run(
+        JSON.stringify(imported.nodes),
+        JSON.stringify(imported.mihomoConfig),
+        subscriptionRevisionId,
+      );
+    if (result.changes !== 1) {
+      throw new Error(`subscription revision not found: ${subscriptionRevisionId}`);
+    }
+    writeRevisionStatus(database, subscriptionRevisionId, "validated", new Date().toISOString());
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
   }
-  advanceRevision(database, revisionId, "validated");
 }
 
-function markRevisionSuspicious(database: DatabaseSync, revisionId: number, reason: string): void {
-  const result = database
-    .prepare("UPDATE subscription_revisions SET suspicious_reason = ? WHERE id = ?")
-    .run(reason, revisionId);
-  if (result.changes !== 1) {
-    throw new Error(`subscription revision not found: ${revisionId}`);
+function markRevisionAccepted(
+  database: DatabaseSync,
+  subscriptionRevisionId: number,
+  operationId: string,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    writeRevisionStatus(database, subscriptionRevisionId, "accepted", now);
+    writeOperationStatus(database, operationId, "checking", now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
   }
-  advanceRevision(database, revisionId, "suspicious");
+}
+
+function markRevisionSuspicious(
+  database: DatabaseSync,
+  subscriptionRevisionId: number,
+  operationId: string,
+  reason: string,
+): void {
+  const now = new Date().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = database
+      .prepare("UPDATE subscription_revisions SET suspicious_reason = ? WHERE id = ?")
+      .run(reason, subscriptionRevisionId);
+    if (result.changes !== 1) {
+      throw new Error(`subscription revision not found: ${subscriptionRevisionId}`);
+    }
+    writeRevisionStatus(database, subscriptionRevisionId, "suspicious", now);
+    writeOperationStatus(database, operationId, "succeeded", now);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function writeRevisionStatus(
+  database: DatabaseSync,
+  subscriptionRevisionId: number,
+  status: SubscriptionRevisionStatus,
+  now: string,
+): void {
+  const result = database
+    .prepare("UPDATE subscription_revisions SET lifecycle_status = ? WHERE id = ?")
+    .run(status, subscriptionRevisionId);
+  if (result.changes !== 1) {
+    throw new Error(`subscription revision not found: ${subscriptionRevisionId}`);
+  }
+  database
+    .prepare("INSERT INTO revision_events (revision_id, status, created_at) VALUES (?, ?, ?)")
+    .run(subscriptionRevisionId, status, now);
 }
 
 function transitionOperation(
@@ -551,23 +628,32 @@ function transitionOperation(
   const now = new Date().toISOString();
   database.exec("BEGIN IMMEDIATE");
   try {
-    const result = database
-      .prepare(
-        `UPDATE operations SET status = ?, updated_at = ?
-         WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
-      )
-      .run(status, now, operationId);
-    if (result.changes !== 1) {
-      throw new Error(`operation is missing or already terminal: ${operationId}`);
-    }
-    database
-      .prepare("INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, ?, ?)")
-      .run(operationId, status, now);
+    writeOperationStatus(database, operationId, status, now);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
   }
+}
+
+function writeOperationStatus(
+  database: DatabaseSync,
+  operationId: string,
+  status: OperationStatus,
+  now: string,
+): void {
+  const result = database
+    .prepare(
+      `UPDATE operations SET status = ?, updated_at = ?
+       WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'interrupted')`,
+    )
+    .run(status, now, operationId);
+  if (result.changes !== 1) {
+    throw new Error(`operation is missing or already terminal: ${operationId}`);
+  }
+  database
+    .prepare("INSERT INTO operation_events (operation_id, status, created_at) VALUES (?, ?, ?)")
+    .run(operationId, status, now);
 }
 
 function failOperation(
@@ -614,8 +700,9 @@ function saveActiveRevision(
   database: DatabaseSync,
   input: {
     imported: ImportedVlessRevision;
-    revisionId?: number;
+    operationId?: string;
     source: SubscriptionIdentity;
+    subscriptionRevisionId?: number;
   },
 ): PersistedActiveRevision {
   const nodes = input.imported.nodes.map((node) => {
@@ -642,7 +729,7 @@ function saveActiveRevision(
       )
       .run(input.source.id, input.source.kind, input.source.locator);
     const subscriptionRevisionId =
-      input.revisionId ??
+      input.subscriptionRevisionId ??
       Number(
         database
           .prepare(
@@ -658,10 +745,10 @@ function saveActiveRevision(
             new Date().toISOString(),
           ).lastInsertRowid,
       );
-    if (input.revisionId !== undefined) {
-      const revision = getRevision(database, input.revisionId);
+    if (input.subscriptionRevisionId !== undefined) {
+      const revision = getRevision(database, input.subscriptionRevisionId);
       if (!revision || revision.subscriptionId !== input.source.id) {
-        throw new Error(`subscription revision not found: ${input.revisionId}`);
+        throw new Error(`subscription revision not found: ${input.subscriptionRevisionId}`);
       }
     } else {
       database
@@ -694,11 +781,19 @@ function saveActiveRevision(
          VALUES (?, ?, 'active')`,
       )
       .run(subscriptionRevisionId, JSON.stringify(input.imported.mihomoConfig));
+    if (input.subscriptionRevisionId !== undefined) {
+      if (input.operationId === undefined) {
+        throw new Error("remote revision activation requires an operation");
+      }
+      const now = new Date().toISOString();
+      writeRevisionStatus(database, subscriptionRevisionId, "ready", now);
+      writeOperationStatus(database, input.operationId, "succeeded", now);
+    }
     database.exec("COMMIT");
     return {
       imported: input.imported,
       nodes,
-      revisionId: Number(insertedRuntime.lastInsertRowid),
+      runtimeRevisionId: Number(insertedRuntime.lastInsertRowid),
       source: input.source,
     };
   } catch (error) {
@@ -760,7 +855,7 @@ function loadActiveRevision(database: DatabaseSync): PersistedActiveRevision | u
       logicalId: node.logical_id,
       node: JSON.parse(node.normalized_node_json) as NormalizedVlessNode,
     })),
-    revisionId: row.revision_id,
+    runtimeRevisionId: row.revision_id,
     source: {
       id: row.source_id,
       kind: row.source_kind,

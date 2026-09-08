@@ -647,12 +647,18 @@ test("revision layers remain distinct and a suspicious zero-node candidate requi
   assert.equal(unauthorizedForce.status, 401);
   assert.equal(applied.length, 0);
 
-  const forced = await adminJson(
-    daemon.address,
-    `/revisions/${evaluated.body.revisionId as number}/force`,
-    { method: "POST" },
-  );
-  assert.equal(forced.status, 202);
+  const forceAttempts = await Promise.all([
+    adminJson(daemon.address, `/revisions/${evaluated.body.revisionId as number}/force`, {
+      method: "POST",
+    }),
+    adminJson(daemon.address, `/revisions/${evaluated.body.revisionId as number}/force`, {
+      method: "POST",
+    }),
+  ]);
+  assert.deepEqual(forceAttempts.map((attempt) => attempt.status).sort(), [202, 409]);
+  const forced = forceAttempts.find(
+    (attempt) => attempt.status === 202,
+  ) as (typeof forceAttempts)[0];
   const forcedOperation = await waitForTerminalOperation(
     daemon.address,
     forced.body.operationId as string,
