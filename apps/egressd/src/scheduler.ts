@@ -80,19 +80,34 @@ export class RotateScheduler {
       state.currentWeight > best.currentWeight ? state : best,
     );
     selected.currentWeight -= totalWeight;
-    selected.leasedConnections += 1;
-
-    let released = false;
-    return {
-      candidate: selected.candidate,
-      release: () => {
-        if (!released) {
-          released = true;
-          selected.leasedConnections -= 1;
-        }
-      },
-    };
+    return lease(selected);
   }
+
+  acquireById(id: string): SchedulerLease | undefined {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (
+      !state?.candidate.healthy ||
+      state.candidate.manualWeight <= 0 ||
+      state.candidate.successRate <= 0
+    ) {
+      return undefined;
+    }
+    return lease(state);
+  }
+}
+
+function lease(state: CandidateState): SchedulerLease {
+  state.leasedConnections += 1;
+  let released = false;
+  return {
+    candidate: state.candidate,
+    release: () => {
+      if (!released) {
+        released = true;
+        state.leasedConnections -= 1;
+      }
+    },
+  };
 }
 
 function effectiveWeight(state: CandidateState): number {

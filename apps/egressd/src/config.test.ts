@@ -83,3 +83,33 @@ test("minimum subscription nodes is a positive configurable integer", () => {
     );
   }
 });
+
+test("session resource limits and expirations are configurable positive integers", () => {
+  assert.deepEqual(
+    loadConfig({
+      EGRESSKIT_MAX_ACTIVE_SESSIONS: "100",
+      EGRESSKIT_SESSION_ABSOLUTE_TTL_MS: "1800000",
+      EGRESSKIT_SESSION_IDLE_TIMEOUT_MS: "300000",
+      EGRESSKIT_SESSION_MAX_CONCURRENT_CONNECTIONS: "50",
+    }),
+    {
+      host: "127.0.0.1",
+      port: 8787,
+      proxyAuthentication: { tokens: [] },
+      sessionAbsoluteTtlMs: 1_800_000,
+      sessionIdleTimeoutMs: 300_000,
+      sessionMaximumActiveSessions: 100,
+      sessionMaximumConcurrentConnections: 50,
+      stateDirectory: join(homedir(), ".local", "state", "egresskit"),
+    },
+  );
+
+  for (const name of [
+    "EGRESSKIT_MAX_ACTIVE_SESSIONS",
+    "EGRESSKIT_SESSION_ABSOLUTE_TTL_MS",
+    "EGRESSKIT_SESSION_IDLE_TIMEOUT_MS",
+    "EGRESSKIT_SESSION_MAX_CONCURRENT_CONNECTIONS",
+  ]) {
+    assert.throws(() => loadConfig({ [name]: "0" }), /positive integer/);
+  }
+});

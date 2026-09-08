@@ -12,6 +12,7 @@ import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import {
   authorizeProxyRequest,
   type ProxyAuthentication,
+  type ProxyRoute,
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
@@ -21,7 +22,18 @@ import {
   validateMinimumSubscriptionNodes,
   validateRemoteSubscriptionTimeout,
 } from "./remote-operation.js";
-import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
+import {
+  createSchedulerCandidate,
+  RotateScheduler,
+  type SchedulerLease,
+  type SchedulerSignals,
+} from "./scheduler.js";
+import {
+  type SessionBindingStore,
+  SessionCapacityError,
+  type SessionClock,
+  SoftStickySessions,
+} from "./session.js";
 import {
   openControlState,
   type PersistedNodeGeneration,
@@ -48,6 +60,12 @@ export interface EgressdOptions {
   remoteSubscriptionTimeoutMs?: number;
   remoteOperationClock?: RemoteOperationClock;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
+  sessionAbsoluteTtlMs?: number;
+  sessionBindingStore?: SessionBindingStore;
+  sessionClock?: SessionClock;
+  sessionIdleTimeoutMs?: number;
+  sessionMaximumActiveSessions?: number;
+  sessionMaximumConcurrentConnections?: number;
   stateDirectory?: string;
 }
 
@@ -106,6 +124,43 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       : [],
   );
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  let softStickySessions: SoftStickySessions;
+  try {
+    softStickySessions = new SoftStickySessions({
+      ...(options.sessionAbsoluteTtlMs === undefined
+        ? {}
+        : { absoluteTtlMs: options.sessionAbsoluteTtlMs }),
+      ...(options.sessionClock === undefined ? {} : { clock: options.sessionClock }),
+      ...(options.sessionIdleTimeoutMs === undefined
+        ? {}
+        : { idleTimeoutMs: options.sessionIdleTimeoutMs }),
+      ...(options.sessionMaximumActiveSessions === undefined
+        ? {}
+        : { maximumActiveSessions: options.sessionMaximumActiveSessions }),
+      ...(options.sessionMaximumConcurrentConnections === undefined
+        ? {}
+        : { maximumConcurrentConnections: options.sessionMaximumConcurrentConnections }),
+      scheduler,
+      ...(options.sessionBindingStore === undefined
+        ? state === undefined
+          ? {}
+          : { store: state }
+        : { store: options.sessionBindingStore }),
+    });
+  } catch (error) {
+    await state?.close();
+    throw error;
+  }
+
+  const acquireRoute = (route: ProxyRoute) => {
+    if (route.mode === "rotate") {
+      return scheduler.acquire();
+    }
+    if (route.mode === "sticky") {
+      return softStickySessions.acquire(route.sessionKey);
+    }
+    return "not-implemented" as const;
+  };
 
   const activateRevision = async (
     revision: ImportedVlessRevision,
@@ -360,18 +415,29 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       rejectHttpProxyAuthentication(response);
       return;
     }
-    if (route.mode !== "rotate") {
-      response.writeHead(501);
-      response.end();
-      return;
-    }
-
     if (!isAbsoluteHttpUrl(incoming.url)) {
       response.writeHead(400);
       response.end();
       return;
     }
-    const lease = scheduler.acquire();
+    let lease: SchedulerLease | "not-implemented" | undefined;
+    try {
+      lease = acquireRoute(route);
+    } catch (error) {
+      if (error instanceof SessionCapacityError) {
+        response.writeHead(429);
+        response.end();
+        return;
+      }
+      response.writeHead(503);
+      response.end();
+      return;
+    }
+    if (lease === "not-implemented") {
+      response.writeHead(501);
+      response.end();
+      return;
+    }
     if (!lease) {
       response.writeHead(502);
       response.end();
@@ -414,11 +480,21 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       rejectConnectProxyAuthentication(clientSocket);
       return;
     }
-    if (route.mode !== "rotate") {
+    let lease: SchedulerLease | "not-implemented" | undefined;
+    try {
+      lease = acquireRoute(route);
+    } catch (error) {
+      if (error instanceof SessionCapacityError) {
+        clientSocket.end("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+        return;
+      }
+      clientSocket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      return;
+    }
+    if (lease === "not-implemented") {
       clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
       return;
     }
-    const lease = scheduler.acquire();
     if (!lease) {
       clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       return;

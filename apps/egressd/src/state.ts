@@ -1,8 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-
+import type { PersistedSessionBinding, SessionBindingStore } from "./session.js";
 import type { ImportedVlessRevision, NormalizedVlessNode } from "./subscription.js";
 
 const SQLITE_BUSY = 5;
@@ -74,7 +74,7 @@ export interface SubscriptionOperation {
   subscriptionId: string;
 }
 
-export interface ControlState {
+export interface ControlState extends SessionBindingStore {
   advanceRevision(subscriptionRevisionId: number, status: SubscriptionRevisionStatus): void;
   createForceOperation(subscriptionRevisionId: number): SubscriptionOperation;
   createRefreshOperation(subscriptionId: string): SubscriptionOperation;
@@ -147,18 +147,31 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     createRefreshOperation: (subscriptionId) =>
       createRefreshOperation(controlDatabase, subscriptionId),
     createRemoteSubscription: (locator) => createRemoteSubscription(controlDatabase, locator),
+    countSessionBindings: () => countSessionBindings(controlDatabase),
     databasePath,
+    deleteExpiredSessionBindings: (now, absoluteTtlMs, idleTimeoutMs, activeIdentities) =>
+      deleteExpiredSessionBindings(
+        controlDatabase,
+        now,
+        absoluteTtlMs,
+        idleTimeoutMs,
+        activeIdentities,
+      ),
     failOperation: (operationId, stage, reason) =>
       failOperation(controlDatabase, operationId, stage, reason),
     failForceOperation: (operationId, subscriptionRevisionId, stage, reason) =>
       failForceOperation(controlDatabase, operationId, subscriptionRevisionId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
+    getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
+    loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
     saveValidatedRevision: (subscriptionRevisionId, imported) =>
       saveValidatedRevision(controlDatabase, subscriptionRevisionId, imported),
+    saveSessionBinding: (identity, binding) =>
+      saveSessionBinding(controlDatabase, identity, binding),
     markRevisionAccepted: (subscriptionRevisionId, operationId) =>
       markRevisionAccepted(controlDatabase, subscriptionRevisionId, operationId),
     markRevisionSuspicious: (subscriptionRevisionId, operationId, reason) =>
@@ -177,6 +190,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     }),
     transitionOperation: (operationId, status) =>
       transitionOperation(controlDatabase, operationId, status),
+    touchSessionBinding: (identity, lastUsedAt) =>
+      touchSessionBinding(controlDatabase, identity, lastUsedAt),
     close: async () => {
       if (closed) {
         return;
@@ -189,6 +204,91 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       }
     },
   };
+}
+
+function countSessionBindings(database: DatabaseSync): number {
+  return (
+    database.prepare("SELECT COUNT(*) AS count FROM session_bindings").get() as { count: number }
+  ).count;
+}
+
+function deleteExpiredSessionBindings(
+  database: DatabaseSync,
+  now: number,
+  absoluteTtlMs: number,
+  idleTimeoutMs: number,
+  activeIdentities: readonly string[],
+): void {
+  const placeholders = activeIdentities.map(() => "?").join(", ");
+  const idleClause =
+    activeIdentities.length === 0
+      ? "last_used_at <= ?"
+      : `last_used_at <= ? AND session_identity NOT IN (${placeholders})`;
+  database
+    .prepare(
+      `DELETE FROM session_bindings
+       WHERE created_at <= ? OR (${idleClause})`,
+    )
+    .run(now - absoluteTtlMs, now - idleTimeoutMs, ...activeIdentities);
+}
+
+function getSessionBinding(
+  database: DatabaseSync,
+  identity: string,
+): PersistedSessionBinding | undefined {
+  const row = database
+    .prepare(
+      `SELECT logical_node_id, created_at, last_used_at
+       FROM session_bindings WHERE session_identity = ?`,
+    )
+    .get(identity) as
+    | { created_at: number; last_used_at: number; logical_node_id: string }
+    | undefined;
+  return row
+    ? {
+        createdAt: row.created_at,
+        lastUsedAt: row.last_used_at,
+        logicalNodeId: row.logical_node_id,
+      }
+    : undefined;
+}
+
+function loadOrCreateSessionHmacKey(database: DatabaseSync): Buffer {
+  const existing = database
+    .prepare("SELECT value FROM daemon_metadata WHERE key = 'session_hmac_key'")
+    .get() as { value: string } | undefined;
+  if (existing) {
+    return Buffer.from(existing.value, "hex");
+  }
+  const key = randomBytes(32);
+  database
+    .prepare("INSERT INTO daemon_metadata (key, value) VALUES ('session_hmac_key', ?)")
+    .run(key.toString("hex"));
+  return key;
+}
+
+function saveSessionBinding(
+  database: DatabaseSync,
+  identity: string,
+  binding: PersistedSessionBinding,
+): void {
+  database
+    .prepare(
+      `INSERT INTO session_bindings
+         (session_identity, logical_node_id, created_at, last_used_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_identity) DO UPDATE SET
+         logical_node_id = excluded.logical_node_id,
+         created_at = excluded.created_at,
+         last_used_at = excluded.last_used_at`,
+    )
+    .run(identity, binding.logicalNodeId, binding.createdAt, binding.lastUsedAt);
+}
+
+function touchSessionBinding(database: DatabaseSync, identity: string, lastUsedAt: number): void {
+  database
+    .prepare("UPDATE session_bindings SET last_used_at = ? WHERE session_identity = ?")
+    .run(lastUsedAt, identity);
 }
 
 function acquireLock(lockPath: string, stateDirectory: string): DatabaseSync {
@@ -265,6 +365,16 @@ function migrate(database: DatabaseSync): void {
       status TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS session_bindings (
+      session_identity TEXT PRIMARY KEY,
+      logical_node_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS daemon_metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
   ensureColumn(database, "subscription_revisions", "mihomo_config_json", "TEXT");
   ensureColumn(
@@ -294,7 +404,7 @@ function migrate(database: DatabaseSync): void {
       WHERE NOT EXISTS (
         SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
       );
-    PRAGMA user_version = 3;
+    PRAGMA user_version = 4;
   `);
   ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
 }

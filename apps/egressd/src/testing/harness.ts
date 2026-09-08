@@ -84,13 +84,13 @@ function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
 
 export async function startTargetServer(
   observedRequests: ObservedRequest[],
-  options: { closeWithoutResponse?: boolean } = {},
+  options: { beforeResponse?: () => Promise<void>; closeWithoutResponse?: boolean } = {},
 ): Promise<RunningHttpFixture> {
   return listen(
     createServer((incoming, response) => {
       const chunks: Buffer[] = [];
       incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
-      incoming.on("end", () => {
+      incoming.on("end", async () => {
         const observed = {
           headers: incoming.headers,
           body: Buffer.concat(chunks).toString(),
@@ -102,6 +102,7 @@ export async function startTargetServer(
           incoming.socket.destroy();
           return;
         }
+        await options.beforeResponse?.();
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(observed));
       });
