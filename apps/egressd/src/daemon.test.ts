@@ -135,6 +135,125 @@ test("an HTTP proxy request reaches the target through the simulated Mihomo list
   assert.equal(observedRequests[0]?.headers.via, "1.1 egresskit, 1.1 simulated-mihomo");
 });
 
+test("GET, HEAD, and POST are forwarded once with their original method and body", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  for (const [method, body] of [
+    ["GET", ""],
+    ["HEAD", ""],
+    ["POST", "payload"],
+  ] as const) {
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/${method.toLowerCase()}`,
+      method,
+      body,
+    );
+  }
+
+  assert.deepEqual(
+    observedRequests.map(({ method, body }) => ({ method, body })),
+    [
+      { method: "GET", body: "" },
+      { method: "HEAD", body: "" },
+      { method: "POST", body: "payload" },
+    ],
+  );
+});
+
+test("a sent POST is not replayed when the target closes without a response", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests, { closeWithoutResponse: true });
+  t.after(() => target.close());
+  const mihomo = await startSimulatedMihomoListener();
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  const status = await sendProxyRequest(
+    daemon.address,
+    `http://${target.host}:${target.port}/submit`,
+    "POST",
+    "do-not-replay",
+  );
+
+  assert.equal(status, 502);
+  assert.deepEqual(
+    observedRequests.map(({ method, body }) => ({ method, body })),
+    [{ method: "POST", body: "do-not-replay" }],
+  );
+});
+
+test("an upstream failure after CONNECT 200 only closes the tunnel", async (t) => {
+  const target = await startHttpsTarget([]);
+  t.after(() => target.close());
+  const faults = new ConnectionFaultPlan();
+  faults.failNext("after-tunnel-established");
+  const mihomo = await startSimulatedMihomoListener(faults);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+  });
+  t.after(() => daemon.close());
+
+  const targetAuthority = `${target.host}:${target.port}`;
+  const received = await new Promise<string>((resolve, reject) => {
+    const socket = connect(daemon.address.port, daemon.address.host);
+    let response = "";
+    socket.on("connect", () =>
+      socket.write(`CONNECT ${targetAuthority} HTTP/1.1\r\nHost: ${targetAuthority}\r\n\r\n`),
+    );
+    socket.on("data", (chunk) => {
+      response += chunk.toString();
+    });
+    socket.on("close", () => resolve(response));
+    socket.on("error", reject);
+  });
+
+  assert.equal(received, "HTTP/1.1 200 Connection Established\r\n\r\n");
+});
+
+function sendProxyRequest(
+  proxy: { host: string; port: number },
+  target: string,
+  method: string,
+  body: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        host: proxy.host,
+        port: proxy.port,
+        path: target,
+        method,
+        headers: body ? { "content-length": Buffer.byteLength(body) } : {},
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(body);
+  });
+}
+
 test("the test clock advances without waiting for wall-clock time", () => {
   const clock = new ManualClock(1_000);
 

@@ -5,10 +5,14 @@ import { connect as connectTls, createServer as createTlsServer, type TLSSocket 
 const TEST_PSK = Buffer.from("0123456789abcdef0123456789abcdef", "hex");
 const TEST_PSK_CIPHER = "PSK-AES128-CBC-SHA256";
 
-export type ConnectionPhase = "before-target-connect" | "after-target-connect";
+export type ConnectionPhase =
+  | "before-target-connect"
+  | "after-target-connect"
+  | "after-tunnel-established";
 
 export interface ObservedRequest {
   headers: IncomingHttpHeaders;
+  body: string;
   method: string;
   url: string;
 }
@@ -80,17 +84,27 @@ function listen(server: Server | TcpServer): Promise<RunningHttpFixture> {
 
 export async function startTargetServer(
   observedRequests: ObservedRequest[],
+  options: { closeWithoutResponse?: boolean } = {},
 ): Promise<RunningHttpFixture> {
   return listen(
     createServer((incoming, response) => {
-      const observed = {
-        headers: incoming.headers,
-        method: incoming.method ?? "GET",
-        url: incoming.url ?? "",
-      };
-      observedRequests.push(observed);
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(observed));
+      const chunks: Buffer[] = [];
+      incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+      incoming.on("end", () => {
+        const observed = {
+          headers: incoming.headers,
+          body: Buffer.concat(chunks).toString(),
+          method: incoming.method ?? "GET",
+          url: incoming.url ?? "",
+        };
+        observedRequests.push(observed);
+        if (options.closeWithoutResponse) {
+          incoming.socket.destroy();
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(observed));
+      });
     }),
   );
 }
@@ -154,6 +168,13 @@ export async function startSimulatedMihomoListener(
           faults.trigger("after-target-connect");
           observedConnectTargets.push(`${host}:${port}`);
           clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          try {
+            faults.trigger("after-tunnel-established");
+          } catch {
+            clientSocket.destroy();
+            targetSocket.destroy();
+            return;
+          }
           if (head.length > 0) {
             targetSocket.write(head);
           }
