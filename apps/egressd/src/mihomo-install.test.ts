@@ -133,6 +133,25 @@ test("installer reports unsupported, download, checksum, and executable errors d
   await assert.doesNotReject(assertMihomoExecutable(supported));
 });
 
+test("HTTP download failures cancel their response body before returning", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    cancel: () => {
+      cancelled = true;
+    },
+    pull: () => undefined,
+  });
+  await assert.rejects(
+    installMihomo({
+      asset: { archive: "mihomo-test.gz", sha256: "00".repeat(32) },
+      destination: "/unused",
+      fetch: async () => new Response(body, { status: 503 }),
+    }),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "download-failed",
+  );
+  assert.equal(cancelled, true);
+});
+
 test("daemon binary resolution discovers the default explicit installation", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-binary-resolution-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));

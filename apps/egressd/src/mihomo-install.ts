@@ -82,6 +82,11 @@ export async function installMihomo(options: {
     throw new MihomoInstallError("download-failed", "Mihomo download failed");
   }
   if (!response.ok) {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Preserve the stable HTTP download error if body cancellation itself fails.
+    }
     throw new MihomoInstallError(
       "download-failed",
       `Mihomo download failed with HTTP ${response.status}`,
