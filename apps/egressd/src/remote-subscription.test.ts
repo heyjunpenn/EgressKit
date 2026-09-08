@@ -215,6 +215,48 @@ test("temporary subscription failures retry with bounded exponential backoff", a
   }
 });
 
+test("retrying hanging error responses releases every response body", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let cancelledBodies = 0;
+  let requests = 0;
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    fetchSubscription: async () => {
+      requests += 1;
+      return new Response(
+        new ReadableStream({
+          cancel: () => {
+            cancelledBodies += 1;
+          },
+        }),
+        { status: 503 },
+      );
+    },
+    host: "127.0.0.1",
+    port: 0,
+    remoteOperationClock: {
+      now: () => 0,
+      sleep: async () => undefined,
+    },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/hanging-503" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+  await daemon.close();
+
+  assert.equal(operation.body.status, "failed");
+  assert.equal(requests, 3);
+  assert.equal(cancelledBodies, 3);
+});
+
 test("network failures retry only up to the operation attempt limit", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   const delays: number[] = [];
@@ -329,6 +371,7 @@ test("authentication, format, and schema failures wait for manual refresh", asyn
   const cases = [
     { expectedStage: "fetching", source: "unauthorized", status: 401 },
     { expectedStage: "fetching", source: "forbidden", status: 403 },
+    { expectedStage: "fetching", source: "not implemented", status: 501 },
     { expectedStage: "parsing", source: "proxies: [", status: 200 },
     {
       expectedStage: "validating",

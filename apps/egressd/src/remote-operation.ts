@@ -137,16 +137,16 @@ export class RemoteOperationRunner {
       });
       if (!response.ok) {
         const reason = `remote subscription returned HTTP ${response.status}`;
+        const retryAfter =
+          response.status === 429
+            ? retryAfterMilliseconds(
+                response.headers.get("retry-after"),
+                (this.#options.clock ?? systemClock).now(),
+              )
+            : undefined;
+        await cancelResponseBody(response);
         if (isRetryableStatus(response.status)) {
-          throw new RetryableOperationError(
-            reason,
-            response.status === 429
-              ? retryAfterMilliseconds(
-                  response.headers.get("retry-after"),
-                  (this.#options.clock ?? systemClock).now(),
-                )
-              : undefined,
-          );
+          throw new RetryableOperationError(reason, retryAfter);
         }
         throw new SafeOperationError(reason);
       }
@@ -198,7 +198,15 @@ const systemClock: RemoteOperationClock = {
 };
 
 function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+  return [408, 429, 500, 502, 503, 504].includes(status);
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The request timeout or peer may already have closed the response stream.
+  }
 }
 
 function retryAfterMilliseconds(value: string | null, now: number): number | undefined {
