@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -16,10 +17,20 @@ export interface MihomoRuntime {
 
 export interface EgressdOptions {
   adminToken?: string;
+  allowUnsafeUnauthenticatedProxy?: boolean;
   host: string;
+  log?: (event: EgressdLogEvent) => void;
   mihomoListener?: URL;
   mihomoRuntime?: MihomoRuntime;
   port: number;
+  proxyAuthentication?: false | { tokens: readonly string[] };
+}
+
+export interface EgressdLogEvent {
+  event: "egressd.proxy_auth.disabled";
+  exposure: "non-loopback";
+  host: string;
+  level: "warn";
 }
 
 export interface RunningEgressd {
@@ -44,6 +55,18 @@ function closeServer(server: Server): Promise<void> {
 }
 
 export async function startEgressd(options: EgressdOptions): Promise<RunningEgressd> {
+  if (options.proxyAuthentication === false && !isLoopbackBindHost(options.host)) {
+    if (!options.allowUnsafeUnauthenticatedProxy) {
+      throw new Error("refusing to disable proxy authentication on a non-loopback host");
+    }
+    const event: EgressdLogEvent = {
+      event: "egressd.proxy_auth.disabled",
+      exposure: "non-loopback",
+      host: options.host,
+      level: "warn",
+    };
+    (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
+  }
   let activeMihomoListener = options.mihomoListener;
   const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
     if (!options.mihomoRuntime) {
@@ -106,17 +129,23 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return;
     }
 
+    if (!authenticateProxyRequest(incoming, options.proxyAuthentication)) {
+      writeProxyAuthenticationRequired(response);
+      return;
+    }
+
     if (!activeMihomoListener || !isAbsoluteHttpUrl(incoming.url)) {
       response.writeHead(activeMihomoListener ? 400 : 502);
       response.end();
       return;
     }
 
+    const { "proxy-authorization": _proxyAuthorization, ...forwardedHeaders } = incoming.headers;
     const upstream = request(
       activeMihomoListener,
       {
         headers: {
-          ...incoming.headers,
+          ...forwardedHeaders,
           via: appendVia(incoming.headers.via, "1.1 egresskit"),
         },
         method: incoming.method,
@@ -136,6 +165,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     incoming.pipe(upstream);
   });
   server.on("connect", (incoming, clientSocket, head) => {
+    if (!authenticateProxyRequest(incoming, options.proxyAuthentication)) {
+      clientSocket.end(
+        'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="EgressKit"\r\n\r\n',
+      );
+      return;
+    }
     handleConnect(incoming, clientSocket, head, activeMihomoListener);
   });
 
@@ -158,6 +193,72 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     close: () => closeServer(server),
     importLocalSubscription,
   };
+}
+
+function isLoopbackBindHost(host: string): boolean {
+  return (
+    host === "localhost" || host === "::1" || host === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(host)
+  );
+}
+
+function authenticateProxyRequest(
+  incoming: IncomingMessage,
+  authentication: EgressdOptions["proxyAuthentication"],
+): boolean {
+  if (authentication === false) {
+    return true;
+  }
+  const credentials = parseBasicProxyCredentials(incoming.headers["proxy-authorization"]);
+  if (!credentials || !parseProxyUsername(credentials.username)) {
+    return false;
+  }
+  const passwordHash = createHash("sha256").update(credentials.password).digest();
+  return (authentication?.tokens ?? []).some((token) =>
+    timingSafeEqual(passwordHash, createHash("sha256").update(token).digest()),
+  );
+}
+
+function parseBasicProxyCredentials(
+  authorization: string | undefined,
+): { password: string; username: string } | undefined {
+  const match = /^Basic ([A-Za-z0-9+/]+={0,2})$/i.exec(authorization ?? "");
+  const encoded = match?.[1];
+  if (!encoded || encoded.length % 4 !== 0) {
+    return undefined;
+  }
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.toString("base64") !== encoded) {
+    return undefined;
+  }
+  const separator = decoded.indexOf(":");
+  if (separator < 1) {
+    return undefined;
+  }
+  return {
+    username: decoded.subarray(0, separator).toString("utf8"),
+    password: decoded.subarray(separator + 1).toString("utf8"),
+  };
+}
+
+function parseProxyUsername(username: string): boolean {
+  if (username === "rotate") {
+    return true;
+  }
+  const match = /^(sticky|strict|node)\.(.+)$/.exec(username);
+  const value = match?.[2];
+  return Boolean(
+    value &&
+      !value.includes(":") &&
+      [...value].every((character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return codePoint > 31 && codePoint !== 127;
+      }),
+  );
+}
+
+function writeProxyAuthenticationRequired(response: import("node:http").ServerResponse): void {
+  response.writeHead(407, { "proxy-authenticate": 'Basic realm="EgressKit"' });
+  response.end();
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {

@@ -13,3 +13,37 @@ test("the simulated Mihomo listener must use a loopback host", () => {
     "[::1]",
   );
 });
+
+test("proxy authentication is enabled by default", () => {
+  assert.deepEqual(loadConfig({}), {
+    host: "127.0.0.1",
+    port: 8787,
+    proxyAuthentication: { tokens: [] },
+  });
+});
+
+test("proxy authentication can only be disabled safely on loopback", () => {
+  assert.equal(loadConfig({ EGRESSKIT_PROXY_AUTH: "disabled" }).proxyAuthentication, false);
+  assert.throws(
+    () =>
+      loadConfig({
+        EGRESSKIT_HOST: "0.0.0.0",
+        EGRESSKIT_PROXY_AUTH: "disabled",
+      }),
+    /refusing to disable proxy authentication on a non-loopback host/,
+  );
+  assert.deepEqual(
+    loadConfig({
+      EGRESSKIT_ALLOW_UNSAFE_UNAUTHENTICATED_PROXY: "true",
+      EGRESSKIT_HOST: "0.0.0.0",
+      EGRESSKIT_PROXY_AUTH: "disabled",
+    }).proxyAuthentication,
+    false,
+  );
+});
+
+test("proxy token configures data-plane authentication", () => {
+  const config = loadConfig({ EGRESSKIT_PROXY_TOKEN: "proxy-secret" });
+
+  assert.deepEqual(config.proxyAuthentication, { tokens: ["proxy-secret"] });
+});
