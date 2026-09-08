@@ -159,19 +159,44 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
 
 function runVersionProbe(path: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(path, ["-v"], { stdio: "ignore" });
+    const child = spawn(path, ["-v"], { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    let outputSize = 0;
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve();
+    };
+    const capture = (chunk: Buffer) => {
+      outputSize += chunk.length;
+      if (outputSize > 4_096) {
+        child.kill("SIGKILL");
+        finish(new Error("version probe output exceeds limit"));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error("version probe timed out"));
+      finish(new Error("version probe timed out"));
     }, 5_000);
     child.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
+      finish(error);
     });
     child.once("exit", (code) => {
-      clearTimeout(timeout);
-      if (code === 0) resolve();
-      else reject(new Error(`version probe exited ${String(code)}`));
+      const output = Buffer.concat(chunks).toString("utf8");
+      if (code !== 0) {
+        finish(new Error(`version probe exited ${String(code)}`));
+      } else if (!/mihomo/i.test(output) || !output.includes(MIHOMO_VERSION)) {
+        finish(new Error(`version probe did not identify Mihomo ${MIHOMO_VERSION}`));
+      } else {
+        finish();
+      }
     });
   });
 }

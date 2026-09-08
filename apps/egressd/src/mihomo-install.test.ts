@@ -108,6 +108,21 @@ test("installer reports unsupported, download, checksum, and executable errors d
     assertMihomoExecutable(invalidExecutable),
     (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
   );
+  const impostor = join(directory, "impostor");
+  await writeFile(impostor, "#!/bin/sh\necho unrelated v1.19.30\n", { mode: 0o700 });
+  await assert.rejects(
+    assertMihomoExecutable(impostor),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+  );
+  const wrongVersion = join(directory, "wrong-version");
+  await writeFile(wrongVersion, "#!/bin/sh\necho Mihomo Meta v1.19.29\n", { mode: 0o700 });
+  await assert.rejects(
+    assertMihomoExecutable(wrongVersion),
+    (error: unknown) => error instanceof MihomoInstallError && error.code === "not-executable",
+  );
+  const supported = join(directory, "supported");
+  await writeFile(supported, "#!/bin/sh\necho Mihomo Meta v1.19.30\n", { mode: 0o700 });
+  await assert.doesNotReject(assertMihomoExecutable(supported));
 });
 
 test("daemon binary resolution discovers the default explicit installation", async (t) => {
