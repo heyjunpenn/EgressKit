@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import { connect, createServer as createTcpServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -130,6 +130,11 @@ test("unauthenticated non-loopback proxy listeners require an explicit warned ov
 test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-cli-state-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const binaryDirectory = await mkdtemp(join(tmpdir(), "egresskit-cli-mihomo-"));
+  t.after(() => rm(binaryDirectory, { force: true, recursive: true }));
+  const binaryPath = join(binaryDirectory, "mihomo");
+  await writeFile(binaryPath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  await chmod(binaryPath, 0o700);
   const mihomo = await startSimulatedMihomoListener();
   t.after(() => mihomo.close());
   const child = spawn(process.execPath, ["dist/cli.js"], {
@@ -141,6 +146,7 @@ test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) 
       EGRESSKIT_MIHOMO_HTTP_LISTENER: `http://${mihomo.host}:${mihomo.port}`,
       EGRESSKIT_PORT: "0",
       EGRESSKIT_STATE_DIRECTORY: stateDirectory,
+      PATH: `${binaryDirectory}:${process.env.PATH ?? ""}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -258,6 +264,7 @@ test("a restart restores the last valid revision and forwards without reimportin
     stateDirectory,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async (
         config: Parameters<
           NonNullable<Parameters<typeof startEgressd>[0]["mihomoRuntime"]>["apply"]
@@ -326,6 +333,7 @@ test("an unavailable remote source does not block startup from its last valid sn
     stateDirectory,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () => new Map([["remote", new URL(`http://${mihomo.host}:${mihomo.port}`)]]),
     },
   });
@@ -531,6 +539,7 @@ test("sent GET, HEAD, and POST requests are not replayed to another listener", {
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -602,6 +611,7 @@ test("soft sticky retries a different listener before sending HTTP and keeps the
     stateDirectory,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
@@ -638,6 +648,7 @@ test("HTTP listener transport failure is recorded without replay and egressd sta
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([["first", new URL(`http://${resetting.host}:${resetting.port}`)]]),
     },
@@ -675,6 +686,7 @@ test("rotate retries a different listener before CONNECT 200", { timeout: 2_000 
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${unavailable.host}:${unavailable.port}`)],
@@ -724,7 +736,11 @@ test("CONNECT failover uses three attempts by default and honors a bounded overr
       port: 0,
       ...(preconnectAttempts === undefined ? {} : { preconnectAttempts }),
       proxyAuthentication: false,
-      mihomoRuntime: { apply: async () => listeners, removeListener: async () => undefined },
+      mihomoRuntime: {
+        apply: async () => listeners,
+        check: async () => undefined,
+        removeListener: async () => undefined,
+      },
     });
   const source = `proxies:
   - { name: one, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
@@ -768,6 +784,7 @@ test("strict sticky and explicit node routes never use another candidate", async
     proxyAuthentication: { tokens: ["proxy-secret"] },
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -819,6 +836,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${timeoutListener.host}:${timeoutListener.port}`)],
@@ -862,6 +880,7 @@ test("CONNECT timeout retries, while client cancellation stops without trying an
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${cancelledListener.host}:${cancelledListener.port}`)],
@@ -1333,6 +1352,7 @@ test("alias updates serialize with revision activation and remain routable", asy
     stateDirectory,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () => {
         applyCount += 1;
         if (applyCount === 2) {
@@ -1400,6 +1420,7 @@ test("alias conflicts are rejected before runtime apply and preserve the active 
     stateDirectory,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () => {
         applyCount += 1;
         return new Map([["first", new URL(`http://${first.host}:${first.port}`)]]);
@@ -1486,6 +1507,7 @@ test("a changed generation drains its listener before removal and port quarantin
         assert.ok(listener);
         return new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]);
       },
+      check: async () => undefined,
       removeListener: async (listener) => {
         removedListeners.push(listener.href);
       },
@@ -1561,6 +1583,7 @@ test("daemon shutdown persists a completed listener removal before closing state
     mihomoRuntime: {
       apply: async () =>
         new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]),
+      check: async () => undefined,
       removeListener: async () => {
         announceRemoval?.();
         await removalGate;
@@ -1579,6 +1602,10 @@ test("daemon shutdown persists a completed listener removal before closing state
     });
   assert.equal((await importYaml("old.example.com")).status, 201);
   assert.equal((await importYaml("new.example.com")).status, 201);
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/ready`)).status,
+    200,
+  );
   await removalStarted;
 
   let closed = false;
@@ -1632,6 +1659,7 @@ test("startup removes abandoned draining listeners before quarantining their por
     mihomoRuntime: {
       apply: async () =>
         new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]),
+      check: async () => undefined,
       removeListener: async (removed) => {
         removedListeners.push(removed.href);
       },
@@ -1654,6 +1682,166 @@ test("startup removes abandoned draining listeners before quarantining their por
     ),
   );
   assert.equal(replacement.nodes[0]?.listenerPort, 20_000);
+});
+
+test("runtime checks candidates, rolls back failures, and becomes not-ready if rollback fails", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-runtime-rollback-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const oldListener = await startSimulatedMihomoListener(undefined, [], [], "old");
+  t.after(() => oldListener.close());
+  const newListener = await startSimulatedMihomoListener(undefined, [], [], "new");
+  t.after(() => newListener.close());
+  const calls: string[] = [];
+  let failRollback = false;
+  const healthySignals = {
+    activeConnections: 0,
+    consecutiveFailures: 0,
+    ewmaLatencyMs: 1,
+    healthy: true,
+    manualWeight: 1,
+    successRate: 1,
+  };
+  const schedulerSignals = new Map([["local:primary", healthySignals]]);
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    mihomoRuntime: {
+      apply: async (config) => {
+        const server = config.proxies[0]?.server ?? "empty";
+        calls.push(`apply:${server}`);
+        if (
+          server === "apply-failure.example.com" ||
+          (failRollback && server === "new.example.com")
+        ) {
+          throw new Error(`runtime apply failed for ${server}`);
+        }
+        const listener = server === "new.example.com" ? newListener : oldListener;
+        return new Map([["primary", new URL(`http://${listener.host}:${listener.port}`)]]);
+      },
+      check: async (config) => {
+        const server = config.proxies[0]?.server ?? "empty";
+        calls.push(`check:${server}`);
+        if (server === "check-failure.example.com") {
+          throw new Error("runtime static check failed");
+        }
+      },
+      removeListener: async () => undefined,
+    },
+    port: 0,
+    proxyAuthentication: false,
+    schedulerSignals,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const importYaml = (server: string) =>
+    fetch(`http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`, {
+      body: `proxies:\n  - { name: primary, type: vless, server: ${server}, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n`,
+      headers: { authorization: "Bearer test-admin-token" },
+      method: "POST",
+    });
+  assert.equal((await importYaml("old.example.com")).status, 201);
+  assert.equal((await importYaml("new.example.com")).status, 201);
+
+  calls.length = 0;
+  assert.equal((await importYaml("check-failure.example.com")).status, 503);
+  assert.deepEqual(calls, ["check:check-failure.example.com", "apply:new.example.com"]);
+  const targetUrl = `http://${target.host}:${target.port}/rollback`;
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
+
+  calls.length = 0;
+  assert.equal((await importYaml("apply-failure.example.com")).status, 503);
+  assert.deepEqual(calls, [
+    "check:apply-failure.example.com",
+    "apply:apply-failure.example.com",
+    "apply:new.example.com",
+  ]);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
+
+  calls.length = 0;
+  schedulerSignals.set("local:primary", { ...healthySignals, manualWeight: Number.NaN });
+  assert.equal((await importYaml("commit-failure.example.com")).status, 422);
+  assert.deepEqual(calls, [
+    "check:commit-failure.example.com",
+    "apply:commit-failure.example.com",
+    "apply:new.example.com",
+  ]);
+  schedulerSignals.set("local:primary", healthySignals);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 200);
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "new");
+
+  failRollback = true;
+  assert.equal((await importYaml("apply-failure.example.com")).status, 503);
+  assert.equal(await sendProxyRequest(daemon.address, targetUrl, "GET", ""), 502);
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/ready`)).status,
+    503,
+  );
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
+    200,
+  );
+  assert.equal(
+    (
+      await fetch(`http://${daemon.address.host}:${daemon.address.port}/operations/missing`, {
+        headers: { authorization: "Bearer test-admin-token" },
+      })
+    ).status,
+    404,
+  );
+});
+
+test("a rejected candidate preserves a configured active listener", async (t) => {
+  const observedRequests: Parameters<typeof startTargetServer>[0] = [];
+  const target = await startTargetServer(observedRequests);
+  t.after(() => target.close());
+  const listener = await startSimulatedMihomoListener(undefined, [], [], "configured");
+  t.after(() => listener.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    mihomoListener: new URL(`http://${listener.host}:${listener.port}`),
+    mihomoRuntime: {
+      apply: async () => {
+        throw new Error("candidate must not be applied");
+      },
+      check: async () => {
+        throw new Error("candidate rejected");
+      },
+      removeListener: async () => undefined,
+    },
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => daemon.close());
+
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      body: "proxies:\n  - { name: primary, type: vless, server: rejected.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }\n",
+      headers: { authorization: "Bearer test-admin-token" },
+      method: "POST",
+    },
+  );
+  assert.equal(imported.status, 422);
+  assert.equal(
+    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/ready`)).status,
+    200,
+  );
+  assert.equal(
+    await sendProxyRequest(
+      daemon.address,
+      `http://${target.host}:${target.port}/configured-active`,
+      "GET",
+      "",
+    ),
+    200,
+  );
+  assert.equal(observedRequests.at(-1)?.headers["x-egresskit-test-exit"], "configured");
 });
 
 function sendProxyRequest(
@@ -1917,6 +2105,7 @@ async function startTwoExitDaemon(
     ...overrides,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () =>
         new Map([
           ["first", new URL(`http://${first.host}:${first.port}`)],
@@ -2037,6 +2226,7 @@ test("CONNECT reaches the target through the selected simulated Mihomo listener"
     proxyAuthentication: false,
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async (config) => {
         appliedConfigs.push(config);
         return new Map([["primary", new URL(`http://${mihomo.host}:${mihomo.port}`)]]);

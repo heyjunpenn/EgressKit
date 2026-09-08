@@ -484,6 +484,7 @@ test("operation failures identify the exact processing stage", async (t) => {
       runtime: {
         apply: async () => Promise.reject(new Error("runtime rejected config")),
         removeListener: async () => undefined,
+        check: async () => undefined,
       },
       source: VALID_SUBSCRIPTION,
     },
@@ -492,6 +493,7 @@ test("operation failures identify the exact processing stage", async (t) => {
       runtime: {
         apply: async () => new Map([["remote", new URL("http://127.0.0.1:20000")]]),
         removeListener: async () => undefined,
+        check: async () => undefined,
       },
       source: VALID_SUBSCRIPTION,
     },
@@ -821,6 +823,7 @@ test("a failed force operation releases its claim for an explicit retry", async 
     host: "127.0.0.1",
     mihomoRuntime: {
       removeListener: async () => undefined,
+      check: async () => undefined,
       apply: async () => {
         applies += 1;
         if (applies === 1) {
@@ -895,7 +898,11 @@ test("an interrupted queued force operation releases its claim after restart", a
       });
     },
     host: "127.0.0.1",
-    mihomoRuntime: { apply: async () => new Map(), removeListener: async () => undefined },
+    mihomoRuntime: {
+      apply: async () => new Map(),
+      check: async () => undefined,
+      removeListener: async () => undefined,
+    },
     port: 0,
     stateDirectory,
   });
@@ -922,7 +929,11 @@ test("an interrupted queued force operation releases its claim after restart", a
   const restarted = await startEgressd({
     adminToken: "admin-token",
     host: "127.0.0.1",
-    mihomoRuntime: { apply: async () => new Map(), removeListener: async () => undefined },
+    mihomoRuntime: {
+      apply: async () => new Map(),
+      check: async () => undefined,
+      removeListener: async () => undefined,
+    },
     port: 0,
     stateDirectory,
   });
@@ -953,6 +964,7 @@ function successfulRuntime(applied: unknown[]): MihomoRuntime {
       return new Map([["remote", new URL("http://127.0.0.1:20000")]]);
     },
     removeListener: async () => undefined,
+    check: async () => undefined,
   };
 }
 
@@ -968,6 +980,7 @@ function runtimeForAllNodes(applied: unknown[]): MihomoRuntime {
       );
     },
     removeListener: async () => undefined,
+    check: async () => undefined,
   };
 }
 

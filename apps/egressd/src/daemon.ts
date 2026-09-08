@@ -53,6 +53,7 @@ export interface MihomoRuntime {
     config: ImportedVlessRevision["mihomoConfig"],
     context: MihomoApplyContext,
   ): Promise<ReadonlyMap<string, URL>>;
+  check(config: ImportedVlessRevision["mihomoConfig"]): Promise<void>;
   removeListener(listener: URL): Promise<void>;
 }
 
@@ -125,6 +126,13 @@ interface RuntimeGeneration {
   listenerPort: number;
 }
 
+interface RuntimeConfigurationState {
+  active: "configured" | ImportedVlessRevision | undefined;
+  candidate: ImportedVlessRevision | undefined;
+  previous: "configured" | ImportedVlessRevision | undefined;
+  status: "failed" | "not-ready" | "ready";
+}
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => {
@@ -193,6 +201,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
   const runtimeGenerations = new Map<string, RuntimeGeneration>();
   const retirementOperations = new Set<Promise<void>>();
+  const runtimeConfiguration: RuntimeConfigurationState = {
+    active: options.mihomoListener === undefined ? undefined : "configured",
+    candidate: undefined,
+    previous: undefined,
+    status: options.mihomoListener === undefined ? "not-ready" : "ready",
+  };
   const withControlPlaneLock = createAsyncLock();
   let softStickySessions: SoftStickySessions;
   try {
@@ -236,6 +250,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   }
 
   const acquireRoute = (route: ProxyRoute, excludedIds: ReadonlySet<string> = new Set()) => {
+    if (runtimeConfiguration.status === "failed") {
+      return undefined;
+    }
     if (route.mode === "rotate") {
       return scheduler.acquire(excludedIds);
     }
@@ -316,6 +333,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ? (state?.prepareNodeRevision(logicalIdPrefix, revision) ??
           prepareTransientNodeRevision(logicalIdPrefix, revision))
         : preparePersistedNodeRevision(revision, persistedNodes);
+    runtimeConfiguration.candidate = prepared.imported;
+    runtimeConfiguration.previous = runtimeConfiguration.active;
     const identities = prepared.nodes.map(({ generation, listenerPort, logicalId: id, node }) => ({
       generation,
       id,
@@ -327,76 +346,106 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       identities.map(({ id }) => ({ id })),
       [...aliases.values()],
     );
-    const listeners = await runtime.apply(prepared.imported.mihomoConfig, {
-      preserveListeners: [...runtimeGenerations.values()].map(({ listener }) => listener),
-    });
-    checking?.();
-    for (const node of prepared.imported.nodes) {
-      const listener = listeners.get(node.name);
-      if (!listener || !isLoopbackHttpUrl(listener)) {
-        throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
+    let listeners: ReadonlyMap<string, URL>;
+    try {
+      await runtime.check(prepared.imported.mihomoConfig);
+      listeners = await applyRuntimeRevision(
+        runtime,
+        prepared.imported,
+        runtimeGenerations,
+        options.checkMihomoListener ?? checkListenerReady,
+        checking,
+      );
+      aliases = state?.getNodeAliases() ?? aliases;
+      validateSelectorUniqueness(
+        identities.map(({ id }) => ({ id })),
+        [...aliases.values()],
+      );
+      const activeRuntimeKeys = new Set(
+        scheduler
+          .snapshot()
+          .map(({ generation, id, listener }) => generationKey(id, generation, listener)),
+      );
+      const candidates = identities.map(({ generation, id, node }) => {
+        const alias = aliases.get(id);
+        const listener = listeners.get(node.name) as URL;
+        const key = generationKey(id, generation, listener);
+        if (runtimeGenerations.has(key) && !activeRuntimeKeys.has(key)) {
+          throw new Error(`Mihomo runtime reused a draining listener for ${node.name}`);
+        }
+        return createSchedulerCandidate(
+          id,
+          listener,
+          options.schedulerSignals?.get(id),
+          alias === undefined ? [] : [alias],
+          generation,
+        );
+      });
+      scheduler.replaceCandidates(candidates, (drained) => {
+        const key = generationKey(drained.id, drained.generation, drained.listener);
+        const retired = runtimeGenerations.get(key);
+        if (!retired) {
+          return;
+        }
+        let removal: Promise<void>;
+        removal = runtime
+          .removeListener(retired.listener)
+          .then(() => {
+            state?.releaseNodeGeneration(
+              retired.id,
+              retired.generation,
+              retired.listenerPort,
+              Date.now() + (options.portQuarantineMs ?? 60_000),
+            );
+            if (runtimeGenerations.get(key) === retired) {
+              runtimeGenerations.delete(key);
+            }
+          })
+          .catch(() => undefined)
+          .finally(() => retirementOperations.delete(removal));
+        retirementOperations.add(removal);
+      });
+    } catch (error) {
+      runtimeConfiguration.candidate = undefined;
+      const previous = runtimeConfiguration.previous;
+      if (previous === "configured") {
+        runtimeConfiguration.status = scheduler.snapshot().length === 0 ? "failed" : "ready";
+        throw error;
       }
-      await (options.checkMihomoListener ?? checkListenerReady)(listener);
+      if (!previous) {
+        runtimeConfiguration.status = "failed";
+        throw error;
+      }
+      try {
+        await applyRuntimeRevision(
+          runtime,
+          previous,
+          runtimeGenerations,
+          options.checkMihomoListener ?? checkListenerReady,
+        );
+        runtimeConfiguration.status = "ready";
+      } catch (rollbackError) {
+        runtimeConfiguration.status = "failed";
+        throw new Error(
+          `runtime rollback failed after candidate rejection: ${errorMessage(rollbackError)}`,
+          { cause: error },
+        );
+      }
+      throw error;
     }
-    aliases = state?.getNodeAliases() ?? aliases;
-    validateSelectorUniqueness(
-      identities.map(({ id }) => ({ id })),
-      [...aliases.values()],
-    );
-    const activeRuntimeKeys = new Set(
-      scheduler
-        .snapshot()
-        .map(({ generation, id, listener }) => generationKey(id, generation, listener)),
-    );
     const nextRuntimeGenerations = new Map<string, RuntimeGeneration>();
-    const candidates = identities.map(({ generation, id, listenerPort, node }) => {
-      const alias = aliases.get(id);
+    for (const { generation, id, listenerPort, node } of identities) {
       const listener = listeners.get(node.name) as URL;
-      const key = generationKey(id, generation, listener);
-      if (runtimeGenerations.has(key) && !activeRuntimeKeys.has(key)) {
-        throw new Error(`Mihomo runtime reused a draining listener for ${node.name}`);
-      }
-      nextRuntimeGenerations.set(key, {
+      nextRuntimeGenerations.set(generationKey(id, generation, listener), {
         generation,
         id,
         listener,
         listenerPort,
       });
-      return createSchedulerCandidate(
-        id,
-        listener,
-        options.schedulerSignals?.get(id),
-        alias === undefined ? [] : [alias],
-        generation,
-      );
-    });
+    }
     for (const [key, generation] of nextRuntimeGenerations) {
       runtimeGenerations.set(key, generation);
     }
-    scheduler.replaceCandidates(candidates, (drained) => {
-      const key = generationKey(drained.id, drained.generation, drained.listener);
-      const retired = runtimeGenerations.get(key);
-      if (!retired) {
-        return;
-      }
-      let removal: Promise<void>;
-      removal = runtime
-        .removeListener(retired.listener)
-        .then(() => {
-          state?.releaseNodeGeneration(
-            retired.id,
-            retired.generation,
-            retired.listenerPort,
-            Date.now() + (options.portQuarantineMs ?? 60_000),
-          );
-          if (runtimeGenerations.get(key) === retired) {
-            runtimeGenerations.delete(key);
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => retirementOperations.delete(removal));
-      retirementOperations.add(removal);
-    });
     healthController?.replaceNodes(
       identities.map(({ generation, id, node }) => ({
         generation,
@@ -404,6 +453,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         listener: listeners.get(node.name) as URL,
       })),
     );
+    runtimeConfiguration.active = prepared.imported;
+    runtimeConfiguration.candidate = undefined;
+    runtimeConfiguration.status = "ready";
     return prepared.imported;
   };
 
@@ -457,6 +509,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (incoming.method === "GET" && incoming.url === "/live") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ status: "live" }));
+      return;
+    }
+
+    if (incoming.method === "GET" && incoming.url === "/ready") {
+      const ready = runtimeConfiguration.status === "ready" && scheduler.snapshot().length > 0;
+      writeJson(response, ready ? 200 : 503, { status: ready ? "ready" : "not-ready" });
       return;
     }
 
@@ -774,6 +832,31 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     importLocalSubscription,
     setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
   };
+}
+
+async function applyRuntimeRevision(
+  runtime: MihomoRuntime,
+  revision: ImportedVlessRevision,
+  generations: ReadonlyMap<string, RuntimeGeneration>,
+  checkListener: (listener: URL) => Promise<void>,
+  applied?: () => void,
+): Promise<ReadonlyMap<string, URL>> {
+  const listeners = await runtime.apply(revision.mihomoConfig, {
+    preserveListeners: [...generations.values()].map(({ listener }) => listener),
+  });
+  applied?.();
+  for (const node of revision.nodes) {
+    const listener = listeners.get(node.name);
+    if (!listener || !isLoopbackHttpUrl(listener)) {
+      throw new Error(`Mihomo runtime did not start a loopback listener for ${node.name}`);
+    }
+    await checkListener(listener);
+  }
+  return listeners;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function prepareTransientNodeRevision(
