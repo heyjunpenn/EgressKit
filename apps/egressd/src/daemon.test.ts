@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { request } from "node:http";
 import { connect } from "node:net";
-import { test } from "node:test";
+import { type TestContext, test } from "node:test";
 
 import { startEgressd } from "./daemon.js";
 import {
@@ -198,53 +198,81 @@ test("HTTP proxy requests require valid standard Basic proxy credentials", async
     assert.equal(response.headers["proxy-authenticate"], 'Basic realm="EgressKit"');
   }
 
-  for (const username of ["rotate", "sticky.session-a", "strict.session-b", "node.exit-alias"]) {
-    const accepted = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", {
-      "proxy-authorization": basicProxyAuthorization(username, "proxy-secret"),
-    });
-    assert.equal(accepted.status, 200);
-  }
-  assert.equal(observedListenerRequests.length, 4);
-  assert.equal(observedRequests.length, 4);
+  const accepted = await sendProxyRequestResponse(daemon.address, targetUrl, "GET", "", {
+    "proxy-authorization": basicProxyAuthorization("rotate", "proxy-secret"),
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal(observedListenerRequests.length, 1);
+  assert.equal(observedRequests.length, 1);
   assert.ok(
     observedRequests.every((request) => request.headers["proxy-authorization"] === undefined),
   );
+});
+
+test("routing modes that are not implemented never silently degrade to rotate", async (t) => {
+  const observedRequests: string[] = [];
+  const observedConnects: string[] = [];
+  const mihomo = await startSimulatedMihomoListener(undefined, observedConnects, observedRequests);
+  t.after(() => mihomo.close());
+  const daemon = await startEgressd({
+    host: "127.0.0.1",
+    port: 0,
+    mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
+    proxyAuthentication: { tokens: ["proxy-secret"] },
+  });
+  t.after(() => daemon.close());
+
+  for (const username of ["sticky.session-a", "strict.session-b", "node.exit-alias"]) {
+    const response = await sendProxyRequestResponse(
+      daemon.address,
+      "http://example.test/must-not-rotate",
+      "GET",
+      "",
+      { "proxy-authorization": basicProxyAuthorization(username, "proxy-secret") },
+    );
+    assert.equal(response.status, 501);
+  }
+  const connectResponse = await sendConnectRequest(
+    daemon.address,
+    "example.test:443",
+    basicProxyAuthorization("sticky.session-a", "proxy-secret"),
+  );
+  assert.match(connectResponse, /^HTTP\/1\.1 501 Not Implemented/);
+  assert.equal(observedRequests.length, 0);
+  assert.equal(observedConnects.length, 0);
 });
 
 test("each new HTTP proxy request performs a fresh rotate selection", async (t) => {
   const observedRequests: Parameters<typeof startTargetServer>[0] = [];
   const target = await startTargetServer(observedRequests);
   t.after(() => target.close());
-  const first = await startSimulatedMihomoListener(undefined, [], [], "first");
-  t.after(() => first.close());
-  const second = await startSimulatedMihomoListener(undefined, [], [], "second");
-  t.after(() => second.close());
-  const daemon = await startEgressd({
-    adminToken: "test-admin-token",
-    host: "127.0.0.1",
-    port: 0,
-    proxyAuthentication: false,
-    mihomoRuntime: {
-      apply: async () =>
-        new Map([
-          ["first", new URL(`http://${first.host}:${first.port}`)],
-          ["second", new URL(`http://${second.host}:${second.port}`)],
-        ]),
-    },
-  });
-  t.after(() => daemon.close());
-  const imported = await fetch(
-    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
-    {
-      method: "POST",
-      headers: { authorization: "Bearer test-admin-token" },
-      body: `proxies:
-  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
-  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
-`,
-    },
+  const { daemon } = await startTwoExitDaemon(
+    t,
+    new Map([
+      [
+        "local:first",
+        {
+          activeConnections: 0,
+          consecutiveFailures: 0,
+          ewmaLatencyMs: 10,
+          healthy: true,
+          manualWeight: 2,
+          successRate: 1,
+        },
+      ],
+      [
+        "local:second",
+        {
+          activeConnections: 1,
+          consecutiveFailures: 1,
+          ewmaLatencyMs: 20,
+          healthy: true,
+          manualWeight: 4,
+          successRate: 0.75,
+        },
+      ],
+    ]),
   );
-  assert.equal(imported.status, 201);
 
   for (let requestNumber = 1; requestNumber <= 4; requestNumber += 1) {
     assert.equal(
@@ -260,7 +288,7 @@ test("each new HTTP proxy request performs a fresh rotate selection", async (t) 
 
   assert.deepEqual(
     observedRequests.map((request) => request.headers["x-egresskit-test-exit"]),
-    ["first", "second", "first", "second"],
+    ["first", "first", "first", "second"],
   );
 });
 
@@ -449,38 +477,7 @@ test("new CONNECT tunnels rotate while requests inside one tunnel keep the same 
   const receivedRequests: string[] = [];
   const target = await startHttpsTarget(receivedRequests);
   t.after(() => target.close());
-  const firstSelections: string[] = [];
-  const first = await startSimulatedMihomoListener(undefined, firstSelections);
-  t.after(() => first.close());
-  const secondSelections: string[] = [];
-  const second = await startSimulatedMihomoListener(undefined, secondSelections);
-  t.after(() => second.close());
-  const daemon = await startEgressd({
-    adminToken: "test-admin-token",
-    host: "127.0.0.1",
-    port: 0,
-    proxyAuthentication: false,
-    mihomoRuntime: {
-      apply: async () =>
-        new Map([
-          ["first", new URL(`http://${first.host}:${first.port}`)],
-          ["second", new URL(`http://${second.host}:${second.port}`)],
-        ]),
-    },
-  });
-  t.after(() => daemon.close());
-  const imported = await fetch(
-    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
-    {
-      method: "POST",
-      headers: { authorization: "Bearer test-admin-token" },
-      body: `proxies:
-  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
-  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
-`,
-    },
-  );
-  assert.equal(imported.status, 201);
+  const { daemon, firstSelections, secondSelections } = await startTwoExitDaemon(t);
   const authority = `${target.host}:${target.port}`;
 
   await sendHttpsPayloadThroughProxy(
@@ -599,6 +596,50 @@ function sendHttpsPayloadThroughProxy(
     });
     socket.on("error", reject);
   });
+}
+
+async function startTwoExitDaemon(
+  t: TestContext,
+  schedulerSignals?: Parameters<typeof startEgressd>[0]["schedulerSignals"],
+): Promise<{
+  daemon: Awaited<ReturnType<typeof startEgressd>>;
+  firstSelections: string[];
+  secondSelections: string[];
+}> {
+  const firstSelections: string[] = [];
+  const first = await startSimulatedMihomoListener(undefined, firstSelections, [], "first");
+  t.after(() => first.close());
+  const secondSelections: string[] = [];
+  const second = await startSimulatedMihomoListener(undefined, secondSelections, [], "second");
+  t.after(() => second.close());
+  const daemon = await startEgressd({
+    adminToken: "test-admin-token",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: false,
+    ...(schedulerSignals === undefined ? {} : { schedulerSignals }),
+    mihomoRuntime: {
+      apply: async () =>
+        new Map([
+          ["first", new URL(`http://${first.host}:${first.port}`)],
+          ["second", new URL(`http://${second.host}:${second.port}`)],
+        ]),
+    },
+  });
+  t.after(() => daemon.close());
+  const imported = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer test-admin-token" },
+      body: `proxies:
+  - { name: first, type: vless, server: one.example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111 }
+  - { name: second, type: vless, server: two.example.com, port: 443, uuid: 22222222-2222-4222-8222-222222222222 }
+`,
+    },
+  );
+  assert.equal(imported.status, 201);
+  return { daemon, firstSelections, secondSelections };
 }
 
 test("the test clock advances without waiting for wall-clock time", () => {

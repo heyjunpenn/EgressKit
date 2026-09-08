@@ -15,7 +15,7 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
-import { RotateScheduler, type SchedulerCandidate } from "./scheduler.js";
+import { createSchedulerCandidate, RotateScheduler, type SchedulerSignals } from "./scheduler.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 
 export interface MihomoRuntime {
@@ -31,6 +31,7 @@ export interface EgressdOptions {
   mihomoRuntime?: MihomoRuntime;
   port: number;
   proxyAuthentication?: ProxyAuthentication;
+  schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
 }
 
 export interface EgressdLogEvent {
@@ -75,7 +76,15 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     (options.log ?? ((entry) => process.stderr.write(`${JSON.stringify(entry)}\n`)))(event);
   }
   const scheduler = new RotateScheduler(
-    options.mihomoListener ? [schedulerCandidate("configured", options.mihomoListener)] : [],
+    options.mihomoListener
+      ? [
+          createSchedulerCandidate(
+            "configured",
+            options.mihomoListener,
+            options.schedulerSignals?.get("configured"),
+          ),
+        ]
+      : [],
   );
   const importLocalSubscription = async (source: string): Promise<ImportedVlessRevision> => {
     if (!options.mihomoRuntime) {
@@ -93,7 +102,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
     }
     scheduler.replaceCandidates(
-      revision.nodes.map((node) => schedulerCandidate(node.name, listeners.get(node.name) as URL)),
+      revision.nodes.map((node) => {
+        const id = localLogicalNodeId(node.name);
+        return createSchedulerCandidate(
+          id,
+          listeners.get(node.name) as URL,
+          options.schedulerSignals?.get(id),
+        );
+      }),
     );
     return revision;
   };
@@ -136,13 +152,17 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return;
     }
 
-    if (
-      authorizeProxyRequest(
-        incoming.headers["proxy-authorization"],
-        options.proxyAuthentication,
-      ) === undefined
-    ) {
+    const route = authorizeProxyRequest(
+      incoming.headers["proxy-authorization"],
+      options.proxyAuthentication,
+    );
+    if (route === undefined) {
       rejectHttpProxyAuthentication(response);
+      return;
+    }
+    if (route.mode !== "rotate") {
+      response.writeHead(501);
+      response.end();
       return;
     }
 
@@ -186,13 +206,16 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     incoming.pipe(upstream);
   });
   server.on("connect", (incoming, clientSocket, head) => {
-    if (
-      authorizeProxyRequest(
-        incoming.headers["proxy-authorization"],
-        options.proxyAuthentication,
-      ) === undefined
-    ) {
+    const route = authorizeProxyRequest(
+      incoming.headers["proxy-authorization"],
+      options.proxyAuthentication,
+    );
+    if (route === undefined) {
       rejectConnectProxyAuthentication(clientSocket);
+      return;
+    }
+    if (route.mode !== "rotate") {
+      clientSocket.end("HTTP/1.1 501 Not Implemented\r\n\r\n");
       return;
     }
     const lease = scheduler.acquire();
@@ -225,17 +248,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   };
 }
 
-function schedulerCandidate(id: string, listener: URL): SchedulerCandidate {
-  return {
-    activeConnections: 0,
-    consecutiveFailures: 0,
-    ewmaLatencyMs: 1,
-    healthy: true,
-    id,
-    listener,
-    manualWeight: 1,
-    successRate: 1,
-  };
+function localLogicalNodeId(normalizedNodeName: string): string {
+  return `local:${normalizedNodeName}`;
 }
 
 function readBody(incoming: IncomingMessage): Promise<string> {

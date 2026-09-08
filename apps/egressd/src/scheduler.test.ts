@@ -59,3 +59,20 @@ test("rotate selection accounts for health, weight, reliability, failures, and l
   assert.ok(selections.includes("slower"));
   assert.ok(!selections.includes("unhealthy"));
 });
+
+test("each scheduling signal can independently change the next selection", () => {
+  for (const penalty of [
+    { manualWeight: 0.5 },
+    { ewmaLatencyMs: 40 },
+    { successRate: 0.5 },
+    { consecutiveFailures: 1 },
+    { activeConnections: 1 },
+  ]) {
+    const scheduler = new RotateScheduler([candidate("penalized", penalty), candidate("baseline")]);
+
+    const lease = scheduler.acquire();
+    assert.ok(lease);
+    assert.equal(lease.candidate.id, "baseline");
+    lease.release();
+  }
+});

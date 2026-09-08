@@ -9,6 +9,25 @@ export interface SchedulerCandidate {
   successRate: number;
 }
 
+export type SchedulerSignals = Omit<SchedulerCandidate, "id" | "listener">;
+
+const DEFAULT_SCHEDULER_SIGNALS: SchedulerSignals = {
+  activeConnections: 0,
+  consecutiveFailures: 0,
+  ewmaLatencyMs: 1,
+  healthy: true,
+  manualWeight: 1,
+  successRate: 1,
+};
+
+export function createSchedulerCandidate(
+  id: string,
+  listener: URL,
+  signals: SchedulerSignals = DEFAULT_SCHEDULER_SIGNALS,
+): SchedulerCandidate {
+  return { id, listener, ...signals };
+}
+
 export interface SchedulerLease {
   candidate: SchedulerCandidate;
   release(): void;
