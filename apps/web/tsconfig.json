@@ -1,11 +1,16 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "exactOptionalPropertyTypes": false,
     "jsx": "react-jsx",
     "lib": ["DOM", "DOM.Iterable", "ES2023"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "types": ["vite/client"]
+    "noUncheckedIndexedAccess": false,
+    "types": ["vite/client"],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
   "include": ["src", "vite.config.ts"]
 }

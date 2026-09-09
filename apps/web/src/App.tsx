@@ -2,16 +2,15 @@ import {
   BookOpenText,
   CirclesThreePlus,
   Gauge,
-  List,
   PlugsConnected,
   TerminalWindow,
   UsersThree,
-  X,
 } from "@phosphor-icons/react";
 import {
   createContext,
   type FormEvent,
-  type KeyboardEvent as ReactKeyboardEvent,
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -19,15 +18,7 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  Navigate,
-  NavLink,
-  Outlet,
-  Route,
-  Routes,
-  useLocation,
-  useNavigate,
-} from "react-router-dom";
+import { Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   type ApiClient,
   ApiError,
@@ -36,14 +27,30 @@ import {
   createApiClient,
 } from "./api";
 import { navigation, type PageId } from "./app-model";
+import { Button } from "./components/motion/button/base";
+import { Input } from "./components/motion/input";
+import { Loader } from "./components/motion/loader";
 import {
-  DocsPage,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./components/motion/select";
+import { Tabs, TabsList, TabsTrigger } from "./components/motion/tabs";
+import { Card, CardContent } from "./components/ui/card";
+import {
   OverviewPage,
   PlaygroundPage,
   ProxiesPage,
   SessionsPage,
   SubscriptionsPage,
 } from "./pages";
+
+const DocsPage = lazy(async () => {
+  const module = await import("./docs-page");
+  return { default: module.DocsPage };
+});
 
 const tokenKey = "egresskit-admin-token";
 const icons = {
@@ -54,6 +61,7 @@ const icons = {
   sessions: UsersThree,
   subscriptions: CirclesThreePlus,
 } satisfies Record<PageId, typeof Gauge>;
+const workspaceNavigation = navigation.filter((item) => item.id !== "docs");
 
 interface ConsoleContextValue {
   api: ApiClient;
@@ -89,12 +97,19 @@ export function App() {
         path="/app"
         element={<ConsoleLayout token={token} onUnauthorized={clearAuthentication} />}
       >
-        <Route index element={<OverviewPage />} />
+        <Route index element={<OverviewRoute />} />
         <Route path="subscriptions" element={<SubscriptionsPage />} />
         <Route path="proxies" element={<ProxiesPage />} />
         <Route path="sessions" element={<SessionsPage />} />
         <Route path="playground" element={<PlaygroundPage />} />
-        <Route path="docs" element={<DocsPage />} />
+        <Route
+          path="docs"
+          element={
+            <Suspense fallback={<RouteLoader label="正在读取使用文档" />}>
+              <DocsPage />
+            </Suspense>
+          }
+        />
       </Route>
       <Route path="*" element={<Navigate replace to="/app" />} />
     </Routes>
@@ -103,9 +118,6 @@ export function App() {
 
 function ConsoleLayout({ onUnauthorized, token }: { onUnauthorized(): void; token: string }) {
   const location = useLocation();
-  const [mobileOpen, setMobileOpen] = useState(false);
-  const drawerRef = useRef<HTMLElement>(null);
-  const drawerCloseRef = useRef<HTMLButtonElement>(null);
   const [snapshot, setSnapshot] = useState<ConsoleSnapshot>();
   const [connectionSamples, setConnectionSamples] = useState<Array<{ at: string; value: number }>>(
     [],
@@ -117,13 +129,16 @@ function ConsoleLayout({ onUnauthorized, token }: { onUnauthorized(): void; toke
       setError("");
       const next = await api.get<ConsoleSnapshot>(consoleSnapshotPath);
       setSnapshot(next);
-      setConnectionSamples((samples) => [
-        ...samples.slice(-11),
-        {
-          at: next.generatedAt,
-          value: next.metrics.successConnections + next.metrics.failedConnections,
-        },
-      ]);
+      setConnectionSamples((samples) => {
+        const previous = samples.filter((sample) => sample.at !== next.generatedAt);
+        return [
+          ...previous.slice(-11),
+          {
+            at: next.generatedAt,
+            value: next.metrics.successConnections + next.metrics.failedConnections,
+          },
+        ];
+      });
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 401) {
         onUnauthorized();
@@ -137,118 +152,61 @@ function ConsoleLayout({ onUnauthorized, token }: { onUnauthorized(): void; toke
     if (token) void refresh();
   }, [refresh, token]);
 
-  useEffect(() => {
-    if (!mobileOpen) return;
-    drawerCloseRef.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMobileOpen(false);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [mobileOpen]);
-
-  const trapDrawerFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (event.key !== "Tab") return;
-    const focusable = [
-      ...(drawerRef.current?.querySelectorAll<HTMLElement>("button, a[href]") ?? []),
-    ];
-    const first = focusable[0];
-    const last = focusable.at(-1);
-    if (!first || !last) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
-
   if (!token) {
-    return <Navigate replace state={{ from: location.pathname }} to="/app/connect" />;
+    return (
+      <Navigate
+        replace
+        state={{ from: `${location.pathname}${location.search}${location.hash}` }}
+        to="/app/connect"
+      />
+    );
   }
+
+  const activePage = navigation.find((item) => item.path === location.pathname) ?? navigation[0];
 
   return (
     <ConsoleContext.Provider
       value={snapshot ? { api, connectionSamples, refresh, snapshot } : undefined}
     >
-      <div className="min-h-screen bg-[#f2f3f1] text-[#111412]">
-        <button
-          className="fixed left-4 top-4 z-40 grid size-11 place-items-center rounded-xl bg-[#202321] text-white shadow-lg lg:hidden"
-          type="button"
-          aria-label="打开导航"
-          onClick={() => setMobileOpen(true)}
+      <div className="min-h-[100dvh] bg-background text-foreground">
+        <AppHeader activeId={activePage.id} />
+        <main
+          aria-label={`${activePage.label}面板`}
+          className="mx-auto max-w-[1480px] px-4 pb-12 pt-6 sm:px-6 md:px-8"
         >
-          <List size={22} />
-        </button>
-        {mobileOpen ? (
-          <button
-            className="fixed inset-0 z-40 bg-black/25 lg:hidden"
-            type="button"
-            aria-label="关闭导航遮罩"
-            onClick={() => setMobileOpen(false)}
-          />
-        ) : null}
-        {mobileOpen ? (
-          <aside
-            ref={drawerRef}
-            role="dialog"
-            aria-label="移动导航"
-            aria-modal="true"
-            className="fixed bottom-0 left-0 top-0 z-50 flex w-64 flex-col items-stretch rounded-r-[28px] bg-[#202321] p-4 shadow-[0_18px_46px_rgba(17,20,18,.22)] lg:hidden"
-            onKeyDown={trapDrawerFocus}
-          >
-            <button
-              ref={drawerCloseRef}
-              type="button"
-              className="mb-2 grid size-10 place-items-center rounded-xl text-white/70 lg:hidden"
-              aria-label="关闭导航"
-              onClick={() => setMobileOpen(false)}
-            >
-              <X size={20} />
-            </button>
-            <img className="mb-6 size-11 lg:mb-3" src="/brand/egresskit-mark.svg" alt="EgressKit" />
-            <NavigationLinks mobile onNavigate={() => setMobileOpen(false)} />
-          </aside>
-        ) : null}
-        <aside className="fixed left-6 top-1/2 z-50 hidden -translate-y-1/2 flex-col items-center rounded-[28px] bg-[#202321] p-2.5 shadow-[0_18px_46px_rgba(17,20,18,.22)] lg:flex">
-          <img className="mb-3 size-11" src="/brand/egresskit-mark.svg" alt="EgressKit" />
-          <NavigationLinks onNavigate={() => undefined} />
-        </aside>
-        <main className="mx-auto min-h-screen max-w-[1520px] px-5 py-8 sm:px-8 lg:px-12 lg:pl-32 lg:py-12">
           {error && !snapshot ? (
-            <section className="mx-auto mt-24 max-w-lg rounded-2xl border border-red-200 bg-white p-8 text-center">
-              <h1 className="text-xl font-semibold">控制台数据加载失败</h1>
-              <p className="mt-2 text-sm text-[#66706a]">{error}</p>
-              <button className="btn-primary mt-6" type="button" onClick={() => void refresh()}>
-                重新加载
-              </button>
-            </section>
+            <Card className="mx-auto mt-24 max-w-lg">
+              <CardContent className="text-center">
+                <h1 className="text-xl font-semibold">控制台数据加载失败</h1>
+                <p className="mt-2 text-sm text-muted-foreground">{error}</p>
+                <Button className="mt-6" onClick={() => void refresh()}>
+                  重新加载
+                </Button>
+              </CardContent>
+            </Card>
           ) : snapshot ? (
             <>
               {error ? (
-                <div
-                  className="mb-5 flex items-center justify-between gap-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
-                  role="alert"
-                >
-                  <span>{error}</span>
-                  <button type="button" className="font-semibold" onClick={() => void refresh()}>
-                    重试
-                  </button>
-                </div>
+                <Card className="mb-4 border-destructive/30">
+                  <CardContent
+                    className="flex items-center justify-between gap-4 text-sm text-destructive"
+                    role="alert"
+                  >
+                    <span>{error}</span>
+                    <Button variant="ghost" size="sm" onClick={() => void refresh()}>
+                      重试
+                    </Button>
+                  </CardContent>
+                </Card>
               ) : null}
               <Outlet />
             </>
           ) : (
-            <div className="animate-pulse pt-12" aria-label="正在读取控制台" role="status">
-              <div className="h-12 w-56 rounded-xl bg-black/8" />
-              <div className="mt-5 h-5 w-80 max-w-full rounded-lg bg-black/6" />
-              <div className="mt-10 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                {[0, 1, 2, 3].map((item) => (
-                  <div className="h-36 rounded-2xl bg-white" key={item} />
-                ))}
+            <div className="grid min-h-[70dvh] place-items-center">
+              <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                <Loader size={24} label="正在读取控制台" />
+                正在读取控制台
               </div>
-              <div className="mt-5 h-72 rounded-2xl bg-white" />
             </div>
           )}
         </main>
@@ -257,39 +215,100 @@ function ConsoleLayout({ onUnauthorized, token }: { onUnauthorized(): void; toke
   );
 }
 
-function NavigationLinks({ mobile = false, onNavigate }: { mobile?: boolean; onNavigate(): void }) {
+function AppHeader({ activeId }: { activeId: PageId }) {
+  const navigate = useNavigate();
+  const listRef = useRef<HTMLDivElement>(null);
+  const [language, setLanguage] = useState("zh-CN");
+
+  useEffect(() => {
+    const activeItem = listRef.current?.querySelector<HTMLElement>(`[data-value="${activeId}"]`);
+    if (typeof activeItem?.scrollIntoView === "function") {
+      activeItem.scrollIntoView({ behavior: "auto", block: "nearest", inline: "center" });
+    }
+  }, [activeId]);
+
   return (
-    <nav className="flex flex-col gap-1.5" aria-label="主要导航">
-      {navigation.map((item) => {
-        const Icon = icons[item.id];
-        return (
-          <NavLink
-            key={item.id}
-            aria-label={item.label}
-            end={item.id === "overview"}
-            title={item.label}
-            to={item.path}
-            onClick={onNavigate}
-            className={({ isActive }) =>
-              `group relative flex h-12 items-center rounded-2xl px-3 transition ${mobile ? "" : "size-12 justify-center px-0"} ${
-                isActive
-                  ? "bg-[#ff5538] text-white shadow-[0_9px_22px_rgba(255,85,56,.34)]"
-                  : "text-white/70 hover:bg-white/8 hover:text-white"
-              }`
-            }
+    <header className="sticky top-0 z-50 bg-background">
+      <div className="mx-auto grid max-w-[1480px] grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-3 px-4 py-4 sm:px-6 lg:grid-cols-[11rem_minmax(0,1fr)_11rem] lg:gap-y-0 md:px-8">
+        <Link
+          to="/app"
+          aria-label="EgressKit"
+          className="w-fit rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-foreground/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <img
+            src="/brand/egresskit-logo.svg"
+            alt=""
+            width="400"
+            height="64"
+            className="h-7 w-auto"
+          />
+        </Link>
+
+        <nav
+          aria-label="主要导航"
+          className="scrollbar-hide -my-2 col-span-2 row-start-2 overflow-x-auto py-2 lg:col-span-1 lg:col-start-2 lg:row-start-1"
+          ref={listRef}
+        >
+          <Tabs
+            value={activeId}
+            onValueChange={(id) => {
+              const destination = navigation.find((item) => item.id === id);
+              if (destination) navigate(destination.path);
+            }}
+            variant="pill"
+            semantics="navigation"
+            className="w-max lg:mx-auto"
           >
-            <Icon size={23} />
-            {mobile ? <span className="ml-3 text-sm font-medium">{item.label}</span> : null}
-            {!mobile ? (
-              <span className="pointer-events-none absolute left-[58px] hidden whitespace-nowrap rounded-lg bg-[#111412] px-2.5 py-1.5 text-xs text-white shadow-lg group-hover:block group-focus-visible:block">
-                {item.label}
-              </span>
-            ) : null}
-          </NavLink>
-        );
-      })}
-    </nav>
+            <TabsList className="min-w-max shadow-md">
+              {navigation.map((item) => {
+                const Icon = icons[item.id];
+                const active = item.id === activeId;
+                return (
+                  <TabsTrigger key={item.id} value={item.id} className="gap-1.5 px-3">
+                    <Icon aria-hidden size={16} weight={active ? "fill" : "regular"} />
+                    <span>{item.label}</span>
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+          </Tabs>
+        </nav>
+
+        <Select value={language} onValueChange={setLanguage} className="w-28 justify-self-end">
+          <SelectTrigger ariaLabel="界面语言 / Language" className="bg-card">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="zh-CN">中文</SelectItem>
+            <SelectItem value="en">English</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </header>
   );
+}
+
+function RouteLoader({ label }: { label: string }) {
+  return (
+    <div className="grid min-h-[45dvh] place-items-center">
+      <div className="flex items-center gap-3 text-sm text-muted-foreground" role="status">
+        <Loader size={24} label={label} />
+        {label}
+      </div>
+    </div>
+  );
+}
+
+function OverviewRoute() {
+  const location = useLocation();
+  const hashId = location.hash.slice(1) as PageId;
+  const destination = workspaceNavigation.find((item) => item.id === hashId);
+
+  if (location.hash) {
+    return <Navigate replace to={destination?.path ?? "/app"} />;
+  }
+
+  return <OverviewPage />;
 }
 
 function ConnectPage({ onAuthenticated }: { onAuthenticated(token: string): void }) {
@@ -316,40 +335,30 @@ function ConnectPage({ onAuthenticated }: { onAuthenticated(token: string): void
   };
 
   return (
-    <main className="grid min-h-screen place-items-center bg-[#f2f3f1] px-5 py-10 text-[#111412]">
-      <section className="w-full max-w-md rounded-[28px] border border-black/6 bg-white p-7 shadow-[0_24px_80px_rgba(17,20,18,.08)] sm:p-10">
-        <img className="h-10 w-auto" src="/brand/egresskit-logo.svg" alt="EgressKit" />
-        <p className="mt-12 text-xs font-semibold uppercase tracking-[.2em] text-[#ff5538]">
-          Token access
-        </p>
-        <h1 className="mt-3 text-3xl font-semibold tracking-[-.04em]">连接控制台</h1>
-        <p className="mt-3 text-sm leading-6 text-[#66706a]">
-          输入实例的 Admin Token。凭据仅保存在当前浏览器会话中。
-        </p>
-        <form className="mt-8" onSubmit={submit}>
-          <label className="text-sm font-medium" htmlFor="admin-token">
-            Admin Token
-          </label>
-          <input
-            className="mt-2 w-full rounded-xl border border-black/10 bg-[#f7f7f5] px-4 py-3 outline-none transition focus:border-[#ff5538] focus:ring-4 focus:ring-[#ff5538]/10"
-            id="admin-token"
-            type="password"
-            autoComplete="current-password"
-            value={token}
-            onChange={(event) => setToken(event.target.value)}
-            placeholder="输入 Admin Token"
-            required
-          />
-          {error ? (
-            <p className="mt-3 text-sm text-red-600" role="alert">
-              {error}
-            </p>
-          ) : null}
-          <button className="btn-primary mt-5 w-full" type="submit" disabled={loading || !token}>
-            {loading ? "正在验证…" : "连接"}
-          </button>
-        </form>
-      </section>
+    <main className="grid min-h-[100dvh] place-items-center bg-background px-5 py-10 text-foreground">
+      <Card className="w-full max-w-md">
+        <CardContent>
+          <img className="h-10 w-auto" src="/brand/egresskit-logo.svg" alt="EgressKit" />
+          <h1 className="sr-only">连接控制台</h1>
+          <form className="mt-8 space-y-5" onSubmit={submit}>
+            <Input
+              id="admin-token"
+              aria-label="Admin Token"
+              type="password"
+              autoComplete="current-password"
+              value={token}
+              onChange={setToken}
+              placeholder="输入 Admin Token"
+              error={error || undefined}
+              reserveErrorLine
+              required
+            />
+            <Button className="w-full" type="submit" disabled={loading || !token}>
+              {loading ? "正在验证…" : "连接"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
     </main>
   );
 }

@@ -1,71 +1,145 @@
 import {
   ArrowClockwise,
   CheckCircle,
-  Clipboard,
-  CloudArrowDown,
-  Code,
   Copy,
-  LinkSimple,
   MagnifyingGlass,
-  PaperPlaneTilt,
   Plus,
   Pulse,
-  ShieldCheck,
   UsersThree,
   WarningCircle,
+  X,
 } from "@phosphor-icons/react";
-import { type FormEvent, type ReactNode, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { useConsole } from "./App";
-import type { ApiClient, OperationResponse } from "./api";
+import type { ApiClient, ConsoleSnapshot, OperationResponse } from "./api";
+import { AnimatedBadge, type AnimatedBadgeStatus } from "./components/motion/animated-badge";
+import { Button } from "./components/motion/button/base";
+import { Input } from "./components/motion/input";
+import { NumberTicker } from "./components/motion/number-ticker";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./components/motion/select";
+import { Switch } from "./components/motion/switch";
+import { Table, type TableColumn } from "./components/motion/table";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "./components/ui/card";
+import { Textarea } from "./components/ui/textarea";
+import { gatewayAddress } from "./lib/gateway-address";
 
-function Header({
-  action,
-  description,
+export { gatewayAddress } from "./lib/gateway-address";
+
+type Subscription = ConsoleSnapshot["subscriptions"][number];
+type Node = ConsoleSnapshot["nodes"][number];
+type Session = ConsoleSnapshot["sessions"][number];
+
+function statusVariant(value: string): AnimatedBadgeStatus {
+  if (["healthy", "ready", "succeeded", "accepted"].includes(value)) return "success";
+  if (["degraded", "warming", "pending", "suspicious", "cooldown", "draining"].includes(value)) {
+    return "warning";
+  }
+  if (["failed", "interrupted", "not-ready", "removed"].includes(value)) return "danger";
+  if (
+    [
+      "saved",
+      "downloaded",
+      "parsed",
+      "validated",
+      "fetching",
+      "parsing",
+      "validating",
+      "applying",
+      "checking",
+      "queued",
+    ].includes(value)
+  ) {
+    return "info";
+  }
+  return "neutral";
+}
+
+const statusLabels: Record<string, string> = {
+  accepted: "已接受",
+  applying: "应用中",
+  checking: "健康检查中",
+  cooldown: "冷却中",
+  degraded: "降级",
+  disabled: "已停用",
+  downloaded: "已下载",
+  failed: "失败",
+  fetching: "下载中",
+  healthy: "健康",
+  interrupted: "已中断",
+  "not-ready": "未就绪",
+  parsed: "已解析",
+  parsing: "解析中",
+  pending: "等待中",
+  queued: "排队中",
+  ready: "就绪",
+  removed: "已移除",
+  saved: "已保存",
+  succeeded: "成功",
+  suspicious: "可疑",
+  validated: "已验证",
+  validating: "校验中",
+  warming: "预热中",
+};
+
+function statusLabel(value: string): string {
+  return statusLabels[value] ?? value;
+}
+
+function StatusBadge({ value }: { value: string }) {
+  return (
+    <AnimatedBadge status={statusVariant(value)} contentKey={value} size="sm">
+      {statusLabel(value)}
+    </AnimatedBadge>
+  );
+}
+
+function tableHeight(rows: number): number {
+  return Math.max(144, 48 + rows * 48);
+}
+
+function Modal({
+  children,
+  onClose,
   title,
 }: {
-  action?: ReactNode;
-  description: string;
+  children: ReactNode;
+  onClose(): void;
   title: string;
 }) {
-  return (
-    <header className="mb-8 flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
-      <div>
-        <p className="text-xs font-semibold uppercase tracking-[.18em] text-[#ff5538]">
-          EgressKit Console
-        </p>
-        <h1 className="mt-2 text-4xl font-semibold tracking-[-.05em] sm:text-5xl">{title}</h1>
-        <p className="mt-3 text-sm text-[#66706a]">{description}</p>
-      </div>
-      {action}
-    </header>
-  );
-}
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
-function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return (
-    <section className={`rounded-2xl border border-black/6 bg-white p-5 sm:p-6 ${className}`}>
-      {children}
-    </section>
-  );
-}
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    return () => dialog?.close();
+  }, []);
 
-function Status({ value }: { value: string }) {
-  const good = value === "healthy" || value === "ready" || value === "succeeded";
-  const warning = value === "degraded" || value === "warming" || value === "pending";
   return (
-    <span
-      className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${good ? "bg-emerald-50 text-emerald-700" : warning ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600"}`}
+    <dialog
+      ref={dialogRef}
+      aria-labelledby="modal-title"
+      className="m-auto w-[min(32rem,calc(100%-2rem))] rounded-2xl bg-background p-0 text-foreground shadow-xl backdrop:bg-foreground/35 backdrop:backdrop-blur-[2px]"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
     >
-      {value}
-    </span>
-  );
-}
-
-function Empty({ children }: { children: ReactNode }) {
-  return (
-    <div className="rounded-xl bg-[#f5f6f4] px-5 py-12 text-center text-sm text-[#7c857f]">
+      <div className="flex items-center justify-between gap-4 px-6 pt-6">
+        <h2 id="modal-title" className="text-lg font-semibold">
+          {title}
+        </h2>
+        <Button variant="ghost" size="icon" aria-label="关闭弹窗" onClick={onClose}>
+          <X size={18} />
+        </Button>
+      </div>
       {children}
-    </div>
+    </dialog>
   );
 }
 
@@ -74,134 +148,181 @@ export function OverviewPage() {
   const { metrics } = snapshot;
   const gateway = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
   const [copied, setCopied] = useState(false);
+  const lifecycleStatuses = [
+    "warming",
+    "healthy",
+    "degraded",
+    "cooldown",
+    "draining",
+    "disabled",
+  ] as const;
+  const lifecycleNodeCount = lifecycleStatuses.reduce(
+    (total, status) => total + (snapshot.nodeStatusCounts[status] ?? 0),
+    0,
+  );
   const copyGateway = async () => {
     await navigator.clipboard?.writeText(gateway);
     setCopied(true);
     setTimeout(() => setCopied(false), 1_500);
   };
   const stats = [
-    ["健康节点", `${metrics.healthyNodes} / ${metrics.totalNodes}`, Pulse],
-    ["活跃会话", String(metrics.activeSessions), UsersThree],
-    ["成功连接", String(metrics.successConnections), CheckCircle],
-    ["失败连接", String(metrics.failedConnections), WarningCircle],
-  ] as const;
+    {
+      label: "健康节点",
+      value: metrics.healthyNodes,
+      suffix: ` / ${metrics.totalNodes}`,
+      icon: Pulse,
+      iconClassName: "text-success",
+    },
+    {
+      label: "活跃会话",
+      value: metrics.activeSessions,
+      icon: UsersThree,
+      iconClassName: "text-foreground",
+    },
+    {
+      label: "本次运行成功连接",
+      value: metrics.successConnections,
+      icon: CheckCircle,
+      iconClassName: "text-success",
+    },
+    {
+      label: "本次运行失败连接",
+      value: metrics.failedConnections,
+      icon: WarningCircle,
+      iconClassName: "text-destructive",
+    },
+  ];
+
   return (
-    <>
-      <Header
-        title="运行概览"
-        description="一个入口，管理所有代理出口。"
-        action={
-          <button className="btn-primary" type="button" onClick={() => void refresh()}>
-            <ArrowClockwise size={18} />
-            刷新
-          </button>
-        }
-      />
-      <Card className="mb-5 overflow-hidden bg-[#fff1ed]">
-        <div className="flex flex-col justify-between gap-8 sm:flex-row sm:items-end">
-          <div>
-            <span
-              className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs ${snapshot.gateway.ready ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}
-            >
-              <i
-                className={`size-2 rounded-full ${snapshot.gateway.ready ? "bg-emerald-400" : "bg-amber-300"}`}
-              />
-              {snapshot.gateway.ready ? "Gateway ready" : "Gateway not ready"}
-            </span>
-            <h2 className="mt-7 max-w-xl text-3xl font-medium leading-tight tracking-[-.04em] sm:text-5xl">
-              稳定出口，从一个简洁入口开始。
-            </h2>
+    <div className="space-y-8">
+      <section className="rounded-2xl bg-foreground px-5 py-6 text-background sm:px-6 md:px-8 md:py-8">
+        <div className="flex flex-col gap-8 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0 space-y-5">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-lg font-semibold">代理入口</h2>
+              <StatusBadge value={snapshot.gateway.ready ? "ready" : "not-ready"} />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs text-background/65">HTTP 代理地址</p>
+              <code className="mt-2 block truncate text-xl font-semibold sm:text-2xl">
+                {gateway}
+              </code>
+            </div>
           </div>
-          <button
-            className="flex items-center gap-3 rounded-xl border border-black/8 bg-white px-4 py-3 text-left"
-            type="button"
-            onClick={() => void copyGateway()}
-          >
-            <span>
-              <small className="block text-[#7c857f]">代理入口</small>
-              <code className="text-sm">{gateway}</code>
-            </span>
-            {copied ? <CheckCircle size={18} /> : <Copy size={18} />}
-          </button>
-          {copied ? (
-            <span className="sr-only" role="status">
-              代理入口已复制
-            </span>
-          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-background/75 hover:bg-background/10 hover:text-background"
+              onClick={() => void refresh()}
+            >
+              <ArrowClockwise size={16} />
+              刷新
+            </Button>
+            <Button
+              size="sm"
+              className="bg-background text-foreground hover:bg-background/90"
+              onClick={() => void copyGateway()}
+            >
+              {copied ? <CheckCircle size={16} /> : <Copy size={16} />}
+              {copied ? "已复制" : "复制"}
+            </Button>
+          </div>
         </div>
-      </Card>
-      <div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {stats.map(([label, value, Icon]) => (
-          <Card key={label}>
-            <Icon className="text-[#ff5538]" size={22} />
-            <p className="mt-6 text-sm text-[#66706a]">{label}</p>
-            <strong className="mt-1 block text-3xl tracking-[-.04em]">{value}</strong>
-          </Card>
+      </section>
+
+      <section
+        aria-label="关键指标"
+        className="grid grid-cols-2 gap-x-6 gap-y-7 rounded-2xl bg-card px-5 py-7 sm:grid-cols-4 sm:px-6 md:px-8 md:py-8"
+      >
+        {stats.map(({ icon: Icon, iconClassName, label, suffix, value }) => (
+          <div className="flex min-w-0 items-start gap-3" key={label}>
+            <Icon aria-hidden className={`mt-0.5 shrink-0 ${iconClassName}`} size={18} />
+            <div className="min-w-0">
+              <p className="text-xs text-muted-foreground">{label}</p>
+              <NumberTicker
+                value={value}
+                locale
+                suffix={suffix}
+                className="mt-1 block text-xl font-semibold"
+              />
+            </div>
+          </div>
         ))}
-      </div>
-      <Card className="mb-5">
-        <h2 className="text-lg font-semibold">节点生命周期</h2>
-        <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
-          {["healthy", "degraded", "cooldown", "draining", "disabled"].map((status) => (
-            <div className="rounded-xl bg-[#f5f6f4] p-4" key={status}>
-              <Status value={status} />
-              <strong className="mt-3 block text-2xl">
-                {snapshot.nodeStatusCounts[status] ?? 0}
-              </strong>
+      </section>
+
+      <section className="rounded-2xl bg-muted px-5 py-7 sm:px-6 md:px-8">
+        <div className="flex items-baseline justify-between gap-4">
+          <h2 className="text-lg font-semibold">节点生命周期</h2>
+          <span className="shrink-0 text-xs text-muted-foreground">
+            共 {lifecycleNodeCount} 个节点
+          </span>
+        </div>
+        <div className="mt-6 grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          {lifecycleStatuses.map((status) => (
+            <div className="flex items-center justify-between gap-4 py-1 sm:block" key={status}>
+              <StatusBadge value={status} />
+              <NumberTicker
+                value={snapshot.nodeStatusCounts[status] ?? 0}
+                className="text-lg font-semibold sm:mt-3 sm:block"
+              />
             </div>
           ))}
         </div>
-      </Card>
-      <div className="grid gap-5 xl:grid-cols-[1.35fr_.65fr]">
-        <Card>
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold">连接趋势</h2>
-            <span className="text-xs text-[#7c857f]">当前浏览器会话</span>
+      </section>
+
+      <div className="grid gap-8 md:grid-cols-2">
+        <section className="rounded-2xl bg-card px-5 py-7 sm:px-6 md:px-8">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="font-semibold">连接采样</h2>
+            <span className="text-xs text-muted-foreground">
+              最近 {connectionSamples.length} 次
+            </span>
           </div>
-          <div
-            className="mt-8 flex h-40 items-end gap-2"
-            aria-label="当前浏览器会话连接趋势"
-            role="img"
-          >
-            {connectionSamples.map((sample) => (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {connectionSamples.length ? (
+              connectionSamples.slice(-6).map((sample) => (
+                <AnimatedBadge key={sample.at} status="info" showIcon={false}>
+                  {new Date(sample.at).toLocaleTimeString()} · {sample.value}
+                </AnimatedBadge>
+              ))
+            ) : (
+              <AnimatedBadge status="neutral">等待下一次采样</AnimatedBadge>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-card px-5 py-7 sm:px-6 md:px-8">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="font-semibold">最近操作</h2>
+            {snapshot.operations[0] ? (
+              <span className="text-xs text-muted-foreground">
+                {new Date(snapshot.operations[0].updatedAt).toLocaleTimeString()}
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-4 divide-y divide-border">
+            {snapshot.operations.slice(0, 4).map((operation) => (
               <div
-                key={sample.at}
-                className="min-h-2 flex-1 rounded-t-lg bg-[#ff5538] opacity-85"
-                title={`连接总数 ${sample.value}`}
-                style={{
-                  height: `${Math.max(8, (sample.value / Math.max(...connectionSamples.map((item) => item.value), 1)) * 100)}%`,
-                }}
-              />
-            ))}
-          </div>
-        </Card>
-        <Card>
-          <h2 className="text-lg font-semibold">运行摘要</h2>
-          <dl className="mt-6 space-y-4 text-sm">
-            {snapshot.operations.map((operation) => (
-              <div className="border-b border-black/6 pb-3" key={operation.id}>
-                <div className="flex items-center justify-between">
-                  <dt className="font-medium">{operation.subscriptionId}</dt>
-                  <dd>
-                    <Status value={operation.status} />
-                  </dd>
+                className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
+                key={operation.id}
+              >
+                <div className="min-w-0">
+                  <strong className="block truncate text-sm">{operation.subscriptionId}</strong>
+                  <p className="text-xs text-muted-foreground">
+                    {new Date(operation.updatedAt).toLocaleString()}
+                  </p>
                 </div>
-                <p className="mt-1 text-xs text-[#7c857f]">
-                  {new Date(operation.updatedAt).toLocaleString()}
-                </p>
+                <StatusBadge value={operation.status} />
               </div>
             ))}
             {snapshot.operations.length === 0 ? (
-              <p className="text-sm text-[#7c857f]">暂无控制面操作</p>
+              <AnimatedBadge status="neutral">暂无控制面操作</AnimatedBadge>
             ) : null}
-            <div className="flex items-center justify-between">
-              <dt className="text-[#66706a]">更新时间</dt>
-              <dd className="font-medium">{new Date(snapshot.generatedAt).toLocaleTimeString()}</dd>
-            </div>
-          </dl>
-        </Card>
+          </div>
+        </section>
       </div>
-    </>
+    </div>
   );
 }
 
@@ -215,6 +336,7 @@ export function SubscriptionsPage() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [notice, setNotice] = useState("");
   const [retryAction, setRetryAction] = useState<() => void>();
+
   const watchOperation = (operation: OperationResponse, retry: () => void) => {
     setRetryAction(undefined);
     void observeOperation(api, operation.operationId, setNotice, refresh).then((succeeded) => {
@@ -275,47 +397,94 @@ export function SubscriptionsPage() {
       setRetryAction(() => () => void forceRevision(revisionId));
     }
   };
+
+  const columns: TableColumn<Subscription>[] = [
+    {
+      key: "id",
+      header: "订阅",
+      width: "12rem",
+      sortable: true,
+      cell: (item) => <strong>{item.id}</strong>,
+    },
+    {
+      key: "locator",
+      header: "来源",
+      width: "20rem",
+      cell: (item) => (item.kind === "remote" ? item.locator : "本地配置"),
+    },
+    { key: "nodeCount", header: "节点", width: "7rem", sortable: true },
+    {
+      key: "status",
+      header: "状态",
+      width: "9rem",
+      sortable: true,
+      cell: (item) => <StatusBadge value={item.status} />,
+    },
+    {
+      key: "updatedAt",
+      header: "最近更新",
+      width: "13rem",
+      sortValue: (item) => item.updatedAt ?? "",
+      cell: (item) => (item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "等待首次刷新"),
+    },
+    {
+      key: "actions",
+      header: "操作",
+      align: "right",
+      width: "10rem",
+      cell: (item) => (
+        <div className="flex justify-end gap-2">
+          {item.status === "suspicious" && item.revisionId ? (
+            <Button size="sm" onClick={() => void forceRevision(item.revisionId as number)}>
+              强制应用
+            </Button>
+          ) : null}
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label={`刷新 ${item.id}`}
+            onClick={() => void refreshSubscription(item.id)}
+          >
+            <ArrowClockwise size={17} />
+          </Button>
+        </div>
+      ),
+    },
+  ];
+
   return (
     <>
-      <Header
-        title="订阅管理"
-        description="导入、验证并应用 VLESS 订阅。"
-        action={
-          <button
-            className="btn-primary"
-            type="button"
-            onClick={() => setAdding((current) => !current)}
-          >
-            <Plus size={18} />
-            添加订阅
-          </button>
-        }
-      />
       {adding ? (
-        <Card className="mb-5">
-          <form onSubmit={submit}>
-            <div className="grid gap-4 md:grid-cols-[180px_1fr_auto]">
-              <select
-                className="field"
-                value={kind}
-                onChange={(event) => setKind(event.target.value as "local" | "remote")}
-              >
-                <option value="remote">远程 URL</option>
-                <option value="local">本地 YAML</option>
-              </select>
+        <Modal
+          title="添加订阅"
+          onClose={() => {
+            setAdding(false);
+            setNotice("");
+          }}
+        >
+          <form className="space-y-5 px-6 pb-6 pt-5" onSubmit={submit}>
+            <div className="space-y-4">
+              <Select value={kind} onValueChange={(next) => setKind(next as "local" | "remote")}>
+                <SelectTrigger ariaLabel="订阅类型">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="remote">远程 URL</SelectItem>
+                  <SelectItem value="local">本地 YAML</SelectItem>
+                </SelectContent>
+              </Select>
               {kind === "remote" ? (
-                <input
-                  className="field"
+                <Input
                   aria-label="订阅 URL"
                   type="url"
                   required
                   placeholder="https://provider.example/sub"
                   value={value}
-                  onChange={(event) => setValue(event.target.value)}
+                  onChange={setValue}
                 />
               ) : (
-                <textarea
-                  className="field min-h-28"
+                <Textarea
+                  className="min-h-28"
                   aria-label="订阅 YAML"
                   required
                   placeholder="粘贴本地 YAML"
@@ -323,134 +492,101 @@ export function SubscriptionsPage() {
                   onChange={(event) => setValue(event.target.value)}
                 />
               )}
-              <button className="btn-primary self-start" type="submit">
-                导入
-              </button>
+            </div>
+            {notice ? (
+              <p className="text-sm text-destructive" role="alert">
+                {notice}
+              </p>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" type="button" onClick={() => setAdding(false)}>
+                取消
+              </Button>
+              <Button type="submit">导入</Button>
             </div>
           </form>
-        </Card>
+        </Modal>
       ) : null}
-      {notice ? (
+      {notice && !adding ? (
         <div
-          className="mb-4 flex items-center justify-between gap-4 rounded-xl bg-[#fff1ed] px-4 py-3 text-sm text-[#b53018]"
-          role="status"
+          className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 text-sm"
+          role={retryAction ? "alert" : "status"}
         >
-          <span>{notice}</span>
+          <StatusBadge value={retryAction ? "failed" : "pending"} />
+          <p className="min-w-0 flex-1 break-words">{notice}</p>
           {retryAction ? (
-            <button className="font-semibold" type="button" onClick={retryAction}>
+            <Button variant="ghost" size="sm" onClick={retryAction}>
               重试
-            </button>
+            </Button>
           ) : null}
         </div>
       ) : null}
       <Card>
-        <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="text-lg font-semibold">
-            全部订阅 <span className="text-[#7c857f]">{snapshot.subscriptions.length}</span>
-          </h2>
-          <div className="flex flex-wrap gap-2">
-            <select
-              className="field w-auto"
-              aria-label="按来源筛选订阅"
-              value={sourceFilter}
-              onChange={(event) => setSourceFilter(event.target.value)}
-            >
-              <option value="all">全部来源</option>
-              <option value="remote">远程</option>
-              <option value="local">本地</option>
-            </select>
-            <select
-              className="field w-auto"
-              aria-label="按状态筛选订阅"
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value)}
-            >
-              <option value="all">全部状态</option>
-              {[
-                "pending",
-                "saved",
-                "downloaded",
-                "parsed",
-                "validated",
-                "accepted",
-                "suspicious",
-                "ready",
-                "healthy",
-              ].map((status) => (
-                <option key={status} value={status}>
-                  {status}
-                </option>
-              ))}
-            </select>
-            <label className="search-field">
-              <MagnifyingGlass size={18} />
-              <input
-                aria-label="搜索订阅"
-                placeholder="搜索订阅"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-            </label>
-          </div>
-        </div>
-        {visible.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>订阅</th>
-                  <th>来源</th>
-                  <th>节点</th>
-                  <th>状态</th>
-                  <th>最近更新</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      <strong>{item.id}</strong>
-                    </td>
-                    <td>{item.kind === "remote" ? item.locator : "本地配置"}</td>
-                    <td>{item.nodeCount}</td>
-                    <td>
-                      <Status value={item.status} />
-                    </td>
-                    <td>
-                      {item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "等待首次刷新"}
-                    </td>
-                    <td className="space-x-2 text-right">
-                      {item.status === "suspicious" && item.revisionId ? (
-                        <button
-                          className="rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700"
-                          type="button"
-                          onClick={() => void forceRevision(item.revisionId as number)}
-                        >
-                          强制应用
-                        </button>
-                      ) : null}
-                      <button
-                        className="icon-button"
-                        type="button"
-                        aria-label={`刷新 ${item.id}`}
-                        onClick={() => void refreshSubscription(item.id)}
-                      >
-                        <ArrowClockwise size={17} />
-                      </button>
-                    </td>
-                  </tr>
+        <CardContent className="space-y-4">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[10rem_12rem_minmax(14rem,1fr)_auto]">
+            <Select value={sourceFilter} onValueChange={setSourceFilter}>
+              <SelectTrigger ariaLabel="按来源筛选订阅">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部来源</SelectItem>
+                <SelectItem value="remote">远程</SelectItem>
+                <SelectItem value="local">本地</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={statusFilter} onValueChange={setStatusFilter}>
+              <SelectTrigger ariaLabel="按状态筛选订阅">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部状态</SelectItem>
+                {[
+                  "pending",
+                  "saved",
+                  "downloaded",
+                  "parsed",
+                  "validated",
+                  "accepted",
+                  "suspicious",
+                  "ready",
+                  "healthy",
+                ].map((status) => (
+                  <SelectItem key={status} value={status}>
+                    {statusLabel(status)}
+                  </SelectItem>
                 ))}
-              </tbody>
-            </table>
+              </SelectContent>
+            </Select>
+            <Input
+              aria-label="搜索订阅"
+              placeholder="搜索订阅"
+              value={query}
+              onChange={setQuery}
+              leftIcon={<MagnifyingGlass size={18} />}
+            />
+            <Button
+              onClick={() => {
+                setNotice("");
+                setAdding(true);
+              }}
+            >
+              <Plus size={18} />
+              添加订阅
+            </Button>
           </div>
-        ) : (
-          <Empty>
-            {snapshot.subscriptions.length === 0
-              ? "还没有订阅，使用右上角“添加订阅”导入第一个来源。"
-              : "没有符合搜索条件的订阅。"}
-          </Empty>
-        )}
+          <Table
+            data={visible}
+            columns={columns}
+            getRowId={(item) => item.id}
+            rowHeight={48}
+            height={tableHeight(visible.length)}
+            emptyState={
+              snapshot.subscriptions.length === 0
+                ? "还没有订阅，使用“添加订阅”导入第一个来源。"
+                : "没有符合搜索条件的订阅。"
+            }
+          />
+        </CardContent>
       </Card>
     </>
   );
@@ -487,156 +623,147 @@ export function ProxiesPage() {
       setNotice(error instanceof Error ? error.message : "别名保存失败");
     }
   };
+
+  const columns: TableColumn<Node>[] = [
+    {
+      key: "id",
+      header: "节点",
+      width: "18rem",
+      sortable: true,
+      sortValue: (node) => node.alias ?? node.id,
+      cell: (node) =>
+        editing === node.id ? (
+          <form
+            className="flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveAlias(node.id);
+            }}
+          >
+            <Input
+              aria-label={`编辑 ${node.id} 别名`}
+              value={alias}
+              onChange={setAlias}
+              className="max-w-44"
+            />
+            <Button variant="secondary" size="icon" type="submit" aria-label="保存别名">
+              <CheckCircle />
+            </Button>
+          </form>
+        ) : (
+          <Button
+            variant="ghost"
+            className="h-auto justify-start px-0 py-1 text-left"
+            onClick={() => {
+              setEditing(node.id);
+              setAlias(node.alias ?? "");
+            }}
+          >
+            <span>
+              <strong className="block">{node.alias ?? node.id}</strong>
+              {node.alias ? <small className="text-muted-foreground">{node.id}</small> : null}
+            </span>
+          </Button>
+        ),
+    },
+    {
+      key: "status",
+      header: "状态",
+      width: "9rem",
+      sortable: true,
+      cell: (node) => <StatusBadge value={node.status} />,
+    },
+    {
+      key: "latencyMs",
+      header: "延迟",
+      width: "8rem",
+      sortable: true,
+      cell: (node) => `${node.latencyMs}ms`,
+    },
+    {
+      key: "activeConnections",
+      header: "连接",
+      width: "8rem",
+      sortable: true,
+      cell: (node) => <NumberTicker value={node.activeConnections} />,
+    },
+    {
+      key: "successRate",
+      header: "成功率",
+      width: "9rem",
+      sortable: true,
+      cell: (node) => (
+        <NumberTicker value={node.successRate * 100} suffix="%" className="font-medium" />
+      ),
+    },
+    {
+      key: "enabled",
+      header: "调度",
+      width: "8rem",
+      cell: (node) => (
+        <Switch
+          checked={node.enabled}
+          ariaLabel={`${node.enabled ? "停用" : "启用"} ${node.alias ?? node.id}`}
+          onCheckedChange={(enabled) => void toggle(node.id, enabled)}
+        />
+      ),
+    },
+  ];
+
   return (
     <>
-      <Header
-        title="代理管理"
-        description="查看节点健康、延迟、负载并控制调度。"
-        action={
-          <button className="btn-secondary" type="button" onClick={() => void refresh()}>
-            <ArrowClockwise size={18} />
-            刷新状态
-          </button>
-        }
-      />
-      <Card className="mb-5 bg-[#fff1ed]">
-        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-          <div>
-            <p className="text-sm text-[#a84531]">网关地址</p>
-            <strong className="mt-1 block text-2xl tracking-[-.03em]">
-              {gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}
-            </strong>
-          </div>
-          <Status value={snapshot.gateway.ready ? "ready" : "not-ready"} />
+      {notice ? (
+        <div
+          className="mb-4 flex items-start gap-3 rounded-xl border border-border bg-card px-4 py-3 text-sm"
+          role="status"
+        >
+          <StatusBadge value="accepted" />
+          <p className="min-w-0 flex-1 break-words">{notice}</p>
         </div>
-      </Card>
+      ) : null}
       <Card>
-        {notice ? (
-          <p
-            className="mb-4 rounded-xl bg-[#fff1ed] px-4 py-3 text-sm text-[#b53018]"
-            role="status"
-          >
-            {notice}
-          </p>
-        ) : null}
-        <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="text-lg font-semibold">节点列表</h2>
-          <div className="flex gap-2">
-            <select
-              className="field w-auto"
-              aria-label="按状态筛选节点"
-              value={filter}
-              onChange={(event) => setFilter(event.target.value)}
-            >
-              <option value="all">全部状态</option>
-              {["healthy", "degraded", "warming", "cooldown", "disabled", "draining"].map(
-                (status) => (
-                  <option key={status} value={status}>
-                    {status}
-                  </option>
-                ),
-              )}
-            </select>
-            <label className="search-field">
-              <MagnifyingGlass size={18} />
-              <input
-                aria-label="搜索节点"
-                placeholder="搜索节点"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-            </label>
+        <CardContent className="space-y-4">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[13rem_minmax(14rem,1fr)_auto]">
+            <Select value={filter} onValueChange={setFilter}>
+              <SelectTrigger ariaLabel="按状态筛选节点">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部状态</SelectItem>
+                {["healthy", "degraded", "warming", "cooldown", "disabled", "draining"].map(
+                  (status) => (
+                    <SelectItem key={status} value={status}>
+                      {statusLabel(status)}
+                    </SelectItem>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
+            <Input
+              aria-label="搜索节点"
+              placeholder="搜索节点"
+              value={query}
+              onChange={setQuery}
+              leftIcon={<MagnifyingGlass size={18} />}
+            />
+            <Button variant="secondary" onClick={() => void refresh()}>
+              <ArrowClockwise size={18} />
+              刷新状态
+            </Button>
           </div>
-        </div>
-        {visible.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>节点</th>
-                  <th>状态</th>
-                  <th>延迟</th>
-                  <th>连接</th>
-                  <th>成功率</th>
-                  <th>调度</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((node) => (
-                  <tr key={node.id}>
-                    <td>
-                      {editing === node.id ? (
-                        <form
-                          className="flex gap-2"
-                          onSubmit={(event) => {
-                            event.preventDefault();
-                            void saveAlias(node.id);
-                          }}
-                        >
-                          <input
-                            className="field max-w-40"
-                            aria-label={`编辑 ${node.id} 别名`}
-                            value={alias}
-                            onChange={(event) => setAlias(event.target.value)}
-                          />
-                          <button className="icon-button" type="submit">
-                            <CheckCircle />
-                          </button>
-                        </form>
-                      ) : (
-                        <button
-                          className="text-left"
-                          type="button"
-                          onClick={() => {
-                            setEditing(node.id);
-                            setAlias(node.alias ?? "");
-                          }}
-                        >
-                          <strong className="block">{node.alias ?? node.id}</strong>
-                          {node.alias ? <small className="text-[#7c857f]">{node.id}</small> : null}
-                        </button>
-                      )}
-                    </td>
-                    <td>
-                      <Status value={node.status} />
-                    </td>
-                    <td>{node.latencyMs}ms</td>
-                    <td>{node.activeConnections}</td>
-                    <td>
-                      <span className="mr-2 inline-block h-2 w-20 overflow-hidden rounded-full bg-[#e8ebe7]">
-                        <i
-                          className="block h-full rounded-full bg-[#ff5538]"
-                          style={{ width: `${node.successRate * 100}%` }}
-                        />
-                      </span>
-                      {Math.round(node.successRate * 100)}%
-                    </td>
-                    <td>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={node.enabled}
-                        aria-label={`${node.enabled ? "停用" : "启用"} ${node.alias ?? node.id}`}
-                        onClick={() => void toggle(node.id, !node.enabled)}
-                        className={`relative h-7 w-12 rounded-full transition ${node.enabled ? "bg-[#ff5538]" : "bg-[#cbd1cc]"}`}
-                      >
-                        <i
-                          className={`absolute top-1 size-5 rounded-full bg-white transition ${node.enabled ? "left-6" : "left-1"}`}
-                        />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <Empty>
-            {snapshot.nodes.length === 0
-              ? "还没有可调度节点，请先导入并成功应用订阅。"
-              : "没有符合当前搜索或状态筛选的节点。"}
-          </Empty>
-        )}
+          <Table
+            data={visible}
+            columns={columns}
+            getRowId={(node) => node.id}
+            rowHeight={56}
+            height={tableHeight(visible.length)}
+            emptyState={
+              snapshot.nodes.length === 0
+                ? "还没有可调度节点，请先导入并成功应用订阅。"
+                : "没有符合当前搜索或状态筛选的节点。"
+            }
+          />
+        </CardContent>
       </Card>
     </>
   );
@@ -648,79 +775,72 @@ export function SessionsPage() {
   const visible = snapshot.sessions.filter((session) =>
     `${session.id} ${session.nodeId}`.toLowerCase().includes(query.toLowerCase()),
   );
+  const columns: TableColumn<Session>[] = [
+    {
+      key: "id",
+      header: "会话摘要",
+      width: "17rem",
+      cell: (session) => <code>{session.id}</code>,
+    },
+    {
+      key: "mode",
+      header: "模式",
+      width: "8rem",
+      sortable: true,
+      cell: (session) => (
+        <code className="rounded-md bg-card px-2 py-1 text-xs font-medium">{session.mode}</code>
+      ),
+    },
+    { key: "nodeId", header: "所属节点", width: "13rem", sortable: true },
+    {
+      key: "activeConnections",
+      header: "当前连接",
+      width: "9rem",
+      sortable: true,
+      cell: (session) => <NumberTicker value={session.activeConnections} />,
+    },
+    {
+      key: "createdAt",
+      header: "创建时间",
+      width: "13rem",
+      sortable: true,
+      cell: (session) => new Date(session.createdAt).toLocaleString(),
+    },
+    {
+      key: "lastUsedAt",
+      header: "最后活动",
+      width: "13rem",
+      sortable: true,
+      cell: (session) => new Date(session.lastUsedAt).toLocaleString(),
+    },
+  ];
+
   return (
-    <>
-      <Header
-        title="活跃会话"
-        description="仅展示 HMAC 摘要，不暴露原始会话标识。"
-        action={
-          <button className="btn-primary" type="button" onClick={() => void refresh()}>
+    <Card>
+      <CardContent className="space-y-4">
+        <div className="grid gap-2 sm:grid-cols-[minmax(14rem,1fr)_auto]">
+          <Input
+            aria-label="搜索会话"
+            placeholder="搜索摘要或节点"
+            value={query}
+            onChange={setQuery}
+            leftIcon={<MagnifyingGlass size={18} />}
+          />
+          <Button onClick={() => void refresh()}>
             <ArrowClockwise size={18} />
             刷新
-          </button>
-        }
-      />
-      <div className="mb-5 grid gap-4 sm:grid-cols-2">
-        <Card>
-          <UsersThree className="text-[#ff5538]" size={24} />
-          <p className="mt-5 text-sm text-[#66706a]">活跃会话</p>
-          <strong className="text-3xl">{snapshot.metrics.activeSessions}</strong>
-        </Card>
-        <Card>
-          <LinkSimple className="text-[#ff5538]" size={24} />
-          <p className="mt-5 text-sm text-[#66706a]">当前连接绑定</p>
-          <strong className="text-3xl">{snapshot.sessions.length}</strong>
-        </Card>
-      </div>
-      <Card>
-        <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="text-lg font-semibold">会话列表</h2>
-          <label className="search-field">
-            <MagnifyingGlass size={18} />
-            <input
-              aria-label="搜索会话"
-              placeholder="搜索摘要或节点"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </label>
+          </Button>
         </div>
-        {visible.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>会话摘要</th>
-                  <th>模式</th>
-                  <th>所属节点</th>
-                  <th>当前连接</th>
-                  <th>创建时间</th>
-                  <th>最后活动</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((session) => (
-                  <tr key={session.id}>
-                    <td>
-                      <code>{session.id}</code>
-                    </td>
-                    <td>
-                      <Status value={session.mode} />
-                    </td>
-                    <td>{session.nodeId}</td>
-                    <td>{session.activeConnections}</td>
-                    <td>{new Date(session.createdAt).toLocaleString()}</td>
-                    <td>{new Date(session.lastUsedAt).toLocaleString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <Empty>当前没有活跃会话</Empty>
-        )}
-      </Card>
-    </>
+        <Table
+          data={visible}
+          columns={columns}
+          getRowId={(session) => session.id}
+          rowHeight={48}
+          height={tableHeight(visible.length)}
+          emptyState="当前没有活跃会话。客户端使用 sticky 或 strict 模式建立连接后，会话会显示在这里。"
+        />
+      </CardContent>
+    </Card>
   );
 }
 
@@ -729,7 +849,6 @@ export function PlaygroundPage() {
   const [mode, setMode] = useState("rotate");
   const [target, setTarget] = useState("https://httpbin.org/ip");
   const [node, setNode] = useState(snapshot.nodes[0]?.alias ?? snapshot.nodes[0]?.id ?? "node-id");
-  const [proxyToken, setProxyToken] = useState("");
   const [copied, setCopied] = useState(false);
   const proxy = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
   const username =
@@ -738,7 +857,7 @@ export function PlaygroundPage() {
       : mode === "rotate"
         ? "rotate"
         : `${mode}.session-demo`;
-  const command = `curl --proxy ${shellQuote(proxy)} --proxy-user "${username}:$PROXY_TOKEN" ${shellQuote(target)}`;
+  const command = `curl --proxy ${shellQuote(proxy)} --proxy-user "${username}:PROXY_TOKEN" ${shellQuote(target)}`;
   const examples = [
     { label: "检查出口 IP", value: "https://httpbin.org/ip" },
     { label: "访问网站", value: "https://example.com" },
@@ -750,212 +869,80 @@ export function PlaygroundPage() {
     setCopied(true);
     setTimeout(() => setCopied(false), 1_500);
   };
+
   return (
-    <>
-      <Header
-        title="快捷操作 Playground"
-        description="在浏览器内生成请求命令，不会代你访问目标网站。"
-      />
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Card>
-          <h2 className="text-lg font-semibold">构建请求</h2>
-          <div className="mt-6 space-y-5">
-            <label className="field-label">
-              代理模式
-              <select
-                className="field mt-2"
-                value={mode}
-                onChange={(event) => setMode(event.target.value)}
-              >
-                <option value="rotate">Rotate</option>
-                <option value="sticky">Soft sticky</option>
-                <option value="strict">Strict sticky</option>
-                <option value="node">指定节点</option>
-              </select>
-            </label>
-            {mode === "node" ? (
-              <label className="field-label">
-                节点
-                <input
-                  className="field mt-2"
-                  value={node}
-                  onChange={(event) => setNode(event.target.value)}
-                />
-              </label>
-            ) : null}
-            <label className="field-label">
-              目标 URL
-              <input
-                className="field mt-2"
-                type="url"
-                value={target}
-                onChange={(event) => setTarget(event.target.value)}
-              />
-            </label>
-            <label className="field-label">
-              Proxy Token（仅组件内存）
-              <input
-                className="field mt-2"
-                aria-label="Proxy Token"
-                type="password"
-                autoComplete="off"
-                value={proxyToken}
-                onChange={(event) => setProxyToken(event.target.value)}
-                placeholder="可选，用于本次构建确认"
-              />
-            </label>
-            <div className="rounded-xl bg-[#f5f6f4] p-4 text-xs leading-5 text-[#66706a]">
-              <ShieldCheck className="mb-2 text-emerald-600" size={20} />
-              生成与复制始终使用环境变量 <code>$PROXY_TOKEN</code>，输入值不会进入 DOM 命令、URL
-              或持久化存储。
-            </div>
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <h2>构建请求</h2>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div>
+            <p className="mb-1.5 px-1 text-sm font-medium">代理模式</p>
+            <Select value={mode} onValueChange={setMode}>
+              <SelectTrigger ariaLabel="代理模式">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="rotate">Rotate</SelectItem>
+                <SelectItem value="sticky">Soft sticky</SelectItem>
+                <SelectItem value="strict">Strict sticky</SelectItem>
+                <SelectItem value="node">指定节点</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-        </Card>
-        <Card className="bg-[#202321] text-white">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold">请求示例</h2>
-            <button
-              className="icon-button border-white/10 text-white"
-              type="button"
+          {mode === "node" ? <Input label="节点" value={node} onChange={setNode} /> : null}
+          <Input label="目标 URL" type="url" value={target} onChange={setTarget} />
+          <div className="grid gap-2 sm:grid-cols-2">
+            {examples.map((example) => (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-auto min-w-0 justify-start px-3 py-2 text-left"
+                key={example.label}
+                onClick={() => setTarget(example.value)}
+              >
+                <span className="min-w-0">
+                  <strong className="block truncate font-medium">{example.label}</strong>
+                  <small className="block truncate font-mono text-muted-foreground">
+                    {example.value}
+                  </small>
+                </span>
+              </Button>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <h2>请求示例</h2>
+          </CardTitle>
+          <CardAction>
+            <Button
+              variant="ghost"
+              size="icon"
               aria-label="复制请求命令"
               onClick={() => void copyCommand()}
             >
               {copied ? <CheckCircle size={18} /> : <Copy size={18} />}
-            </button>
-          </div>
-          <pre className="mt-7 overflow-x-auto whitespace-pre-wrap rounded-xl bg-black/20 p-5 text-sm leading-7 text-[#f7b4a8]">
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg bg-foreground p-4 text-sm leading-6 text-background">
             <code>{command}</code>
           </pre>
-          <p className="mt-5 flex items-center gap-2 text-xs text-white/50">
-            <Code size={16} />
-            请在你信任的终端中执行。
-          </p>
           {copied ? (
-            <p className="mt-3 text-xs text-emerald-300" role="status">
+            <div className="mt-4 text-sm text-success" role="status" aria-live="polite">
               命令已复制
-            </p>
+            </div>
           ) : null}
-        </Card>
-      </div>
-      <h2 className="mb-4 mt-8 text-xl font-semibold">常用示例</h2>
-      <div className="grid gap-4 sm:grid-cols-2">
-        {examples.map((example) => (
-          <button
-            className="flex items-center justify-between rounded-2xl border border-black/6 bg-white p-5 text-left"
-            type="button"
-            key={example.label}
-            onClick={() => setTarget(example.value)}
-          >
-            <span>
-              <strong className="block">{example.label}</strong>
-              <small className="mt-1 block text-[#7c857f]">{example.value}</small>
-            </span>
-            <PaperPlaneTilt className="text-[#ff5538]" />
-          </button>
-        ))}
-      </div>
-    </>
-  );
-}
-
-export function DocsPage() {
-  const { snapshot } = useConsole();
-  const proxy = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
-  const sections = [
-    ["1", "配置 Proxy Token", "在服务端设置独立的 Proxy Token，不要复用 Admin Token。"],
-    [
-      "2",
-      "选择路由模式",
-      "使用 rotate、sticky.<session>、strict.<session> 或 node.<selector> 作为代理用户名。",
-    ],
-    ["3", "发起请求", "通过标准 HTTP_PROXY / HTTPS_PROXY 或 curl --proxy 接入。"],
-  ];
-  return (
-    <>
-      <Header title="使用文档" description="从代理入口到路由模式的最短接入路径。" />
-      <Card className="mb-5 bg-[#fff1ed]">
-        <div className="flex items-center gap-4">
-          <span className="grid size-12 place-items-center rounded-xl bg-[#ff5538] text-white">
-            <CloudArrowDown size={23} />
-          </span>
-          <div>
-            <p className="text-sm text-[#a84531]">当前代理入口</p>
-            <code className="text-lg font-semibold">{proxy}</code>
-          </div>
-          <button
-            className="icon-button ml-auto"
-            type="button"
-            aria-label="复制代理入口"
-            onClick={() => void navigator.clipboard?.writeText(proxy)}
-          >
-            <Clipboard />
-          </button>
-        </div>
+        </CardContent>
       </Card>
-      <div className="grid gap-5 lg:grid-cols-[.65fr_1.35fr]">
-        <Card>
-          <h2 className="text-lg font-semibold">快速开始</h2>
-          <div className="mt-6 space-y-6">
-            {sections.map(([number, title, copy]) => (
-              <div className="flex gap-4" key={number}>
-                <span className="grid size-8 shrink-0 place-items-center rounded-full bg-[#202321] text-sm text-white">
-                  {number}
-                </span>
-                <div>
-                  <strong>{title}</strong>
-                  <p className="mt-1 text-sm leading-6 text-[#66706a]">{copy}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
-        <Card>
-          <h2 className="text-lg font-semibold">路由模式</h2>
-          <div className="mt-5 grid gap-3 sm:grid-cols-2">
-            {[
-              ["rotate", "每次请求选择合适节点"],
-              ["sticky.<session>", "会话可在节点失效时重新绑定"],
-              ["strict.<session>", "绑定失效后拒绝自动迁移"],
-              ["node.<selector>", "固定使用指定节点或别名"],
-            ].map(([mode, copy]) => (
-              <div className="rounded-xl bg-[#f5f6f4] p-4" key={mode}>
-                <code className="font-semibold text-[#e43c20]">{mode}</code>
-                <p className="mt-2 text-sm text-[#66706a]">{copy}</p>
-              </div>
-            ))}
-          </div>
-          <div className="mt-5 rounded-xl border border-black/6 p-4">
-            <p className="text-sm font-semibold">鉴权边界</p>
-            <p className="mt-2 text-sm leading-6 text-[#66706a]">
-              控制台与管理 API 使用 Admin Token；代理流量使用 Proxy Token。除 /live 与 /ready
-              外，管理接口均需 Bearer 鉴权。
-            </p>
-          </div>
-        </Card>
-      </div>
-      <div className="mt-5 grid gap-5 lg:grid-cols-3">
-        <Card>
-          <h2 className="text-lg font-semibold">Docker 启动</h2>
-          <pre className="mt-4 overflow-x-auto rounded-xl bg-[#202321] p-4 text-xs leading-6 text-white/80">
-            <code>{`docker run --rm \\\n  -v egresskit-state:/var/lib/egresskit \\\n  -p 127.0.0.1:8787:8787 \\\n  -e EGRESSKIT_ADMIN_TOKEN='…' \\\n  -e EGRESSKIT_PROXY_TOKEN='…' \\\n  ghcr.io/heyjunpenn/egresskit:VERSION`}</code>
-          </pre>
-        </Card>
-        <Card>
-          <h2 className="text-lg font-semibold">存活与就绪</h2>
-          <p className="mt-4 text-sm leading-6 text-[#66706a]">
-            <code>/live</code> 表示 Node 进程存活；<code>/ready</code> 表示 Mihomo
-            已就绪且至少存在一个可调度节点。这两个探针无需 Admin Token。
-          </p>
-        </Card>
-        <Card>
-          <h2 className="text-lg font-semibold">Prometheus</h2>
-          <p className="mt-4 text-sm leading-6 text-[#66706a]">
-            使用 <code>Authorization: Bearer &lt;ADMIN_TOKEN&gt;</code> 读取
-            <code> /metrics</code>。指标覆盖连接、回退、节点、订阅操作与活跃会话。
-          </p>
-        </Card>
-      </div>
-    </>
+    </div>
   );
 }
 
@@ -983,7 +970,7 @@ async function observeOperation(
 ): Promise<boolean> {
   try {
     const operation = await pollOperation(api, operationId, (current) => {
-      setNotice(`任务 ${operationId}：${current.status}`);
+      setNotice(`任务 ${operationId}：${statusLabel(current.status)}`);
     });
     if (operation.status === "failed") {
       setNotice(
@@ -1013,11 +1000,4 @@ function encodeProxyUsernameValue(value: string): string {
     /[!'()*]/g,
     (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   );
-}
-
-export function gatewayAddress(host: string, port: number): string {
-  const displayHost = host === "0.0.0.0" || host === "::" ? window.location.hostname : host;
-  const normalizedHost = displayHost.replace(/^\[(.*)]$/, "$1");
-  const urlHost = normalizedHost.includes(":") ? `[${normalizedHost}]` : normalizedHost;
-  return `${urlHost}:${port}`;
 }
