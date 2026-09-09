@@ -27,6 +27,7 @@ export interface EgressdConfig {
   sessionMaximumConcurrentConnections?: number;
   stateDirectory: string;
   targetReputationEnabled?: true;
+  webDirectory?: string;
 }
 
 function parseNonNegativeInteger(name: string, value: string | undefined): number | undefined {
@@ -112,6 +113,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
   }
   if (environment.EGRESSKIT_STATE_DIRECTORY === "") {
     throw new Error("EGRESSKIT_STATE_DIRECTORY must not be empty");
+  }
+  if (environment.EGRESSKIT_WEB_DIRECTORY === "") {
+    throw new Error("EGRESSKIT_WEB_DIRECTORY must not be empty");
   }
   const stateDirectory =
     environment.EGRESSKIT_STATE_DIRECTORY ??
@@ -206,6 +210,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv): EgressdConfig {
     ...(sessionMaximumConcurrentConnections === undefined
       ? {}
       : { sessionMaximumConcurrentConnections }),
+    ...(environment.EGRESSKIT_WEB_DIRECTORY === undefined
+      ? {}
+      : { webDirectory: environment.EGRESSKIT_WEB_DIRECTORY }),
   };
 }
 

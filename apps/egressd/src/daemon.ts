@@ -52,6 +52,7 @@ import {
   type PreparedNodeRevision,
   RevisionForceConflictError,
 } from "./state.js";
+import { serveStaticWeb } from "./static-web.js";
 import { type ImportedVlessRevision, importLocalVlessYaml } from "./subscription.js";
 import {
   TargetFeedbackError,
@@ -111,6 +112,7 @@ export interface EgressdOptions {
   stateDirectory?: string;
   targetReputationClock?: () => number;
   targetReputationEnabled?: boolean;
+  webDirectory?: string;
 }
 
 export interface ConnectionOutcome {
@@ -335,6 +337,21 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     );
   }
   const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const applyNodeEnabledOverrides = () => {
+    for (const [id, enabled] of state?.getNodeEnabledOverrides() ?? []) {
+      scheduler.setManualEnabled(id, enabled);
+      healthController?.setManualEnabled(id, enabled);
+    }
+  };
+  const setNodeEnabled = (id: string, enabled: boolean): boolean => {
+    if (!scheduler.hasCandidate(id)) {
+      return false;
+    }
+    state?.saveNodeEnabledOverride(id, enabled);
+    scheduler.setManualEnabled(id, enabled);
+    healthController?.setManualEnabled(id, enabled);
+    return true;
+  };
   try {
     const persistedProxyTokens = state?.loadProxyTokens();
     if (proxyTokenRegistry && persistedProxyTokens !== undefined) {
@@ -345,6 +362,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     if (options.adminToken && proxyTokenRegistry?.matches(options.adminToken)) {
       throw new Error("admin and proxy tokens must be distinct");
     }
+    applyNodeEnabledOverrides();
   } catch (error) {
     await state?.close();
     throw error;
@@ -628,6 +646,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         listener: listeners.get(node.name) as URL,
       })),
     );
+    applyNodeEnabledOverrides();
     runtimeConfiguration.active = prepared.imported;
     runtimeConfiguration.candidate = undefined;
     runtimeConfiguration.status = "ready";
@@ -723,6 +742,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       })
     : undefined;
 
+  let publicPort = options.port;
   const createRequestHandler =
     (localControl: boolean) => (incoming: IncomingMessage, response: ServerResponse) => {
       if (localControl && !isAuthorizedAdmin(incoming, options.adminToken)) {
@@ -739,8 +759,77 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         const ready =
           runtimeAvailable &&
           runtimeConfiguration.status === "ready" &&
-          scheduler.snapshot().length > 0;
+          scheduler.hasSchedulableCandidate();
         writeJson(response, ready ? 200 : 503, { status: ready ? "ready" : "not-ready" });
+        return;
+      }
+
+      if (incoming.method === "GET" && incoming.url === "/console/snapshot") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        const candidates = scheduler.snapshot();
+        const healthById = new Map(
+          (healthController?.snapshot() ?? []).map((snapshot) => [snapshot.id, snapshot]),
+        );
+        const nodeStatuses: Record<string, number> = {};
+        const nodes = candidates.map((candidate) => {
+          const health = healthById.get(candidate.id);
+          const enabled = candidate.manualWeight > 0 && health?.manuallyEnabled !== false;
+          const status = enabled
+            ? (health?.status ?? scheduler.healthStatus(candidate.id) ?? "healthy")
+            : "disabled";
+          nodeStatuses[status] = (nodeStatuses[status] ?? 0) + 1;
+          return {
+            activeConnections: candidate.activeConnections,
+            ...(candidate.selectors?.[0] === undefined ? {} : { alias: candidate.selectors[0] }),
+            enabled,
+            id: candidate.id,
+            latencyMs: Math.round(candidate.ewmaLatencyMs),
+            status,
+            successRate: candidate.successRate,
+          };
+        });
+        const drainingNodes = scheduler.drainingCount();
+        if (drainingNodes > 0) {
+          nodeStatuses.draining = drainingNodes;
+        }
+        const connectionCounts = metrics.connectionSnapshot();
+        const activeConnectionCounts = softStickySessions.redactedActiveConnectionCounts();
+        writeJson(response, 200, {
+          gateway: {
+            host: options.host,
+            port: publicPort,
+            ready:
+              runtimeAvailable &&
+              runtimeConfiguration.status === "ready" &&
+              scheduler.hasSchedulableCandidate(),
+          },
+          generatedAt: new Date().toISOString(),
+          metrics: {
+            activeSessions: softStickySessions.countActiveSessions(),
+            failedConnections: connectionCounts.failed,
+            healthyNodes: nodeStatuses.healthy ?? 0,
+            successConnections: connectionCounts.succeeded,
+            totalNodes: nodes.length,
+          },
+          nodes,
+          nodeStatusCounts: nodeStatuses,
+          operationCounts: state?.operationStatusCounts() ?? {},
+          operations: state?.listConsoleOperations() ?? [],
+          sessions: (state?.listConsoleSessions() ?? []).map((session) => ({
+            ...session,
+            activeConnections: activeConnectionCounts.get(session.id) ?? 0,
+          })),
+          subscriptions: (state?.listConsoleSubscriptions() ?? []).map((subscription) => ({
+            ...subscription,
+            locator:
+              subscription.kind === "remote"
+                ? redactSubscriptionUrl(subscription.locator)
+                : "local source",
+          })),
+        });
         return;
       }
 
@@ -1052,6 +1141,34 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      const nodeEnabledMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/enabled$/);
+      if (incoming.method === "PUT" && nodeEnabledMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        readBody(incoming)
+          .then(parseNodeEnabledRequest)
+          .then((enabled) => {
+            const nodeId = decodeNodeLogicalId(nodeEnabledMatch[1] as string);
+            if (!setNodeEnabled(nodeId, enabled)) {
+              writeJson(response, 404, { error: "active node not found" });
+              return;
+            }
+            writeJson(response, 200, { enabled, nodeId });
+          })
+          .catch((error: unknown) => {
+            const invalidRequest =
+              error instanceof NodeEnabledRequestError || error instanceof NodeAliasRequestError;
+            writeJson(response, invalidRequest ? 422 : 500, {
+              error: invalidRequest
+                ? "node enabled request is invalid"
+                : "node enabled state could not be saved",
+            });
+          });
+        return;
+      }
+
       const forceRevisionMatch = incoming.url?.match(/^\/revisions\/(\d+)\/force$/);
       if (incoming.method === "POST" && forceRevisionMatch) {
         if (!isAuthorizedAdmin(incoming, options.adminToken)) {
@@ -1108,6 +1225,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
 
       if (localControl) {
         writeJson(response, 404, { error: "management route not found" });
+        return;
+      }
+
+      if (options.webDirectory && incoming.url?.startsWith("/")) {
+        void serveStaticWeb(incoming, response, options.webDirectory).then((served) => {
+          if (!served) writeJson(response, 404, { error: "management route not found" });
+        });
         return;
       }
 
@@ -1192,6 +1316,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     await closeStartupResources();
     throw new Error("egressd did not bind a TCP address");
   }
+  publicPort = address.port;
 
   let healthCheckRunning = false;
   let healthCheckRun: Promise<void> | undefined;
@@ -1264,7 +1389,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     },
     healthSnapshot: () => healthController?.snapshot() ?? [],
     importLocalSubscription,
-    setNodeEnabled: (id, enabled) => healthController?.setManualEnabled(id, enabled) ?? false,
+    setNodeEnabled,
   };
 }
 
@@ -1475,7 +1600,21 @@ function parseNodeAliasRequest(body: string): string {
   return document.alias;
 }
 
+function parseNodeEnabledRequest(body: string): boolean {
+  try {
+    const document = JSON.parse(body) as { enabled?: unknown };
+    if (typeof document.enabled !== "boolean") {
+      throw new NodeEnabledRequestError("enabled must be a boolean");
+    }
+    return document.enabled;
+  } catch (error) {
+    if (error instanceof NodeEnabledRequestError) throw error;
+    throw new NodeEnabledRequestError("enabled request must be JSON", { cause: error });
+  }
+}
+
 class NodeAliasRequestError extends Error {}
+class NodeEnabledRequestError extends Error {}
 
 function decodeNodeLogicalId(encoded: string): string {
   try {

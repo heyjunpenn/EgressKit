@@ -7,10 +7,13 @@ RUN corepack enable
 WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json biome.json ./
 COPY apps/egressd/package.json apps/egressd/package.json
+COPY apps/web/package.json apps/web/package.json
 RUN pnpm install --frozen-lockfile
 COPY apps/egressd apps/egressd
-RUN pnpm --filter @egresskit/egressd build \
-    && pnpm --filter @egresskit/egressd deploy --prod --legacy /opt/egresskit
+COPY apps/web apps/web
+RUN pnpm --filter @egresskit/app-web build \
+    && pnpm --filter @egresskit/app-egressd build \
+    && pnpm --filter @egresskit/app-egressd deploy --prod --legacy /opt/egresskit
 
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
 ARG TARGETARCH
@@ -30,6 +33,7 @@ RUN set -eux; \
     install --mode=0755 /tmp/mihomo /usr/local/bin/mihomo; \
     rm /tmp/mihomo
 COPY --from=build /opt/egresskit /opt/egresskit
+COPY --from=build /workspace/apps/web/dist /opt/egresskit/web
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/egresskit/
 COPY licenses/Mihomo-GPL-3.0.txt /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt
 RUN mkdir --parents /var/lib/egresskit \
@@ -37,6 +41,7 @@ RUN mkdir --parents /var/lib/egresskit \
 ENV EGRESSKIT_STATE_DIRECTORY=/var/lib/egresskit
 ENV EGRESSKIT_MIHOMO_BINARY=/usr/local/bin/mihomo
 ENV EGRESSKIT_HOST=0.0.0.0
+ENV EGRESSKIT_WEB_DIRECTORY=/opt/egresskit/web
 EXPOSE 8787
 USER node
 ENTRYPOINT ["node", "/opt/egresskit/dist/cli.js"]

@@ -227,6 +227,9 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 - HTTP 管理 API默认绑定 loopback，并始终脱敏订阅 URL。
 - 本机 CLI通过 Unix domain socket 管理 API执行读写；它不绕过 daemon 访问 SQLite。
 - HTTP 管理 API和 Unix socket 都要求独立 admin token；admin token 与代理入口 token 不同。
+- Docker 镜像内置同版本 Web 控制台，由 `egressd` 提供静态资源和 SPA 路由。
+- Web 控制台覆盖概览、订阅管理、代理管理、活跃会话、快捷操作 Playground 和使用文档；登录凭据仅保存在浏览器会话中。
+- 除 `/live` 与 `/ready` 基础设施探针外，Web 控制台发起的全部管理 API 请求都必须携带 admin token；代理数据面继续使用独立的 proxy token。
 - CLI默认可以显示完整订阅 URL，并提供 `--redact`；HTTP API不提供读取完整 URL的能力。
 - CLI支持从标准输入读取订阅 URL，减少 URL进入 shell history 的机会。
 - 添加或更新订阅返回持久化 operation ID；CLI默认等待状态变化，也支持不等待并在之后查询。
@@ -351,7 +354,6 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 - SOCKS5 对外入口。
 - Redis、分布式 session、多实例高可用和跨主机协调。
 - 公网多租户、计费、配额套餐和商业代理运营。
-- Web 管理后台。
 - 自动购买或发现第三方代理。
 - 浏览器指纹管理、Cookie 管理、账号自动化编排和 CAPTCHA 识别。
 - 自动兼容所有机场订阅方言、Base64 订阅、sing-box JSON 和任意分享链接。

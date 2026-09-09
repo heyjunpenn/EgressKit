@@ -181,6 +181,13 @@ export class RotateScheduler {
     return this.#states.some(({ candidate }) => candidate.id === id);
   }
 
+  hasSchedulableCandidate(): boolean {
+    return this.#states.some(
+      ({ candidate }) =>
+        candidate.healthy && candidate.manualWeight > 0 && candidate.successRate > 0,
+    );
+  }
+
   snapshot(): readonly SchedulerCandidate[] {
     return this.#states.map(({ candidate }) => ({ ...candidate }));
   }
@@ -221,6 +228,18 @@ export class RotateScheduler {
     state.candidate = {
       ...state.candidate,
       healthy: healthStatus === "healthy" || healthStatus === "degraded",
+    };
+    return true;
+  }
+
+  setManualEnabled(id: string, enabled: boolean): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) {
+      return false;
+    }
+    state.candidate = {
+      ...state.candidate,
+      manualWeight: enabled ? 1 : 0,
     };
     return true;
   }

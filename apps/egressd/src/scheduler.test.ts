@@ -78,6 +78,19 @@ test("each scheduling signal can independently change the next selection", () =>
   }
 });
 
+test("manual enabled state excludes and restores a candidate", () => {
+  const scheduler = new RotateScheduler([candidate("first")]);
+
+  assert.equal(scheduler.setManualEnabled("first", false), true);
+  assert.equal(scheduler.acquire(), undefined);
+  assert.equal(scheduler.snapshot()[0]?.manualWeight, 0);
+
+  assert.equal(scheduler.setManualEnabled("first", true), true);
+  const lease = scheduler.acquire();
+  assert.equal(lease?.candidate.id, "first");
+  lease?.release();
+});
+
 test("explicit selectors are unique, exact, and never fall back", () => {
   const scheduler = new RotateScheduler([
     candidate("first", { selectors: ["primary"] }),

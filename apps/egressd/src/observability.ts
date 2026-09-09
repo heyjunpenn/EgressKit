@@ -41,6 +41,13 @@ export class EgressdMetrics {
     this.#fallbacks += 1;
   }
 
+  connectionSnapshot(): { failed: number; succeeded: number } {
+    return {
+      failed: this.#connectionFailures,
+      succeeded: this.#connectionSuccesses,
+    };
+  }
+
   render(snapshot: MetricsSnapshot): string {
     const lines = [
       "# HELP egresskit_connections_total Completed upstream connection attempts.",

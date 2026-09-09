@@ -118,7 +118,7 @@ export async function main() {
   process.once("SIGTERM", interrupt);
 
   try {
-    run("pnpm", ["--filter", "@egresskit/egressd", "build"], { env: childEnvironment });
+    run("pnpm", ["--filter", "@egresskit/app-egressd", "build"], { env: childEnvironment });
     ensureNotCancelled();
     daemon = spawn("node", ["apps/egressd/dist/cli.js"], {
       env: {

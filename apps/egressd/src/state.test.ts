@@ -26,6 +26,40 @@ test("control state enables durable SQLite settings and holds a single-writer lo
   await assert.rejects(openControlState(stateDirectory), /already owned by another daemon/);
 });
 
+test("control state persists manual node enabled overrides", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const first = await openControlState(stateDirectory);
+  first.saveNodeEnabledOverride("subscription:node", false);
+  await first.close();
+
+  const restored = await openControlState(stateDirectory);
+  t.after(() => restored.close());
+  assert.equal(restored.getNodeEnabledOverrides().get("subscription:node"), false);
+});
+
+test("session rebinding updates the persisted routing mode", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const state = await openControlState(stateDirectory);
+  t.after(() => state.close());
+  state.saveSessionBinding("identity", {
+    createdAt: 1,
+    lastUsedAt: 1,
+    logicalNodeId: "first",
+    mode: "strict",
+  });
+
+  state.saveSessionBinding("identity", {
+    createdAt: 2,
+    lastUsedAt: 2,
+    logicalNodeId: "second",
+    mode: "sticky",
+  });
+
+  assert.equal(state.getSessionBinding("identity")?.mode, "sticky");
+});
+
 test("control state restores the last active subscription revision and node generation", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-state-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));

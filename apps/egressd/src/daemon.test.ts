@@ -42,6 +42,132 @@ test("/live reports Node process liveness without a Mihomo listener", async (t) 
   assert.deepEqual(await response.json(), { status: "live" });
 });
 
+test("console snapshot is authenticated and redacts management data", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-console-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const daemon = await startEgressd({
+    adminToken: "console-admin",
+    fetchSubscription: async () => new Response("proxies: []"),
+    host: "127.0.0.1",
+    mihomoListener: new URL("http://127.0.0.1:20001"),
+    port: 0,
+    proxyAuthentication: false,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const origin = `http://${daemon.address.host}:${daemon.address.port}`;
+
+  const unauthorized = await fetch(`${origin}/console/snapshot`);
+  assert.equal(unauthorized.status, 401);
+
+  const created = await fetch(`${origin}/subscriptions/remote`, {
+    body: JSON.stringify({
+      url: "https://user:password@provider.example/subscription?token=secret",
+    }),
+    headers: {
+      authorization: "Bearer console-admin",
+      "content-type": "application/json",
+    },
+    method: "POST",
+  });
+  assert.equal(created.status, 202);
+
+  const response = await fetch(`${origin}/console/snapshot`, {
+    headers: { authorization: "Bearer console-admin" },
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    gateway: { host: string; port: number; ready: boolean };
+    nodes: Array<{ id: string; listener?: string }>;
+    sessions: unknown[];
+    subscriptions: Array<{ locator: string }>;
+  };
+  assert.deepEqual(body.gateway, {
+    host: "127.0.0.1",
+    port: daemon.address.port,
+    ready: true,
+  });
+  assert.equal(body.nodes[0]?.id, "configured");
+  assert.equal(body.nodes[0]?.listener, undefined);
+  assert.deepEqual(body.sessions, []);
+  assert.equal(body.subscriptions.length, 1);
+  assert.equal(body.subscriptions[0]?.locator, "https://provider.example/[redacted]");
+  assert.doesNotMatch(JSON.stringify(body), /password|secret/);
+});
+
+test("authenticated node enabled mutation controls scheduling health", async (t) => {
+  const daemon = await startEgressd({
+    adminToken: "console-admin",
+    host: "127.0.0.1",
+    mihomoListener: new URL("http://127.0.0.1:20001"),
+    port: 0,
+    proxyAuthentication: false,
+  });
+  t.after(() => daemon.close());
+  const origin = `http://${daemon.address.host}:${daemon.address.port}`;
+
+  const response = await fetch(`${origin}/nodes/configured/enabled`, {
+    body: JSON.stringify({ enabled: false }),
+    headers: {
+      authorization: "Bearer console-admin",
+      "content-type": "application/json",
+    },
+    method: "PUT",
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { enabled: false, nodeId: "configured" });
+  const snapshot = await fetch(`${origin}/console/snapshot`, {
+    headers: { authorization: "Bearer console-admin" },
+  });
+  const body = (await snapshot.json()) as {
+    gateway: { ready: boolean };
+    nodeStatusCounts: Record<string, number>;
+    nodes: Array<{ enabled: boolean; status: string }>;
+  };
+  assert.equal(body.gateway.ready, false);
+  assert.equal(body.nodes[0]?.enabled, false);
+  assert.equal(body.nodes[0]?.status, "disabled");
+  assert.equal(body.nodeStatusCounts.disabled, 1);
+  const readiness = await fetch(`${origin}/ready`);
+  assert.equal(readiness.status, 503);
+});
+
+test("manual node enabled override survives a daemon restart", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-node-enabled-state-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const options = {
+    adminToken: "console-admin",
+    host: "127.0.0.1",
+    mihomoListener: new URL("http://127.0.0.1:20001"),
+    port: 0,
+    proxyAuthentication: false as const,
+    stateDirectory,
+  };
+  const first = await startEgressd(options);
+  const firstOrigin = `http://${first.address.host}:${first.address.port}`;
+  const disabled = await fetch(`${firstOrigin}/nodes/configured/enabled`, {
+    body: JSON.stringify({ enabled: false }),
+    headers: {
+      authorization: "Bearer console-admin",
+      "content-type": "application/json",
+    },
+    method: "PUT",
+  });
+  assert.equal(disabled.status, 200);
+  await first.close();
+
+  const restored = await startEgressd(options);
+  t.after(() => restored.close());
+  const restoredOrigin = `http://${restored.address.host}:${restored.address.port}`;
+  const response = await fetch(`${restoredOrigin}/console/snapshot`, {
+    headers: { authorization: "Bearer console-admin" },
+  });
+  const body = (await response.json()) as { nodes: Array<{ enabled: boolean; status: string }> };
+  assert.equal(body.nodes[0]?.enabled, false);
+  assert.equal(body.nodes[0]?.status, "disabled");
+});
+
 test("daemon shutdown closes an idle HTTP keep-alive connection", async () => {
   const daemon = await startEgressd({ host: "127.0.0.1", port: 0 });
   const client = connect(daemon.address.port, daemon.address.host);

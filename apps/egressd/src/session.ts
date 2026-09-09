@@ -15,6 +15,7 @@ export interface PersistedSessionBinding {
   createdAt: number;
   lastUsedAt: number;
   logicalNodeId: string;
+  mode: "sticky" | "strict";
 }
 
 export interface SessionBindingStore {
@@ -28,7 +29,7 @@ export interface SessionBindingStore {
   getSessionBinding(identity: string): PersistedSessionBinding | undefined;
   loadOrCreateSessionHmacKey(): Buffer;
   saveSessionBinding(identity: string, binding: PersistedSessionBinding): void;
-  touchSessionBinding(identity: string, lastUsedAt: number): void;
+  touchSessionBinding(identity: string, lastUsedAt: number, mode?: "sticky" | "strict"): void;
 }
 
 export interface SoftStickySessionOptions {
@@ -106,6 +107,15 @@ export class SoftStickySessions {
     return this.#activeSessionCount();
   }
 
+  redactedActiveConnectionCounts(): ReadonlyMap<string, number> {
+    return new Map(
+      [...this.#activeConnections].map(([identity, count]) => [
+        `${identity.slice(0, 8)}…${identity.slice(-8)}`,
+        count,
+      ]),
+    );
+  }
+
   #acquire(
     sessionKey: string,
     rebindUnavailable: boolean,
@@ -128,7 +138,7 @@ export class SoftStickySessions {
         ? this.#scheduler.acquireById(binding.logicalNodeId)
         : undefined;
     if (binding && !lease && !rebindUnavailable) {
-      this.#store.touchSessionBinding(identity, now);
+      this.#store.touchSessionBinding(identity, now, rebindUnavailable ? "sticky" : "strict");
       return undefined;
     }
     if (!lease) {
@@ -147,6 +157,7 @@ export class SoftStickySessions {
         createdAt: now,
         lastUsedAt: now,
         logicalNodeId: lease.candidate.id,
+        mode: rebindUnavailable ? "sticky" : "strict",
       };
       try {
         this.#store.saveSessionBinding(identity, binding);
@@ -156,7 +167,7 @@ export class SoftStickySessions {
       }
     } else {
       try {
-        this.#store.touchSessionBinding(identity, now);
+        this.#store.touchSessionBinding(identity, now, rebindUnavailable ? "sticky" : "strict");
       } catch (error) {
         lease.release();
         throw error;

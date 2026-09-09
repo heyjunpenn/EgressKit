@@ -86,6 +86,28 @@ export interface SubscriptionOperation {
   subscriptionId: string;
 }
 
+export interface ConsoleSubscriptionSummary extends SubscriptionIdentity {
+  nodeCount: number;
+  revisionId?: number;
+  status: SubscriptionRevisionStatus | "pending";
+  updatedAt?: string;
+}
+
+export interface ConsoleSessionSummary {
+  createdAt: number;
+  id: string;
+  lastUsedAt: number;
+  mode: "sticky" | "strict";
+  nodeId: string;
+}
+
+export interface ConsoleOperationSummary {
+  id: string;
+  status: OperationStatus;
+  subscriptionId: string;
+  updatedAt: string;
+}
+
 export class NodeAliasConflictError extends Error {}
 export class NodeAliasTargetNotFoundError extends Error {}
 
@@ -108,8 +130,12 @@ export interface ControlState extends SessionBindingStore {
   ): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
   getNodeAliases(): ReadonlyMap<string, string>;
+  getNodeEnabledOverrides(): ReadonlyMap<string, boolean>;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
+  listConsoleSessions(): ConsoleSessionSummary[];
+  listConsoleOperations(): ConsoleOperationSummary[];
+  listConsoleSubscriptions(): ConsoleSubscriptionSummary[];
   listDrainingListenerLeases(): PersistedListenerLease[];
   operationStatusCounts(): Record<string, number>;
   loadProxyTokens(): PersistedProxyToken[] | undefined;
@@ -132,6 +158,7 @@ export interface ControlState extends SessionBindingStore {
     subscriptionRevisionId?: number;
   }): PersistedActiveRevision;
   saveNodeAlias(logicalNodeId: string, alias: string): void;
+  saveNodeEnabledOverride(logicalNodeId: string, enabled: boolean): void;
   saveProxyTokens(tokens: readonly PersistedProxyToken[]): void;
   saveValidatedRevision(subscriptionRevisionId: number, imported: ImportedVlessRevision): void;
   markRevisionAccepted(subscriptionRevisionId: number, operationId: string): void;
@@ -195,9 +222,13 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       failForceOperation(controlDatabase, operationId, subscriptionRevisionId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
     getNodeAliases: () => getNodeAliases(controlDatabase),
+    getNodeEnabledOverrides: () => getNodeEnabledOverrides(controlDatabase),
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
+    listConsoleSessions: () => listConsoleSessions(controlDatabase),
+    listConsoleOperations: () => listConsoleOperations(controlDatabase),
+    listConsoleSubscriptions: () => listConsoleSubscriptions(controlDatabase),
     listDrainingListenerLeases: () => listDrainingListenerLeases(controlDatabase),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
@@ -209,6 +240,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       releaseNodeGeneration(controlDatabase, logicalId, generation, listenerPort, reusableAfter),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
     saveNodeAlias: (logicalNodeId, alias) => saveNodeAlias(controlDatabase, logicalNodeId, alias),
+    saveNodeEnabledOverride: (logicalNodeId, enabled) =>
+      saveNodeEnabledOverride(controlDatabase, logicalNodeId, enabled),
     saveProxyTokens: (tokens) => saveProxyTokens(controlDatabase, tokens),
     saveValidatedRevision: (subscriptionRevisionId, imported) =>
       saveValidatedRevision(controlDatabase, subscriptionRevisionId, imported),
@@ -232,8 +265,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     }),
     transitionOperation: (operationId, status) =>
       transitionOperation(controlDatabase, operationId, status),
-    touchSessionBinding: (identity, lastUsedAt) =>
-      touchSessionBinding(controlDatabase, identity, lastUsedAt),
+    touchSessionBinding: (identity, lastUsedAt, mode) =>
+      touchSessionBinding(controlDatabase, identity, lastUsedAt, mode),
     close: async () => {
       if (closed) {
         return;
@@ -287,17 +320,23 @@ function getSessionBinding(
 ): PersistedSessionBinding | undefined {
   const row = database
     .prepare(
-      `SELECT logical_node_id, created_at, last_used_at
+      `SELECT logical_node_id, created_at, last_used_at, mode
        FROM session_bindings WHERE session_identity = ?`,
     )
     .get(identity) as
-    | { created_at: number; last_used_at: number; logical_node_id: string }
+    | {
+        created_at: number;
+        last_used_at: number;
+        logical_node_id: string;
+        mode: "sticky" | "strict";
+      }
     | undefined;
   return row
     ? {
         createdAt: row.created_at,
         lastUsedAt: row.last_used_at,
         logicalNodeId: row.logical_node_id,
+        mode: row.mode,
       }
     : undefined;
 }
@@ -308,6 +347,26 @@ function getNodeAliases(database: DatabaseSync): ReadonlyMap<string, string> {
     logical_id: string;
   }>;
   return new Map(rows.map((row) => [row.logical_id, row.alias]));
+}
+
+function getNodeEnabledOverrides(database: DatabaseSync): ReadonlyMap<string, boolean> {
+  const rows = database
+    .prepare("SELECT logical_id, enabled FROM node_enabled_overrides")
+    .all() as Array<{ enabled: 0 | 1; logical_id: string }>;
+  return new Map(rows.map((row) => [row.logical_id, row.enabled === 1]));
+}
+
+function saveNodeEnabledOverride(
+  database: DatabaseSync,
+  logicalNodeId: string,
+  enabled: boolean,
+): void {
+  database
+    .prepare(
+      `INSERT INTO node_enabled_overrides (logical_id, enabled) VALUES (?, ?)
+       ON CONFLICT(logical_id) DO UPDATE SET enabled = excluded.enabled`,
+    )
+    .run(logicalNodeId, enabled ? 1 : 0);
 }
 
 function saveNodeAlias(database: DatabaseSync, logicalNodeId: string, alias: string): void {
@@ -405,20 +464,28 @@ function saveSessionBinding(
   database
     .prepare(
       `INSERT INTO session_bindings
-         (session_identity, logical_node_id, created_at, last_used_at)
-       VALUES (?, ?, ?, ?)
+         (session_identity, logical_node_id, created_at, last_used_at, mode)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(session_identity) DO UPDATE SET
          logical_node_id = excluded.logical_node_id,
          created_at = excluded.created_at,
-         last_used_at = excluded.last_used_at`,
+         last_used_at = excluded.last_used_at,
+         mode = excluded.mode`,
     )
-    .run(identity, binding.logicalNodeId, binding.createdAt, binding.lastUsedAt);
+    .run(identity, binding.logicalNodeId, binding.createdAt, binding.lastUsedAt, binding.mode);
 }
 
-function touchSessionBinding(database: DatabaseSync, identity: string, lastUsedAt: number): void {
+function touchSessionBinding(
+  database: DatabaseSync,
+  identity: string,
+  lastUsedAt: number,
+  mode?: "sticky" | "strict",
+): void {
   database
-    .prepare("UPDATE session_bindings SET last_used_at = ? WHERE session_identity = ?")
-    .run(lastUsedAt, identity);
+    .prepare(
+      "UPDATE session_bindings SET last_used_at = ?, mode = COALESCE(?, mode) WHERE session_identity = ?",
+    )
+    .run(lastUsedAt, mode ?? null, identity);
 }
 
 function acquireLock(lockPath: string, stateDirectory: string): DatabaseSync {
@@ -499,7 +566,8 @@ function migrate(database: DatabaseSync): void {
       session_identity TEXT PRIMARY KEY,
       logical_node_id TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      last_used_at INTEGER NOT NULL
+      last_used_at INTEGER NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'sticky' CHECK (mode IN ('sticky', 'strict'))
     );
     CREATE TABLE IF NOT EXISTS daemon_metadata (
       key TEXT PRIMARY KEY,
@@ -513,6 +581,10 @@ function migrate(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS node_aliases (
       alias TEXT PRIMARY KEY,
       logical_id TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS node_enabled_overrides (
+      logical_id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
     );
     CREATE TABLE IF NOT EXISTS listener_port_leases (
       listener_port INTEGER PRIMARY KEY,
@@ -556,9 +628,10 @@ function migrate(database: DatabaseSync): void {
       WHERE NOT EXISTS (
         SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
       );
-    PRAGMA user_version = 6;
+    PRAGMA user_version = 7;
   `);
   ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
+  ensureColumn(database, "session_bindings", "mode", "TEXT NOT NULL DEFAULT 'sticky'");
 }
 
 function ensureColumn(
@@ -710,6 +783,86 @@ function getSubscription(
     .prepare("SELECT id, kind, locator FROM subscriptions WHERE id = ?")
     .get(subscriptionId) as { id: string; kind: "local" | "remote"; locator: string } | undefined;
   return row;
+}
+
+function listConsoleSubscriptions(database: DatabaseSync): ConsoleSubscriptionSummary[] {
+  const rows = database
+    .prepare(
+      `SELECT s.id, s.kind, s.locator, sr.id AS revision_id,
+              sr.lifecycle_status, sr.normalized_nodes_json, sr.created_at
+       FROM subscriptions s
+       LEFT JOIN subscription_revisions sr ON sr.id = (
+         SELECT latest.id FROM subscription_revisions latest
+         WHERE latest.subscription_id = s.id ORDER BY latest.id DESC LIMIT 1
+       )
+       ORDER BY s.id`,
+    )
+    .all() as Array<{
+    created_at: string | null;
+    id: string;
+    kind: "local" | "remote";
+    lifecycle_status: SubscriptionRevisionStatus | null;
+    locator: string;
+    normalized_nodes_json: string | null;
+    revision_id: number | null;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    locator: row.locator,
+    nodeCount:
+      row.normalized_nodes_json === null
+        ? 0
+        : (JSON.parse(row.normalized_nodes_json) as unknown[]).length,
+    ...(row.revision_id === null ? {} : { revisionId: row.revision_id }),
+    status: row.lifecycle_status ?? "pending",
+    ...(row.created_at === null ? {} : { updatedAt: row.created_at }),
+  }));
+}
+
+function listConsoleSessions(database: DatabaseSync): ConsoleSessionSummary[] {
+  const rows = database
+    .prepare(
+      `SELECT session_identity, logical_node_id, created_at, last_used_at, mode
+       FROM session_bindings ORDER BY last_used_at DESC LIMIT 200`,
+    )
+    .all() as Array<{
+    created_at: number;
+    last_used_at: number;
+    logical_node_id: string;
+    mode: "sticky" | "strict";
+    session_identity: string;
+  }>;
+  return rows.map((row) => ({
+    createdAt: row.created_at,
+    id: `${row.session_identity.slice(0, 8)}…${row.session_identity.slice(-8)}`,
+    lastUsedAt: row.last_used_at,
+    mode: row.mode,
+    nodeId: row.logical_node_id,
+  }));
+}
+
+function listConsoleOperations(database: DatabaseSync): ConsoleOperationSummary[] {
+  return database
+    .prepare(
+      `SELECT id, subscription_id, status, updated_at
+       FROM operations ORDER BY updated_at DESC LIMIT 12`,
+    )
+    .all()
+    .map((row) => {
+      const value = row as {
+        id: string;
+        status: OperationStatus;
+        subscription_id: string;
+        updated_at: string;
+      };
+      return {
+        id: value.id,
+        status: value.status,
+        subscriptionId: value.subscription_id,
+        updatedAt: value.updated_at,
+      };
+    });
 }
 
 function getOperation(

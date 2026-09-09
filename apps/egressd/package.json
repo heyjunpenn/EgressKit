@@ -1,5 +1,5 @@
 {
-  "name": "@egresskit/egressd",
+  "name": "@egresskit/app-egressd",
   "version": "0.0.0",
   "private": true,
   "type": "module",

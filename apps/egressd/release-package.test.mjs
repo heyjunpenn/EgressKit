@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, unlink } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,10 +33,10 @@ test("release metadata identifies EgressKit and redistributed Mihomo licenses", 
 });
 
 test("the packaged release contains both built entry points and legal files", async () => {
-  await execFileAsync("pnpm", ["--filter", "@egresskit/egressd", "build"], { cwd: root });
+  await execFileAsync("pnpm", ["--filter", "@egresskit/app-egressd", "build"], { cwd: root });
   const { stdout } = await execFileAsync(
     "pnpm",
-    ["--filter", "@egresskit/egressd", "pack", "--pack-destination", "release"],
+    ["--filter", "@egresskit/app-egressd", "pack", "--pack-destination", "release"],
     { cwd: root },
   );
   const archive = stdout.trim().split("\n").at(-1);
@@ -79,4 +79,16 @@ test("the packaged release contains both built entry points and legal files", as
     await unlink(archive);
     await rm(installation, { recursive: true, force: true });
   }
+});
+
+test("the Docker release input contains a built Web SPA", async () => {
+  await execFileAsync("pnpm", ["--filter", "@egresskit/app-web", "build"], { cwd: root });
+  const [document, assets] = await Promise.all([
+    text("apps/web/dist/index.html"),
+    readdir(new URL("apps/web/dist/assets/", root)),
+  ]);
+
+  assert.match(document, /<div id="root"><\/div>/);
+  assert.ok(assets.some((name) => /^index-[\w-]+\.js$/.test(name)));
+  assert.ok(assets.some((name) => /^index-[\w-]+\.css$/.test(name)));
 });

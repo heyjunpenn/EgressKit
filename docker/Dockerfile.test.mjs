@@ -28,3 +28,11 @@ test("the Docker image receives both EgressKit and Mihomo license materials", as
   assert.match(dockerfile, /COPY LICENSE THIRD_PARTY_NOTICES\.md/);
   assert.match(dockerfile, /COPY licenses\/Mihomo-GPL-3\.0\.txt/);
 });
+
+test("the Docker build embeds the web application in the backend image", async () => {
+  const dockerfile = await readFile(new URL("docker/Dockerfile", root), "utf8");
+
+  assert.match(dockerfile, /@egresskit\/app-web build/);
+  assert.match(dockerfile, /COPY --from=build \/workspace\/apps\/web\/dist \/opt\/egresskit\/web/);
+  assert.match(dockerfile, /EGRESSKIT_WEB_DIRECTORY=\/opt\/egresskit\/web/);
+});

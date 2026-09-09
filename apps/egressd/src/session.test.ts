@@ -33,6 +33,18 @@ test("session persistence failures release scheduler leases and in-memory capaci
   retried.release();
 });
 
+test("persisted session bindings retain the requested sticky mode without exposing the key", () => {
+  const store = new FaultingSessionStore();
+  const sessions = new SoftStickySessions({ scheduler: new TrackingScheduler(), store });
+
+  const lease = sessions.acquireStrict("private-session-key");
+
+  assert.ok(lease);
+  assert.equal(store.binding?.mode, "strict");
+  assert.doesNotMatch(JSON.stringify(store.binding), /private-session-key/);
+  lease.release();
+});
+
 class TrackingScheduler {
   activeLeases = 0;
   readonly #candidate = createSchedulerCandidate("only", new URL("http://127.0.0.1:20000"));

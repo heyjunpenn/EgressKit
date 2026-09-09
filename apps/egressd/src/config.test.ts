@@ -89,6 +89,15 @@ test("state directory configures durable daemon control state", () => {
   assert.equal(loadConfig({ XDG_STATE_HOME: "/tmp/state" }).stateDirectory, "/tmp/state/egresskit");
 });
 
+test("web directory enables the embedded console without changing the default", () => {
+  assert.equal(loadConfig({}).webDirectory, undefined);
+  assert.equal(
+    loadConfig({ EGRESSKIT_WEB_DIRECTORY: "/opt/egresskit/web" }).webDirectory,
+    "/opt/egresskit/web",
+  );
+  assert.throws(() => loadConfig({ EGRESSKIT_WEB_DIRECTORY: "" }), /must not be empty/);
+});
+
 test("minimum subscription nodes is a positive configurable integer", () => {
   assert.equal(
     loadConfig({ EGRESSKIT_MINIMUM_SUBSCRIPTION_NODES: "3" }).minimumSubscriptionNodes,
