@@ -231,7 +231,12 @@ export function Table<T>({
         className,
       )}
     >
-      <div ref={scrollRef} onScroll={handleScroll} className="overflow-auto" style={{ height }}>
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="isolate overflow-auto"
+        style={{ height }}
+      >
         <table
           className={cn("border-collapse", sized ? "w-max" : undefined)}
           style={{

@@ -180,7 +180,7 @@ export function TableHeader<T>({
       <thead>
         <tr style={{ height: rowHeight }}>
           {selectable ? (
-            <th className="sticky top-0 z-10 border-border border-b bg-muted">
+            <th className="sticky top-0 z-20 border-border border-b bg-muted">
               <div className="flex items-center justify-center">
                 <Checkbox
                   checked={allSelected}
@@ -213,7 +213,7 @@ export function TableHeader<T>({
                   dragKey ? dropIndex === columns.length && index === columns.length - 1 : undefined
                 }
                 className={cn(
-                  "group sticky top-0 z-10 border-border border-b bg-muted p-0 font-medium text-muted-foreground",
+                  "group sticky top-0 z-20 border-border border-b bg-muted p-0 font-medium text-muted-foreground",
                   "data-[drop=true]:before:absolute data-[drop=true]:before:inset-y-0 data-[drop=true]:before:left-0 data-[drop=true]:before:w-0.5 data-[drop=true]:before:bg-primary",
                   "data-[dropend=true]:after:absolute data-[dropend=true]:after:inset-y-0 data-[dropend=true]:after:right-0 data-[dropend=true]:after:w-0.5 data-[dropend=true]:after:bg-primary",
                 )}
@@ -306,7 +306,7 @@ export function TableHeader<T>({
               </th>
             );
           })}
-          <th aria-hidden className="sticky top-0 z-10 border-border border-b bg-muted" />
+          <th aria-hidden className="sticky top-0 z-20 border-border border-b bg-muted" />
         </tr>
       </thead>
     </>
