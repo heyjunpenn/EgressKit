@@ -140,6 +140,36 @@ flowchart LR
 
 Several nodes can share one public IP, so EgressKit schedules verified exit IPs rather than counting nodes as distinct exits. `rotate` selects the least recently used IP group and then a healthy transport within that group. Sticky, strict, and explicit-node routes also bind to an exit IP.
 
+### Proxy lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Verifying: node imported / generation changed
+
+    Verifying --> AwaitingExit: health passes, but no exit IP
+    AwaitingExit --> Verifying: retry on the next health cycle
+    Verifying --> Schedulable: health and exit IP verified
+    AwaitingExit --> Schedulable: exit IP verified
+
+    Schedulable --> Degraded: failure threshold reached
+    Degraded --> Schedulable: health recovers
+    Degraded --> Cooldown: cooldown threshold reached
+    Cooldown --> Verifying: cooldown expires
+
+    Verifying --> Disabled: manually disabled
+    AwaitingExit --> Disabled: manually disabled
+    Schedulable --> Disabled: manually disabled
+    Degraded --> Disabled: manually disabled
+    Cooldown --> Disabled: manually disabled
+    Disabled --> Verifying: re-enabled
+
+    Schedulable --> Draining: old generation replaced or removed
+    Draining --> Removed: existing connections reach zero
+    Removed --> [*]
+```
+
+Passing a health check and becoming schedulable are separate conditions: a proxy enters the scheduling pool only after it is healthy and has a verified exit IP. Consecutive failures move it through `degraded` and then exponentially backed-off `cooldown`; after cooldown it returns to `warming` for another probe. Automatic probes never override a manual disable. A subscription update gives a changed generation a fresh verification cycle while the old generation stops accepting new connections; its listener is removed and its port quarantined after existing connections drain.
+
 For HTTPS, EgressKit can try another exit before returning `200 Connection Established`. After the tunnel is established, EgressKit forwards encrypted bytes without decrypting or replaying requests. The client decides whether to reconnect after a tunnel failure.
 
 ## Configuration and data
