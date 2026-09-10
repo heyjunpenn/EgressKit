@@ -41,7 +41,7 @@ docker run --rm \
   -v egresskit-state:/var/lib/egresskit \
   -p 127.0.0.1:8787:8787 \
   -e EGRESSKIT_ADMIN_TOKEN='replace-me' \
-  heyjunpenn/egresskit:0.1.0
+  heyjunpenn/egresskit:latest
 ```
 
 镜像内的 daemon 监听 `0.0.0.0:8787` 以穿过容器网络；上述端口映射只把服务暴露到宿主机

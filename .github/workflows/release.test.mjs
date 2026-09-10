@@ -45,3 +45,24 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /load: true/);
   assert.match(workflow, /127\.0\.0\.1::8787/);
 });
+
+test("every release job times out after ten minutes", async () => {
+  const workflow = await readFile(workflowUrl, "utf8");
+
+  for (const job of [
+    "workflow-lint",
+    "quality",
+    "host-artifacts",
+    "docker-validation",
+    "docker-publish",
+    "github-release",
+  ]) {
+    assert.match(workflow, new RegExp(`\\n  ${job}:[\\s\\S]*?\\n    timeout-minutes: 10`));
+  }
+});
+
+test("a Docker release publishes both its version and latest", async () => {
+  const workflow = await readFile(workflowUrl, "utf8");
+
+  assert.match(workflow, /type=raw,value=latest/);
+});

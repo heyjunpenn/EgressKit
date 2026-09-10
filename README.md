@@ -21,7 +21,7 @@ EgressKit 是一个开源、自托管的代理网关。客户端只连接一个 
 ### 启动 EgressKit
 
 ```bash
-docker pull heyjunpenn/egresskit:0.1.0
+docker pull heyjunpenn/egresskit:latest
 
 read -rsp "Admin Token: " EGRESSKIT_ADMIN_TOKEN && echo
 
@@ -31,7 +31,7 @@ docker run --detach \
   --volume egresskit-state:/var/lib/egresskit \
   --publish 127.0.0.1:8787:8787 \
   --env EGRESSKIT_ADMIN_TOKEN \
-  heyjunpenn/egresskit:0.1.0
+  heyjunpenn/egresskit:latest
 ```
 
 打开 <http://127.0.0.1:8787>，输入 Admin Token。

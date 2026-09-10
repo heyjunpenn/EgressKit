@@ -21,7 +21,7 @@ EgressKit is an open-source, self-hosted proxy gateway. Clients connect to one H
 ### Start EgressKit
 
 ```bash
-docker pull heyjunpenn/egresskit:0.1.0
+docker pull heyjunpenn/egresskit:latest
 
 read -rsp "Admin Token: " EGRESSKIT_ADMIN_TOKEN && echo
 
@@ -31,7 +31,7 @@ docker run --detach \
   --volume egresskit-state:/var/lib/egresskit \
   --publish 127.0.0.1:8787:8787 \
   --env EGRESSKIT_ADMIN_TOKEN \
-  heyjunpenn/egresskit:0.1.0
+  heyjunpenn/egresskit:latest
 ```
 
 Open <http://127.0.0.1:8787> and enter the Admin Token.
