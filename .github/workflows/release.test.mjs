@@ -12,6 +12,7 @@ test("the release workflow builds both commands on every supported host architec
     assert.match(workflow, new RegExp(`runner: ${runner}`));
   }
   assert.match(workflow, /tags:\s*\n\s*- "\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+"/);
+  assert.match(workflow, /workflow_dispatch:\s*\n\s*inputs:\s*\n\s*release_tag:/);
   assert.match(workflow, /pnpm --filter @egresskit\/app-egressd build/);
   assert.match(workflow, /dist\/control-cli-bin\.js/);
   assert.match(workflow, /dist\/cli\.js/);
@@ -28,6 +29,8 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /username: \$\{\{ secrets\.DOCKERHUB_USERNAME \}\}/);
   assert.match(workflow, /password: \$\{\{ secrets\.DOCKERHUB_TOKEN \}\}/);
   assert.match(workflow, /images: heyjunpenn\/egresskit/);
+  assert.match(workflow, /ref: \$\{\{ inputs\.release_tag \|\| github\.ref \}\}/);
+  assert.match(workflow, /type=raw,value=\$\{\{ inputs\.release_tag \}\}/);
   assert.doesNotMatch(workflow, /ghcr\.io\/heyjunpenn\/egresskit/);
   assert.match(workflow, /gh release (create|upload)/);
   assert.match(workflow, /GH_REPO: \$\{\{ github\.repository \}\}/);
