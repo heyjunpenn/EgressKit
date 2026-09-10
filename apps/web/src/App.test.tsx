@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { gatewayAddress } from "./pages";
+import { gatewayAddress, gatewayUrl } from "./pages";
 
 const snapshot = {
   exitIps: [{ ip: "203.0.113.24", location: "JP-Tokyo", nodeCount: 1 }],
@@ -433,6 +433,69 @@ describe("console router", () => {
     expect(screen.queryByText("tokyo-a")).toBeNull();
   });
 
+  it("bulk verifies exit IPs with loading and toast feedback", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    let finish: ((response: Response) => void) | undefined;
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/nodes/verify-exits" && init?.method === "POST") {
+        return await new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      }
+      return new Response(JSON.stringify(snapshot), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", request);
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/app/proxies"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    const button = await screen.findByRole("button", { name: "验证全部出口 IP" });
+    await user.click(button);
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    finish?.(
+      new Response(JSON.stringify({ failed: 0, succeeded: 1, total: 1 }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    expect(await screen.findByText("出口 IP 验证完成：1/1")).toBeTruthy();
+    expect(button.getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("reports a failed exit-IP operation through a toast and clears loading", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input) === "/nodes/verify-exits"
+          ? new Response(JSON.stringify({ error: "verification unavailable" }), {
+              headers: { "content-type": "application/json" },
+              status: 503,
+            })
+          : new Response(JSON.stringify(snapshot), {
+              headers: { "content-type": "application/json" },
+            }),
+      ),
+    );
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/app/proxies"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    const button = await screen.findByRole("button", { name: "验证全部出口 IP" });
+    await user.click(button);
+
+    expect(await screen.findByText("verification unavailable")).toBeTruthy();
+    expect(button.getAttribute("aria-busy")).toBe("false");
+    expect(screen.queryByText("verification unavailable", { selector: "main *" })).toBeNull();
+  });
+
   it("switches routes without mounting the other management panels", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
@@ -764,7 +827,7 @@ describe("console router", () => {
     expect(screen.getByText(/203\.0\.113\.1/)).toBeTruthy();
   });
 
-  it("uses the browser hostname when the daemon listens on all interfaces", async () => {
+  it("uses the browser origin when the daemon listens on all interfaces", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
       "fetch",
@@ -782,7 +845,13 @@ describe("console router", () => {
       </MemoryRouter>,
     );
 
-    expect((await screen.findAllByText(/http:\/\/localhost:8787/)).length).toBeGreaterThan(0);
+    expect(
+      (
+        await screen.findAllByText(
+          (_, element) => element?.textContent?.includes(window.location.origin) ?? false,
+        )
+      ).length,
+    ).toBeGreaterThan(0);
   });
 
   it("renders a copyable Docker example without diff markers", async () => {
@@ -808,5 +877,12 @@ describe("console router", () => {
 
   it("normalizes an already bracketed IPv6 gateway host", () => {
     expect(gatewayAddress("[::1]", 8787)).toBe("[::1]:8787");
+  });
+
+  it("uses the externally visible origin for a wildcard Docker listener", () => {
+    expect(gatewayUrl("0.0.0.0", 8787, "https://proxy.example.com")).toBe(
+      "https://proxy.example.com",
+    );
+    expect(gatewayUrl("[::1]", 8787, "https://proxy.example.com")).toBe("http://[::1]:8787");
   });
 });

@@ -4,11 +4,13 @@ import { AnimatedBadge } from "./components/motion/animated-badge";
 import { Button } from "./components/motion/button/base";
 import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
-import { gatewayAddress } from "./lib/gateway-address";
+import { useToast } from "./components/ui/toast";
+import { gatewayUrl } from "./lib/gateway-address";
 
 export function DocsPage() {
   const { snapshot } = useConsole();
-  const proxy = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
+  const toast = useToast();
+  const proxy = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
   const sections = [
     ["1", "配置 Proxy Token", "在服务端设置独立的 Proxy Token，不要复用 Admin Token。"],
     [
@@ -33,7 +35,17 @@ export function DocsPage() {
               variant="secondary"
               size="icon"
               aria-label="复制代理入口"
-              onClick={() => void navigator.clipboard?.writeText(proxy)}
+              onClick={() =>
+                void navigator.clipboard
+                  ?.writeText(proxy)
+                  .then(() => toast({ message: "代理入口已复制", variant: "success" }))
+                  .catch((error: unknown) =>
+                    toast({
+                      message: error instanceof Error ? error.message : "复制失败",
+                      variant: "error",
+                    }),
+                  )
+              }
             >
               <Clipboard />
             </Button>

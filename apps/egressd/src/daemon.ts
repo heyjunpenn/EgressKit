@@ -124,6 +124,7 @@ export interface EgressdOptions {
   targetReputationClock?: () => number;
   targetReputationEnabled?: boolean;
   webDirectory?: string;
+  wgetSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<string>;
 }
 
 export interface ConnectionOutcome {
@@ -150,6 +151,39 @@ export type EgressdLogEvent =
       event: "egressd.subscription.remote.created";
       level: "info";
       subscriptionOrigin: string;
+    }
+  | {
+      event: "egressd.node.lifecycle";
+      level: "info";
+      nodeId: string;
+      status: string;
+    }
+  | {
+      event: "egressd.node.exit_verification";
+      failed: number;
+      level: "info";
+      reason: "manual" | "subscription-activated";
+      succeeded: number;
+      total: number;
+    }
+  | {
+      event: "egressd.node.exit_verified";
+      level: "info";
+      nodeId: string;
+      provider: string;
+    }
+  | {
+      event: "egressd.runtime.revision";
+      level: "info";
+      nodeCount: number;
+      status: "ready";
+    }
+  | {
+      event: "egressd.subscription.lifecycle";
+      level: "info" | "warn";
+      operationId: string;
+      stage: string;
+      status: "failed" | "running" | "succeeded";
     };
 
 export interface RunningEgressd {
@@ -344,9 +378,18 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           });
           exitIdentitiesByNode.set(id, identity);
           scheduler.setExitIp(id, identity.ip);
+          emitLog({
+            event: "egressd.node.exit_verified",
+            level: "info",
+            nodeId: id,
+            provider: identity.provider,
+          });
         },
         onProbeResult: (id, succeeded) => scheduler.reportHealthCheck(id, succeeded),
-        onStatusChange: (id, status) => scheduler.setHealthStatus(id, status),
+        onStatusChange: (id, status) => {
+          scheduler.setHealthStatus(id, status);
+          emitLog({ event: "egressd.node.lifecycle", level: "info", nodeId: id, status });
+        },
         ...(options.healthCheckProbe === undefined ? {} : { probe: options.healthCheckProbe }),
         ...(options.healthCheckSuccessThreshold === undefined
           ? {}
@@ -379,6 +422,14 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       scheduler.setManualEnabled(id, enabled);
       healthController?.setManualEnabled(id, enabled);
     }
+  };
+  const verifyAllExits = async (reason: "manual" | "subscription-activated") => {
+    if (!healthController) return { failed: 0, succeeded: 0, total: 0 };
+    const results = await healthController.verifyAllExits();
+    const succeeded = results.filter(({ identity }) => identity !== undefined).length;
+    const summary = { failed: results.length - succeeded, succeeded, total: results.length };
+    emitLog({ event: "egressd.node.exit_verification", level: "info", reason, ...summary });
+    return summary;
   };
   const setNodeEnabled = (id: string, enabled: boolean): boolean => {
     if (!scheduler.hasCandidate(id)) {
@@ -681,6 +732,12 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     runtimeConfiguration.active = prepared.imported;
     runtimeConfiguration.candidate = undefined;
     runtimeConfiguration.status = "ready";
+    emitLog({
+      event: "egressd.runtime.revision",
+      level: "info",
+      nodeCount: prepared.imported.nodes.length,
+      status: "ready",
+    });
     return prepared.imported;
   };
 
@@ -705,6 +762,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         imported: activated,
         source: { id: "local", kind: "local", locator: "inline", name: "本地配置" },
       });
+      void verifyAllExits("subscription-activated");
     });
     return state?.loadActiveRevision()?.imported ?? revision;
   };
@@ -768,7 +826,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(options.minimumSubscriptionNodes === undefined
           ? {}
           : { minimumNodes: options.minimumSubscriptionNodes }),
+        ...(options.wgetSubscription === undefined
+          ? {}
+          : { wgetSubscription: options.wgetSubscription }),
         runControlPlaneOperation: withControlPlaneLock,
+        onSubscriptionActivated: () => void verifyAllExits("subscription-activated"),
+        onLifecycle: ({ operationId, stage, status }) =>
+          emitLog({
+            event: "egressd.subscription.lifecycle",
+            level: status === "failed" ? "warn" : "info",
+            operationId,
+            stage,
+            status,
+          }),
         state,
       })
     : undefined;
@@ -796,6 +866,24 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       }
 
       const verifyExitMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/verify-exit$/);
+      if (incoming.method === "POST" && incoming.url === "/nodes/verify-exits") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!healthController) {
+          writeJson(response, 503, { error: "exit verification unavailable" });
+          return;
+        }
+        void verifyAllExits("manual")
+          .then((summary) => writeJson(response, 200, summary))
+          .catch((error) =>
+            writeJson(response, 503, {
+              error: error instanceof Error ? error.message : "exit verification unavailable",
+            }),
+          );
+        return;
+      }
       if (incoming.method === "POST" && verifyExitMatch) {
         if (!isAuthorizedAdmin(incoming, options.adminToken)) {
           rejectAdminAuthentication(response);

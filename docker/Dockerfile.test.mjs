@@ -17,7 +17,8 @@ test("the Docker release pins and verifies the matching Mihomo asset for both ar
   assert.match(dockerfile, /58896873736d28628f66de3677c8654fa0f180662523148e136cff4f6e890069/);
   assert.match(dockerfile, /sha256sum -c/);
   assert.doesNotMatch(dockerfile, /releases\/latest/);
-  assert.doesNotMatch(dockerfile, /apt-get/);
+  assert.match(dockerfile, /apt-get install[^\n]*wget/);
+  assert.match(dockerfile, /rm -rf \/var\/lib\/apt\/lists/);
   assert.doesNotMatch(dockerfile, /ENV EGRESSKIT_(?!ADMIN_TOKEN)/);
   assert.match(dockerfile, /EXPOSE 8787/);
 });

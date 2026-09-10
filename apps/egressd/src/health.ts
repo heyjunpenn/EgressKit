@@ -209,6 +209,19 @@ export class NodeHealthController {
     return identity;
   }
 
+  async verifyAllExits(
+    signal = new AbortController().signal,
+  ): Promise<readonly { id: string; identity?: ExitIpIdentity }[]> {
+    return Promise.all(
+      [...this.#states.values()]
+        .filter(({ manuallyEnabled }) => manuallyEnabled)
+        .map(async ({ id }) => {
+          const identity = await this.verifyExit(id, signal).catch(() => undefined);
+          return identity ? { id, identity } : { id };
+        }),
+    );
+  }
+
   restoreExitIdentity(id: string, identity: ExitIpIdentity): boolean {
     const state = this.#states.get(id);
     if (!state) return false;

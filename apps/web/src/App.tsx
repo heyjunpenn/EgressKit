@@ -37,6 +37,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger } from "./components/m
 import { Tabs, TabsList, TabsTrigger } from "./components/motion/tabs";
 import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardContent } from "./components/ui/card";
+import { ToastProvider, useToast } from "./components/ui/toast";
 import {
   OverviewPage,
   PlaygroundPage,
@@ -90,30 +91,32 @@ export function App() {
   }, []);
 
   return (
-    <Routes>
-      <Route path="/" element={<Navigate replace to="/app" />} />
-      <Route path="/app/connect" element={<ConnectPage onAuthenticated={authenticate} />} />
-      <Route
-        path="/app"
-        element={<ConsoleLayout token={token} onUnauthorized={clearAuthentication} />}
-      >
-        <Route index element={<OverviewRoute />} />
-        <Route path="subscriptions" element={<SubscriptionsPage />} />
-        <Route path="proxies" element={<ProxiesPage />} />
-        <Route path="sessions" element={<SessionsPage />} />
-        <Route path="playground" element={<PlaygroundPage />} />
-        <Route path="settings" element={<SettingsPage />} />
+    <ToastProvider>
+      <Routes>
+        <Route path="/" element={<Navigate replace to="/app" />} />
+        <Route path="/app/connect" element={<ConnectPage onAuthenticated={authenticate} />} />
         <Route
-          path="docs"
-          element={
-            <Suspense fallback={<RouteLoader label="正在读取使用文档" />}>
-              <DocsPage />
-            </Suspense>
-          }
-        />
-      </Route>
-      <Route path="*" element={<Navigate replace to="/app" />} />
-    </Routes>
+          path="/app"
+          element={<ConsoleLayout token={token} onUnauthorized={clearAuthentication} />}
+        >
+          <Route index element={<OverviewRoute />} />
+          <Route path="subscriptions" element={<SubscriptionsPage />} />
+          <Route path="proxies" element={<ProxiesPage />} />
+          <Route path="sessions" element={<SessionsPage />} />
+          <Route path="playground" element={<PlaygroundPage />} />
+          <Route path="settings" element={<SettingsPage />} />
+          <Route
+            path="docs"
+            element={
+              <Suspense fallback={<RouteLoader label="正在读取使用文档" />}>
+                <DocsPage />
+              </Suspense>
+            }
+          />
+        </Route>
+        <Route path="*" element={<Navigate replace to="/app" />} />
+      </Routes>
+    </ToastProvider>
   );
 }
 
@@ -347,8 +350,8 @@ function OverviewRoute() {
 
 function ConnectPage({ onAuthenticated }: { onAuthenticated(token: string): void }) {
   const [token, setToken] = useState("");
-  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const toast = useToast();
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from ?? "/app";
@@ -356,13 +359,15 @@ function ConnectPage({ onAuthenticated }: { onAuthenticated(token: string): void
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setLoading(true);
-    setError("");
     try {
       await createApiClient(token).get<ConsoleSnapshot>(consoleSnapshotPath);
       onAuthenticated(token);
       navigate(from, { replace: true });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法验证 Admin Token");
+      toast({
+        message: cause instanceof Error ? cause.message : "无法验证 Admin Token",
+        variant: "error",
+      });
     } finally {
       setLoading(false);
     }
@@ -445,12 +450,10 @@ function ConnectPage({ onAuthenticated }: { onAuthenticated(token: string): void
                 value={token}
                 onChange={setToken}
                 placeholder="输入 Admin Token"
-                error={error || undefined}
-                reserveErrorLine
                 required
               />
-              <Button className="w-full" type="submit" disabled={loading || !token}>
-                {loading ? "正在验证…" : "连接"}
+              <Button className="w-full" type="submit" disabled={!token} loading={loading}>
+                连接
               </Button>
             </form>
           </div>

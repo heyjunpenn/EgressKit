@@ -27,6 +27,73 @@ interface RevisionBody extends OperationBody {
   suspiciousReason?: string;
 }
 
+test("remote subscriptions identify as a Mihomo-compatible client", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let receivedAccept = "";
+  let receivedUserAgent = "";
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (_url, options) => {
+      const headers = new Headers((options as RequestInit).headers);
+      receivedAccept = headers.get("accept") ?? "";
+      receivedUserAgent = headers.get("user-agent") ?? "";
+      return new Response(receivedUserAgent === "clash.meta" ? VALID_SUBSCRIPTION : "forbidden", {
+        status: receivedUserAgent === "clash.meta" ? 200 : 403,
+      });
+    },
+    host: "127.0.0.1",
+    mihomoRuntime: successfulRuntime([]),
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/subscription" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+
+  assert.equal(operation.body.status, "succeeded");
+  assert.equal(receivedUserAgent, "clash.meta");
+  assert.match(receivedAccept, /application\/yaml/);
+});
+
+test("remote subscriptions fall back to wget after fetch is exhausted", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  let wgetCalls = 0;
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async () => new Response("forbidden", { status: 403 }),
+    host: "127.0.0.1",
+    mihomoRuntime: successfulRuntime([]),
+    port: 0,
+    stateDirectory,
+    wgetSubscription: async () => {
+      wgetCalls += 1;
+      return VALID_SUBSCRIPTION;
+    },
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/subscription" },
+    method: "POST",
+  });
+  const operation = await waitForTerminalOperation(
+    daemon.address,
+    created.body.operationId as string,
+  );
+
+  assert.equal(operation.body.status, "succeeded");
+  assert.equal(wgetCalls, 1);
+});
+
 test("remote subscription operations expose every successful processing stage and can refresh", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   const applied: unknown[] = [];

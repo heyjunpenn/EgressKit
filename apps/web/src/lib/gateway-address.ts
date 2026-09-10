@@ -4,3 +4,14 @@ export function gatewayAddress(host: string, port: number): string {
   const urlHost = normalizedHost.includes(":") ? `[${normalizedHost}]` : normalizedHost;
   return `${urlHost}:${port}`;
 }
+
+export function gatewayUrl(
+  host: string,
+  port: number,
+  browserOrigin = window.location.origin,
+): string {
+  if (host === "0.0.0.0" || host === "::") {
+    return browserOrigin;
+  }
+  return `http://${gatewayAddress(host, port)}`;
+}

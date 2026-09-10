@@ -36,9 +36,10 @@ import { Table, type TableColumn } from "./components/motion/table";
 import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Textarea } from "./components/ui/textarea";
-import { gatewayAddress } from "./lib/gateway-address";
+import { useToast } from "./components/ui/toast";
+import { gatewayUrl } from "./lib/gateway-address";
 
-export { gatewayAddress } from "./lib/gateway-address";
+export { gatewayAddress, gatewayUrl } from "./lib/gateway-address";
 
 type Subscription = ConsoleSnapshot["subscriptions"][number];
 type Node = ConsoleSnapshot["nodes"][number];
@@ -177,17 +178,32 @@ function Modal({
 
 export function OverviewPage() {
   const { refresh, snapshot } = useConsole();
+  const toast = useToast();
   const { metrics } = snapshot;
   const activeProxies = snapshot.nodes
     .filter((node) => node.activeConnections > 0)
     .sort((left, right) => right.activeConnections - left.activeConnections)
     .slice(0, 4);
-  const gateway = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
-  const [copied, setCopied] = useState(false);
+  const gateway = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshOverview = async () => {
+    setRefreshing(true);
+    try {
+      await refresh();
+      toast({ message: "运行状态已刷新", variant: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "刷新失败", variant: "error" });
+    } finally {
+      setRefreshing(false);
+    }
+  };
   const copyGateway = async () => {
-    await navigator.clipboard?.writeText(gateway);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1_500);
+    try {
+      await navigator.clipboard?.writeText(gateway);
+      toast({ message: "代理入口已复制", variant: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "复制失败", variant: "error" });
+    }
   };
   const stats = [
     {
@@ -244,7 +260,8 @@ export function OverviewPage() {
               variant="ghost"
               size="sm"
               className="text-background/75 hover:bg-background/10 hover:text-background"
-              onClick={() => void refresh()}
+              loading={refreshing}
+              onClick={() => void refreshOverview()}
             >
               <ArrowClockwise size={16} />
               刷新
@@ -254,8 +271,8 @@ export function OverviewPage() {
               className="bg-background text-foreground hover:bg-background/90"
               onClick={() => void copyGateway()}
             >
-              {copied ? <CheckCircle size={16} /> : <Copy size={16} />}
-              {copied ? "已复制" : "复制"}
+              <Copy size={16} />
+              复制
             </Button>
           </div>
         </div>
@@ -352,6 +369,7 @@ export function OverviewPage() {
 
 export function SubscriptionsPage() {
   const { api, refresh, snapshot } = useConsole();
+  const toast = useToast();
   const [adding, setAdding] = useState(false);
   const [editingSubscription, setEditingSubscription] = useState<Subscription>();
   const [deletingSubscription, setDeletingSubscription] = useState<Subscription>();
@@ -362,13 +380,11 @@ export function SubscriptionsPage() {
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
-  const [notice, setNotice] = useState("");
-  const [retryAction, setRetryAction] = useState<() => void>();
+  const [pendingAction, setPendingAction] = useState<string>();
 
   const watchOperation = (operation: OperationResponse, retry: () => void) => {
-    setRetryAction(undefined);
-    void observeOperation(api, operation.operationId, setNotice, refresh).then((succeeded) => {
-      if (!succeeded) setRetryAction(() => retry);
+    void observeOperation(api, operation.operationId, toast, refresh).then((succeeded) => {
+      if (!succeeded) void retry;
     });
   };
   const visible = snapshot.subscriptions.filter(
@@ -379,7 +395,7 @@ export function SubscriptionsPage() {
   );
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    setNotice("");
+    setPendingAction("add");
     try {
       const operation =
         kind === "remote"
@@ -388,11 +404,10 @@ export function SubscriptionsPage() {
               url: value,
             })
           : await api.sendText<{ nodes: unknown[] }>("/subscriptions/local", value);
-      setNotice(
-        "operationId" in operation
-          ? `刷新任务 ${operation.operationId} 已进入队列`
-          : "本地订阅已应用",
-      );
+      toast({
+        message: "operationId" in operation ? "订阅已保存，正在同步" : "本地订阅已应用",
+        variant: "success",
+      });
       setValue("");
       setName("");
       setAdding(false);
@@ -401,26 +416,34 @@ export function SubscriptionsPage() {
         watchOperation(operation, () => void refreshSubscription(operation.subscriptionId));
       }
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "添加失败");
+      toast({ message: error instanceof Error ? error.message : "添加失败", variant: "error" });
+    } finally {
+      setPendingAction(undefined);
     }
   };
   const refreshSubscription = async (id: string) => {
+    setPendingAction(`refresh:${id}`);
     try {
       const operation = await api.send<OperationResponse>(
         `/subscriptions/${encodeURIComponent(id)}/refresh`,
         "POST",
       );
-      setNotice(`刷新任务 ${operation.operationId} 已进入队列`);
+      toast({ message: "订阅刷新已开始", variant: "success" });
       await refresh();
       watchOperation(operation, () => void refreshSubscription(id));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "刷新失败，请重试");
-      setRetryAction(() => () => void refreshSubscription(id));
+      toast({
+        message: error instanceof Error ? error.message : "刷新失败，请重试",
+        variant: "error",
+      });
+    } finally {
+      setPendingAction(undefined);
     }
   };
   const updateSubscription = async (event: FormEvent) => {
     event.preventDefault();
     if (!editingSubscription) return;
+    setPendingAction("edit");
     try {
       const operation = await api.send<OperationResponse>(
         `/subscriptions/${encodeURIComponent(editingSubscription.id)}`,
@@ -430,32 +453,48 @@ export function SubscriptionsPage() {
       setEditingSubscription(undefined);
       setValue("");
       setName("");
-      setNotice("订阅地址已更新，正在同步");
+      toast({ message: "订阅地址已更新，正在同步", variant: "success" });
       await refresh();
       watchOperation(operation, () => void refreshSubscription(editingSubscription.id));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "订阅更新失败");
+      toast({
+        message: error instanceof Error ? error.message : "订阅更新失败",
+        variant: "error",
+      });
+    } finally {
+      setPendingAction(undefined);
     }
   };
   const deleteSubscription = async (id: string) => {
+    setPendingAction(`delete:${id}`);
     try {
       await api.send(`/subscriptions/${encodeURIComponent(id)}`, "DELETE");
       setDeletingSubscription(undefined);
-      setNotice("订阅已删除");
+      toast({ message: "订阅已删除", variant: "success" });
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "订阅删除失败");
+      toast({
+        message: error instanceof Error ? error.message : "订阅删除失败",
+        variant: "error",
+      });
+    } finally {
+      setPendingAction(undefined);
     }
   };
   const forceRevision = async (revisionId: number) => {
+    setPendingAction(`force:${revisionId}`);
     try {
       const operation = await api.send<OperationResponse>(`/revisions/${revisionId}/force`, "POST");
       setForcingRevisionId(undefined);
-      setNotice(`强制应用任务 ${operation.operationId} 已进入队列`);
+      toast({ message: "强制应用任务已开始", variant: "success" });
       watchOperation(operation, () => void forceRevision(revisionId));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "强制应用失败，请重试");
-      setRetryAction(() => () => void forceRevision(revisionId));
+      toast({
+        message: error instanceof Error ? error.message : "强制应用失败，请重试",
+        variant: "error",
+      });
+    } finally {
+      setPendingAction(undefined);
     }
   };
 
@@ -511,6 +550,7 @@ export function SubscriptionsPage() {
               variant="secondary"
               size="icon"
               aria-label={`刷新 ${item.id}`}
+              loading={pendingAction === `refresh:${item.id}`}
               onClick={() => void refreshSubscription(item.id)}
             >
               <ArrowClockwise size={17} />
@@ -525,7 +565,6 @@ export function SubscriptionsPage() {
                 onClick={() => {
                   setValue("");
                   setName(item.name);
-                  setNotice("");
                   setEditingSubscription(item);
                 }}
               >
@@ -555,7 +594,6 @@ export function SubscriptionsPage() {
           title="添加订阅"
           onClose={() => {
             setAdding(false);
-            setNotice("");
           }}
         >
           <form className="space-y-5 px-6 pb-6 pt-5" onSubmit={submit}>
@@ -597,16 +635,13 @@ export function SubscriptionsPage() {
                 />
               )}
             </div>
-            {notice ? (
-              <p className="text-sm text-destructive" role="alert">
-                {notice}
-              </p>
-            ) : null}
             <div className="flex justify-end gap-2">
               <Button variant="ghost" type="button" onClick={() => setAdding(false)}>
                 取消
               </Button>
-              <Button type="submit">导入</Button>
+              <Button type="submit" loading={pendingAction === "add"}>
+                导入
+              </Button>
             </div>
           </form>
         </Modal>
@@ -638,7 +673,6 @@ export function SubscriptionsPage() {
               value={value}
               onChange={setValue}
             />
-            {notice ? <p className="text-sm text-destructive">{notice}</p> : null}
             <div className="flex justify-end gap-2">
               <Button
                 type="button"
@@ -650,7 +684,9 @@ export function SubscriptionsPage() {
               >
                 取消
               </Button>
-              <Button type="submit">保存并同步</Button>
+              <Button type="submit" loading={pendingAction === "edit"}>
+                保存并同步
+              </Button>
             </div>
           </form>
         </Modal>
@@ -667,6 +703,7 @@ export function SubscriptionsPage() {
               </Button>
               <Button
                 className="bg-destructive text-white hover:bg-destructive/90"
+                loading={pendingAction === `delete:${deletingSubscription.id}`}
                 onClick={() => void deleteSubscription(deletingSubscription.id)}
               >
                 确认删除
@@ -685,24 +722,15 @@ export function SubscriptionsPage() {
               <Button variant="ghost" onClick={() => setForcingRevisionId(undefined)}>
                 取消
               </Button>
-              <Button onClick={() => void forceRevision(forcingRevisionId)}>确认应用</Button>
+              <Button
+                loading={pendingAction === `force:${forcingRevisionId}`}
+                onClick={() => void forceRevision(forcingRevisionId)}
+              >
+                确认应用
+              </Button>
             </div>
           </div>
         </Modal>
-      ) : null}
-      {notice && !adding ? (
-        <div
-          className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 text-sm"
-          role={retryAction ? "alert" : "status"}
-        >
-          <StatusBadge value={retryAction ? "failed" : "pending"} />
-          <p className="min-w-0 flex-1 break-words">{notice}</p>
-          {retryAction ? (
-            <Button variant="ghost" size="sm" onClick={retryAction}>
-              重试
-            </Button>
-          ) : null}
-        </div>
       ) : null}
       <Card>
         <CardContent className="space-y-4">
@@ -749,7 +777,6 @@ export function SubscriptionsPage() {
             />
             <Button
               onClick={() => {
-                setNotice("");
                 setAdding(true);
               }}
             >
@@ -777,13 +804,16 @@ export function SubscriptionsPage() {
 
 export function ProxiesPage() {
   const { api, refresh, snapshot } = useConsole();
+  const toast = useToast();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [exitIpFilter, setExitIpFilter] = useState("all");
   const [editing, setEditing] = useState<string>();
+  const [savingAlias, setSavingAlias] = useState(false);
   const [alias, setAlias] = useState("");
-  const [notice, setNotice] = useState("");
   const [verifying, setVerifying] = useState<string>();
+  const [verifyingAll, setVerifyingAll] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const exitIpOptions = snapshot.exitIps;
   const visible = snapshot.nodes.filter(
     (node) =>
@@ -794,20 +824,26 @@ export function ProxiesPage() {
   const toggle = async (id: string, enabled: boolean) => {
     try {
       await api.send(`/nodes/${encodeURIComponent(id)}/enabled`, "PUT", { enabled });
-      setNotice(enabled ? "节点已重新加入健康评估" : "节点已停止接收新分配");
+      toast({
+        message: enabled ? "节点已重新加入健康评估" : "节点已停止接收新分配",
+        variant: "success",
+      });
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "节点更新失败");
+      toast({ message: error instanceof Error ? error.message : "节点更新失败", variant: "error" });
     }
   };
   const saveAlias = async (id: string) => {
+    setSavingAlias(true);
     try {
       await api.send(`/nodes/${encodeURIComponent(id)}/alias`, "PUT", { alias });
       setEditing(undefined);
-      setNotice("节点别名已保存");
+      toast({ message: "节点别名已保存", variant: "success" });
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "别名保存失败");
+      toast({ message: error instanceof Error ? error.message : "别名保存失败", variant: "error" });
+    } finally {
+      setSavingAlias(false);
     }
   };
   const verifyExit = async (node: Node) => {
@@ -817,12 +853,41 @@ export function ProxiesPage() {
         `/nodes/${encodeURIComponent(node.id)}/verify-exit`,
         "POST",
       );
-      setNotice(`出口验证成功：${identity.ip}`);
+      toast({ message: `出口验证成功：${identity.ip}`, variant: "success" });
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "出口验证失败");
+      toast({ message: error instanceof Error ? error.message : "出口验证失败", variant: "error" });
     } finally {
       setVerifying(undefined);
+    }
+  };
+  const verifyAllExits = async () => {
+    setVerifyingAll(true);
+    try {
+      const result = await api.send<{ failed: number; succeeded: number; total: number }>(
+        "/nodes/verify-exits",
+        "POST",
+      );
+      toast({
+        message: `出口 IP 验证完成：${result.succeeded}/${result.total}`,
+        variant: result.failed === 0 ? "success" : "error",
+      });
+      await refresh();
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "全量验证失败", variant: "error" });
+    } finally {
+      setVerifyingAll(false);
+    }
+  };
+  const refreshNodes = async () => {
+    setRefreshing(true);
+    try {
+      await refresh();
+      toast({ message: "代理状态已刷新", variant: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "刷新失败", variant: "error" });
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -854,7 +919,13 @@ export function ProxiesPage() {
               className="max-w-44"
             />
             <Tooltip content="保存别名">
-              <Button variant="secondary" size="icon" type="submit" aria-label="保存别名">
+              <Button
+                variant="secondary"
+                size="icon"
+                type="submit"
+                aria-label="保存别名"
+                loading={savingAlias}
+              >
                 <CheckCircle />
               </Button>
             </Tooltip>
@@ -939,7 +1010,7 @@ export function ProxiesPage() {
             variant="secondary"
             size="icon"
             aria-label={`验证 ${node.alias ?? nodeDisplayName(node.id)} 出口 IP`}
-            disabled={verifying === node.id}
+            loading={verifying === node.id}
             onClick={() => void verifyExit(node)}
           >
             <Pulse size={17} />
@@ -950,83 +1021,89 @@ export function ProxiesPage() {
   ];
 
   return (
-    <>
-      {notice ? (
-        <div
-          className="mb-4 flex items-start gap-3 rounded-xl border border-border bg-card px-4 py-3 text-sm"
-          role="status"
-        >
-          <StatusBadge value="accepted" />
-          <p className="min-w-0 flex-1 break-words">{notice}</p>
-        </div>
-      ) : null}
-      <Card>
-        <CardContent className="space-y-4">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[12rem_15rem_minmax(14rem,1fr)_auto]">
-            <Select value={filter} onValueChange={setFilter}>
-              <SelectTrigger ariaLabel="按状态筛选节点">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部状态</SelectItem>
-                {["healthy", "degraded", "warming", "cooldown", "disabled", "draining"].map(
-                  (status) => (
-                    <SelectItem key={status} value={status}>
-                      {statusLabel(status)}
-                    </SelectItem>
-                  ),
-                )}
-              </SelectContent>
-            </Select>
-            <Select value={exitIpFilter} onValueChange={setExitIpFilter}>
-              <SelectTrigger ariaLabel="按出口 IP 筛选节点">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部出口 IP</SelectItem>
-                {exitIpOptions.map(({ ip, location, nodeCount }) => (
-                  <SelectItem key={ip} value={ip}>
-                    {location ? `${ip} · ${location}` : ip}（{nodeCount}）
+    <Card>
+      <CardContent className="space-y-4">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[12rem_15rem_minmax(14rem,1fr)_auto_auto]">
+          <Select value={filter} onValueChange={setFilter}>
+            <SelectTrigger ariaLabel="按状态筛选节点">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部状态</SelectItem>
+              {["healthy", "degraded", "warming", "cooldown", "disabled", "draining"].map(
+                (status) => (
+                  <SelectItem key={status} value={status}>
+                    {statusLabel(status)}
                   </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Input
-              aria-label="搜索节点"
-              placeholder="搜索节点"
-              value={query}
-              onChange={setQuery}
-              leftIcon={<MagnifyingGlass size={18} />}
-            />
-            <Button variant="secondary" onClick={() => void refresh()}>
-              <ArrowClockwise size={18} />
-              刷新状态
-            </Button>
-          </div>
-          <Table
-            data={visible}
-            columns={columns}
-            getRowId={(node) => node.id}
-            rowHeight={56}
-            height={tableHeight(visible.length)}
-            emptyState={
-              snapshot.nodes.length === 0
-                ? "还没有可调度节点，请先导入并成功应用订阅。"
-                : "没有符合当前搜索或状态筛选的节点。"
-            }
+                ),
+              )}
+            </SelectContent>
+          </Select>
+          <Select value={exitIpFilter} onValueChange={setExitIpFilter}>
+            <SelectTrigger ariaLabel="按出口 IP 筛选节点">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部出口 IP</SelectItem>
+              {exitIpOptions.map(({ ip, location, nodeCount }) => (
+                <SelectItem key={ip} value={ip}>
+                  {location ? `${ip} · ${location}` : ip}（{nodeCount}）
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Input
+            aria-label="搜索节点"
+            placeholder="搜索节点"
+            value={query}
+            onChange={setQuery}
+            leftIcon={<MagnifyingGlass size={18} />}
           />
-        </CardContent>
-      </Card>
-    </>
+          <Button variant="secondary" loading={refreshing} onClick={() => void refreshNodes()}>
+            <ArrowClockwise size={18} />
+            刷新状态
+          </Button>
+          <Button loading={verifyingAll} onClick={() => void verifyAllExits()}>
+            <Pulse size={18} />
+            验证全部出口 IP
+          </Button>
+        </div>
+        <Table
+          data={visible}
+          columns={columns}
+          getRowId={(node) => node.id}
+          rowHeight={56}
+          height={tableHeight(visible.length)}
+          emptyState={
+            snapshot.nodes.length === 0
+              ? "还没有可调度节点，请先导入并成功应用订阅。"
+              : "没有符合当前搜索或状态筛选的节点。"
+          }
+        />
+      </CardContent>
+    </Card>
   );
 }
 
 export function SessionsPage() {
   const { refresh, snapshot } = useConsole();
+  const toast = useToast();
+  const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState("");
   const visible = snapshot.sessions.filter((session) =>
     `${session.id} ${session.nodeId}`.toLowerCase().includes(query.toLowerCase()),
   );
+  const refreshSessions = async () => {
+    setRefreshing(true);
+    try {
+      await refresh();
+      toast({ message: "会话状态已刷新", variant: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "刷新失败", variant: "error" });
+    } finally {
+      setRefreshing(false);
+    }
+  };
   const columns: TableColumn<Session>[] = [
     {
       key: "id",
@@ -1078,7 +1155,7 @@ export function SessionsPage() {
             onChange={setQuery}
             leftIcon={<MagnifyingGlass size={18} />}
           />
-          <Button onClick={() => void refresh()}>
+          <Button loading={refreshing} onClick={() => void refreshSessions()}>
             <ArrowClockwise size={18} />
             刷新
           </Button>
@@ -1098,9 +1175,9 @@ export function SessionsPage() {
 
 export function SettingsPage() {
   const { api } = useConsole();
+  const toast = useToast();
   const [settings, setSettings] = useState<RuntimeSettings>();
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1118,15 +1195,17 @@ export function SettingsPage() {
   const persist = async (next: RuntimeSettings) => {
     setSaving(true);
     setError("");
-    setNotice("");
     try {
       const result = await api.send<SettingsResponse>("/settings", "PUT", next);
       setSettings(result.settings);
-      setNotice(
-        result.restartRequired ? "设置已保存，部分修改将在重启服务后生效。" : "设置已保存并生效。",
-      );
+      toast({
+        message: result.restartRequired
+          ? "设置已保存，部分修改将在重启服务后生效。"
+          : "设置已保存并生效。",
+        variant: "success",
+      });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "保存设置失败");
+      toast({ message: cause instanceof Error ? cause.message : "保存设置失败", variant: "error" });
     } finally {
       setSaving(false);
     }
@@ -1190,14 +1269,6 @@ export function SettingsPage() {
           {saving ? "保存中…" : "保存设置"}
         </Button>
       </div>
-      {(error || notice) && (
-        <div
-          role="status"
-          className={`rounded-xl px-4 py-3 text-sm ${error ? "bg-destructive/10 text-destructive" : "bg-muted"}`}
-        >
-          {error || notice}
-        </div>
-      )}
       <section className="rounded-2xl bg-card p-5 sm:p-6">
         <h2 className="mb-5 text-lg font-semibold">服务与代理入口</h2>
         <div className="flex items-end gap-3">
@@ -1272,16 +1343,16 @@ export function SettingsPage() {
 
 export function PlaygroundPage() {
   const { api, snapshot } = useConsole();
+  const toast = useToast();
   const [mode, setMode] = useState("rotate");
   const [target, setTarget] = useState("https://ipinfo.io/json");
   const [node, setNode] = useState(snapshot.nodes[0]?.alias ?? snapshot.nodes[0]?.id ?? "node-id");
-  const [copied, setCopied] = useState(false);
   const [proxyToken, setProxyToken] = useState("");
   const [result, setResult] = useState<PlaygroundResult>();
   const [requestLogs, setRequestLogs] = useState<PlaygroundLog[]>([]);
   const requestSequence = useRef(0);
   const [requesting, setRequesting] = useState(false);
-  const [requestError, setRequestError] = useState("");
+  const [, setRequestError] = useState("");
   useEffect(() => {
     void api
       .get<{ proxyToken: string; proxyTokenAvailable: boolean }>("/playground/config")
@@ -1290,7 +1361,7 @@ export function PlaygroundPage() {
         setRequestError(error instanceof Error ? error.message : "无法读取 Proxy Token"),
       );
   }, [api]);
-  const proxy = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
+  const proxy = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
   const username =
     mode === "node"
       ? `node.${encodeProxyUsernameValue(node)}`
@@ -1306,8 +1377,7 @@ export function PlaygroundPage() {
   ];
   const copyCommand = async () => {
     await navigator.clipboard?.writeText(command);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1_500);
+    toast({ message: "curl 命令已复制", variant: "success" });
   };
   const execute = async (event: FormEvent) => {
     event.preventDefault();
@@ -1329,11 +1399,16 @@ export function PlaygroundPage() {
       });
       setResult(nextResult);
       setRequestLogs((logs) => [{ ...requestSnapshot, result: nextResult }, ...logs].slice(0, 20));
+      toast({
+        message: nextResult.status < 400 ? "请求成功" : `请求返回 HTTP ${nextResult.status}`,
+        variant: nextResult.status < 400 ? "success" : "error",
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "请求执行失败";
       setResult(undefined);
       setRequestError(message);
       setRequestLogs((logs) => [{ ...requestSnapshot, error: message }, ...logs].slice(0, 20));
+      toast({ message, variant: "error" });
     } finally {
       setRequesting(false);
     }
@@ -1372,19 +1447,15 @@ export function PlaygroundPage() {
                 </button>
               ))}
             </div>
-            {requestError ? (
-              <p className="text-sm text-destructive" role="alert">
-                {requestError}
-              </p>
-            ) : null}
             <Button
               className="w-full"
               type="submit"
               hoverScale={1}
               pressScale={1}
               disabled={!target}
+              loading={requesting}
             >
-              {requesting ? "请求中…" : "发起请求"}
+              发起请求
             </Button>
           </form>
           <div className="mt-6 border-border border-t pt-5">
@@ -1441,7 +1512,7 @@ export function PlaygroundPage() {
                 aria-label="复制请求命令"
                 onClick={() => void copyCommand()}
               >
-                {copied ? <CheckCircle size={18} /> : <Copy size={18} />}
+                <Copy size={18} />
               </Button>
             </Tooltip>
           </CardAction>
@@ -1451,11 +1522,6 @@ export function PlaygroundPage() {
             <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-foreground p-4 text-sm leading-6 text-background">
               <code>{command}</code>
             </pre>
-            {copied ? (
-              <div className="text-sm text-success" role="status" aria-live="polite">
-                命令已复制
-              </div>
-            ) : null}
             <div className="flex items-center justify-between gap-3">
               <h2 className="text-base font-semibold">请求结果</h2>
               {result ? <StatusBadge value={result.status < 400 ? "succeeded" : "failed"} /> : null}
@@ -1501,28 +1567,30 @@ async function pollOperation(
 async function observeOperation(
   api: ApiClient,
   operationId: string,
-  setNotice: (notice: string) => void,
+  toast: (input: { message: string; variant: "error" | "success" }) => void,
   refresh: () => Promise<void>,
 ): Promise<boolean> {
   try {
-    const operation = await pollOperation(api, operationId, (current) => {
-      setNotice(`任务 ${operationId}：${statusLabel(current.status)}`);
-    });
+    const operation = await pollOperation(api, operationId, () => undefined);
     if (operation.status === "failed") {
-      setNotice(
-        `任务失败（${operation.failure?.stage ?? "unknown"}）：${operation.failure?.reason ?? "请重试"}`,
-      );
+      toast({
+        message: `任务失败（${operation.failure?.stage ?? "unknown"}）：${operation.failure?.reason ?? "请重试"}`,
+        variant: "error",
+      });
       return false;
     }
     if (operation.status === "interrupted") {
-      setNotice("任务因服务重启被中断，可点击刷新重试");
+      toast({ message: "任务因服务重启被中断，可重新刷新订阅", variant: "error" });
       return false;
     }
-    setNotice(`任务 ${operationId} 已完成`);
+    toast({ message: "订阅任务已完成", variant: "success" });
     await refresh();
     return true;
   } catch (error) {
-    setNotice(error instanceof Error ? error.message : "无法读取任务进度，请重试");
+    toast({
+      message: error instanceof Error ? error.message : "无法读取任务进度，请重试",
+      variant: "error",
+    });
     return false;
   }
 }

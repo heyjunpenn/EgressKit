@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { parse } from "yaml";
 
 import type { ControlState, OperationProcessingStage, SubscriptionIdentity } from "./state.js";
@@ -20,12 +21,22 @@ export interface RemoteOperationRunnerOptions {
     subscription: SubscriptionIdentity,
     checking: () => void,
   ): Promise<ImportedVlessRevision>;
-  fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
+  fetchSubscription?: (
+    url: string,
+    options: { headers: HeadersInit; signal: AbortSignal },
+  ) => Promise<Response>;
   fetchTimeoutMs?: number;
   clock?: RemoteOperationClock;
   minimumNodes?: number;
+  onSubscriptionActivated?: () => void;
+  onLifecycle?: (event: {
+    operationId: string;
+    stage: OperationProcessingStage;
+    status: "failed" | "running" | "succeeded";
+  }) => void;
   runControlPlaneOperation?<Result>(operation: () => Promise<Result> | Result): Promise<Result>;
   state: ControlState;
+  wgetSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<string>;
 }
 
 export function validateRemoteSubscriptionTimeout(fetchTimeoutMs: number | undefined): void {
@@ -107,6 +118,7 @@ export class RemoteOperationRunner {
       }
       stage = "fetching";
       this.#options.state.transitionOperation(operationId, stage);
+      this.#options.onLifecycle?.({ operationId, stage, status: "running" });
       const source = await this.#downloadWithRetries(subscription.locator);
       this.#options.state.advanceRevision(subscriptionRevisionId, "downloaded");
       if (this.#shuttingDown) {
@@ -114,10 +126,12 @@ export class RemoteOperationRunner {
       }
       stage = "parsing";
       this.#options.state.transitionOperation(operationId, stage);
+      this.#options.onLifecycle?.({ operationId, stage, status: "running" });
       parse(source);
       this.#options.state.advanceRevision(subscriptionRevisionId, "parsed");
       stage = "validating";
       this.#options.state.transitionOperation(operationId, stage);
+      this.#options.onLifecycle?.({ operationId, stage, status: "running" });
       const revision = importLocalVlessYaml(source, { firstListenerPort: 20_000 });
       this.#options.state.saveValidatedRevision(subscriptionRevisionId, revision);
       const suspiciousReason = this.#suspiciousReason(revision, subscription.id);
@@ -132,9 +146,11 @@ export class RemoteOperationRunner {
       await this.#apply(operationId, subscriptionRevisionId, revision, subscription, (next) => {
         stage = next;
       });
+      this.#options.onLifecycle?.({ operationId, stage, status: "succeeded" });
     } catch (error) {
       if (!this.#shuttingDown) {
         this.#options.state.failOperation(operationId, stage, operationFailureReason(stage, error));
+        this.#options.onLifecycle?.({ operationId, stage, status: "failed" });
       }
     }
   }
@@ -185,6 +201,7 @@ export class RemoteOperationRunner {
   ): Promise<void> {
     setStage("applying");
     this.#options.state.transitionOperation(operationId, "applying");
+    this.#options.onLifecycle?.({ operationId, stage: "applying", status: "running" });
     const runControlPlaneOperation =
       this.#options.runControlPlaneOperation ?? runControlPlaneOperationDirectly;
     await runControlPlaneOperation(async () => {
@@ -192,6 +209,7 @@ export class RemoteOperationRunner {
         if (!this.#shuttingDown) {
           this.#options.state.markRevisionAccepted(subscriptionRevisionId, operationId);
           setStage("checking");
+          this.#options.onLifecycle?.({ operationId, stage: "checking", status: "running" });
         }
       });
       if (this.#shuttingDown) {
@@ -203,6 +221,7 @@ export class RemoteOperationRunner {
         source: subscription,
         subscriptionRevisionId,
       });
+      this.#options.onSubscriptionActivated?.();
     });
   }
 
@@ -223,6 +242,29 @@ export class RemoteOperationRunner {
   }
 
   async #downloadWithRetries(locator: string): Promise<string> {
+    let fetchFailure: unknown;
+    try {
+      return await this.#downloadUsingFetchWithRetries(locator);
+    } catch (error) {
+      if (
+        !(error instanceof SafeOperationError) ||
+        error.message !== "remote subscription returned HTTP 403"
+      ) {
+        throw error;
+      }
+      fetchFailure = error;
+    }
+    try {
+      return await this.#downloadWithWget(locator);
+    } catch (wgetFailure) {
+      throw new SafeOperationError(
+        `remote subscription download failed with fetch and wget: ${operationFailureReason("fetching", wgetFailure)}`,
+        { cause: fetchFailure },
+      );
+    }
+  }
+
+  async #downloadUsingFetchWithRetries(locator: string): Promise<string> {
     for (let attempt = 0; attempt < MAXIMUM_FETCH_ATTEMPTS; attempt += 1) {
       try {
         return await this.#download(locator);
@@ -241,6 +283,27 @@ export class RemoteOperationRunner {
     throw new Error("remote subscription retry limit is invalid");
   }
 
+  async #downloadWithWget(locator: string): Promise<string> {
+    const controller = new AbortController();
+    this.#controllers.add(controller);
+    const timeout = setTimeout(
+      () => controller.abort(new SafeOperationError("remote subscription wget timed out")),
+      this.#options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
+    );
+    try {
+      const source = await (this.#options.wgetSubscription ?? wgetSubscription)(locator, {
+        signal: controller.signal,
+      });
+      if (Buffer.byteLength(source) > MAXIMUM_SUBSCRIPTION_BYTES) {
+        throw new SafeOperationError("remote subscription exceeds 1 MiB");
+      }
+      return source;
+    } finally {
+      clearTimeout(timeout);
+      this.#controllers.delete(controller);
+    }
+  }
+
   async #download(locator: string): Promise<string> {
     const controller = new AbortController();
     this.#controllers.add(controller);
@@ -250,6 +313,10 @@ export class RemoteOperationRunner {
     );
     try {
       const response = await (this.#options.fetchSubscription ?? fetch)(locator, {
+        headers: {
+          accept: "application/yaml, text/yaml, text/plain, */*",
+          "user-agent": "clash.meta",
+        },
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -281,6 +348,24 @@ export class RemoteOperationRunner {
       this.#controllers.delete(controller);
     }
   }
+}
+
+function wgetSubscription(url: string, { signal }: { signal: AbortSignal }): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "wget",
+      [
+        "--quiet",
+        "--output-document=-",
+        "--timeout=30",
+        "--user-agent=clash.meta",
+        "--header=Accept: application/yaml, text/yaml, text/plain, */*",
+        url,
+      ],
+      { encoding: "utf8", maxBuffer: MAXIMUM_SUBSCRIPTION_BYTES + 1, signal },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
+    );
+  });
 }
 
 async function runControlPlaneOperationDirectly<Result>(

@@ -13,6 +13,7 @@ import {
 import { EASE_OUT, SPRING_PRESS } from "@/lib/ease";
 import { useHoverCapable } from "@/lib/hooks/use-hover-capable";
 import { cn } from "@/lib/utils";
+import { Loader } from "../loader";
 
 export type ButtonVariant = "primary" | "secondary" | "ghost" | "outline";
 export type ButtonSize = "sm" | "md" | "lg" | "icon";
@@ -24,6 +25,7 @@ export interface ButtonProps extends Omit<HTMLMotionProps<"button">, "children">
   pressScale?: number;
   /** Spawn a Material-style ripple from the press point. Off by default. */
   ripple?: boolean;
+  loading?: boolean;
   children?: ReactNode;
 }
 
@@ -60,6 +62,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
     hoverScale = 1.02,
     pressScale = 0.93,
     ripple = false,
+    loading = false,
     className,
     children,
     onPointerDown,
@@ -112,6 +115,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
         className,
       )}
       {...rest}
+      aria-busy={loading}
+      disabled={loading || rest.disabled}
     >
       {ripple && !reduce ? (
         <span className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]">
@@ -138,7 +143,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
           </AnimatePresence>
         </span>
       ) : null}
-      {children}
+      {loading ? <Loader size={16} label="处理中" /> : children}
     </motion.button>
   );
 });

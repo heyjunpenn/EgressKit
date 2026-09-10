@@ -16,6 +16,9 @@ RUN pnpm --filter @egresskit/app-web build \
     && pnpm --filter @egresskit/app-egressd deploy --prod --legacy /opt/egresskit
 
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 ARG MIHOMO_VERSION=v1.19.30
 ARG MIHOMO_AMD64_SHA256=db214c7a2517e63c150d123178d16d102e03a241ccdae4e5e07ffbe9cf56c6f9

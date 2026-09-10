@@ -190,6 +190,33 @@ test("manual exit verification shares the five-probe concurrency limit", async (
   await running;
 });
 
+test("bulk exit verification checks every enabled node and returns each result", async () => {
+  const controller = new NodeHealthController({
+    exitIpProbe: async (listener) => ({
+      ip: `203.0.113.${Number(listener.port) - 20_000}`,
+      provider: "test",
+      verifiedAt: 10_000,
+    }),
+    healthUrls: [new URL("https://health.example/status")],
+    jitterMs: 0,
+    probe: async () => true,
+  });
+  controller.replaceNodes([
+    { id: "node-1", listener: new URL("http://127.0.0.1:20001") },
+    { id: "node-2", listener: new URL("http://127.0.0.1:20002") },
+  ]);
+
+  const results = await controller.verifyAllExits();
+
+  assert.deepEqual(
+    results.map(({ id, identity }) => ({ id, ip: identity?.ip })),
+    [
+      { id: "node-1", ip: "203.0.113.1" },
+      { id: "node-2", ip: "203.0.113.2" },
+    ],
+  );
+});
+
 test("manual exit verification discards a result from a replaced generation", async () => {
   let markStarted: (() => void) | undefined;
   const started = new Promise<void>((resolve) => {

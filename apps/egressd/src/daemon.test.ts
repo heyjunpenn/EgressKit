@@ -122,6 +122,13 @@ test("console snapshot is authenticated and redacts management data", async (t) 
     provider: "ipinfo",
     verifiedAt: 1_757_408_400_000,
   });
+
+  const bulkVerification = await fetch(`${origin}/nodes/verify-exits`, {
+    headers: { authorization: "Bearer console-admin" },
+    method: "POST",
+  });
+  assert.equal(bulkVerification.status, 200);
+  assert.deepEqual(await bulkVerification.json(), { failed: 0, succeeded: 1, total: 1 });
 });
 
 test("authenticated node enabled mutation controls scheduling health", async (t) => {
