@@ -26,6 +26,7 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /docker\/build-push-action/);
   assert.match(workflow, /linux\/amd64,linux\/arm64/);
   assert.match(workflow, /gh release (create|upload)/);
+  assert.match(workflow, /GH_REPO: \$\{\{ github\.repository \}\}/);
   assert.doesNotMatch(workflow, /uses: [^\n]+@v\d/);
   assert.match(workflow, /packages: write/);
   assert.match(workflow, /contents: write/);
