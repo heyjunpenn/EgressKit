@@ -1,4 +1,4 @@
-name: Release artifacts
+name: Publish Docker image
 
 on:
   pull_request:
@@ -36,61 +36,6 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
-
-  host-artifacts:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            runner: ubuntu-latest
-          - name: linux-arm64
-            runner: ubuntu-24.04-arm
-          - name: macos-x64
-            runner: macos-15-intel
-          - name: macos-arm64
-            runner: macos-15
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @egresskit/app-egressd build
-      - name: Stamp tag version
-        if: github.ref_type == 'tag'
-        run: node release/set-package-version.mjs "$GITHUB_REF_NAME" apps/egressd/package.json
-      - name: Assemble CLI and daemon archive
-        shell: bash
-        run: |
-          test -f apps/egressd/dist/control-cli-bin.js
-          test -f apps/egressd/dist/cli.js
-          pnpm --filter @egresskit/app-egressd pack --pack-destination release
-          mv release/egresskit-app-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
-      - name: Install and invoke both packaged commands
-        shell: bash
-        run: |
-          install_dir=$(mktemp -d)
-          trap 'rm -rf "$install_dir"' EXIT
-          archive="$GITHUB_WORKSPACE/release/egresskit-${{ matrix.name }}.tgz"
-          pnpm --dir "$install_dir" add "$archive"
-          if "$install_dir/node_modules/.bin/egresskit" runtime install --destination 2>"$install_dir/egresskit.stderr"; then
-            exit 1
-          fi
-          grep -F -- '--destination requires a path' "$install_dir/egresskit.stderr"
-          if env EGRESSKIT_ADMIN_TOKEN= "$install_dir/node_modules/.bin/egressd" 2>"$install_dir/egressd.stderr"; then
-            exit 1
-          fi
-          grep -F -- 'EGRESSKIT_ADMIN_TOKEN is required' "$install_dir/egressd.stderr"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: egresskit-${{ matrix.name }}
-          path: release/egresskit-${{ matrix.name }}.tgz
 
   docker-validation:
     name: docker-${{ matrix.name }}
@@ -170,27 +115,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           provenance: mode=max
           sbom: true
-
-  github-release:
-    if: github.ref_type == 'tag'
-    needs: [quality, host-artifacts, docker-publish]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: egresskit-*
-          path: release-assets
-          merge-multiple: true
-      - name: Attach archives to the GitHub Release
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/*.tgz --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" release-assets/*.tgz --verify-tag --generate-notes
-          fi

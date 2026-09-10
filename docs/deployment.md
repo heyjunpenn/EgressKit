@@ -1,23 +1,16 @@
-# Deployment and release support
+# Docker deployment and release support
 
 ## v1 support matrix
 
 | Distribution | Architecture | v1 status |
 | --- | --- | --- |
-| Linux CLI and daemon | Linux x64 | Supported and built in the release matrix |
-| Linux CLI and daemon | Linux arm64 | Supported and built in the release matrix |
-| macOS CLI and daemon | macOS x64 | Supported and built in the release matrix |
-| macOS CLI and daemon | macOS arm64 | Supported and built in the release matrix |
 | Linux Docker | linux/amd64 | Supported multi-architecture image |
 | Linux Docker | linux/arm64 | Supported multi-architecture image |
 
-Windows 不在 v1 的正式支持范围。发布流水线通过独立任务执行一次完整 `pnpm verify`。
-四种受支持的宿主组合分别执行构建、打包、安装和双入口 smoke，并保存构建归档。Docker manifest 同时包含
-`linux/amd64` 与 `linux/arm64`。正式镜像与 GitHub Release 都依赖完整质量验证成功。
-
-带版本的 GitHub Release 附件是 v1 CLI 和 daemon 归档的正式下载渠道；项目不从 npm registry
-发布。归档内部 package version 必须与无前缀的 `x.y.z` release tag 完全一致。容器镜像从同一 tag 发布到
-Docker Hub 的 `heyjunpenn/egresskit`，并附带构建 provenance 与 SBOM。
+EgressKit 仅通过 Docker Hub 分发，不提供宿主机归档或 npm registry 包。发布流水线先执行完整
+`pnpm verify`，再分别验证 `linux/amd64` 与 `linux/arm64` 镜像，最后从无前缀的 `x.y.z` tag
+发布 `heyjunpenn/egresskit:<version>` 和 `heyjunpenn/egresskit:latest`。多架构镜像附带构建
+provenance 与 SBOM。
 
 ## State-directory security
 
