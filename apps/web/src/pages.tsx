@@ -61,7 +61,7 @@ type PlaygroundLog = {
 };
 
 function statusVariant(value: string): AnimatedBadgeStatus {
-  if (["healthy", "ready", "succeeded", "accepted"].includes(value)) return "success";
+  if (["available", "healthy", "ready", "succeeded", "accepted"].includes(value)) return "success";
   if (["degraded", "warming", "pending", "suspicious", "cooldown", "draining"].includes(value)) {
     return "warning";
   }
@@ -86,6 +86,7 @@ function statusVariant(value: string): AnimatedBadgeStatus {
 }
 
 const statusLabels: Record<string, string> = {
+  available: "可用",
   accepted: "已接受",
   applying: "应用中",
   checking: "健康检查中",
@@ -107,6 +108,7 @@ const statusLabels: Record<string, string> = {
   saved: "已保存",
   succeeded: "成功",
   suspicious: "可疑",
+  unavailable: "不可用",
   validated: "已验证",
   validating: "校验中",
   warming: "预热中",
@@ -213,7 +215,7 @@ export function OverviewPage() {
       iconClassName: "text-foreground",
     },
     {
-      label: "健康节点",
+      label: "可用节点",
       value: metrics.healthyNodes,
       suffix: ` / ${metrics.totalNodes}`,
       icon: Pulse,
@@ -825,7 +827,7 @@ export function ProxiesPage() {
     try {
       await api.send(`/nodes/${encodeURIComponent(id)}/enabled`, "PUT", { enabled });
       toast({
-        message: enabled ? "节点已重新加入健康评估" : "节点已停止接收新分配",
+        message: enabled ? "节点已重新加入调度" : "节点已停止接收新分配",
         variant: "success",
       });
       await refresh();
@@ -1030,20 +1032,18 @@ export function ProxiesPage() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">全部状态</SelectItem>
-              {["healthy", "degraded", "warming", "cooldown", "disabled", "draining"].map(
-                (status) => (
-                  <SelectItem key={status} value={status}>
-                    {statusLabel(status)}
-                  </SelectItem>
-                ),
-              )}
+              {["available", "unavailable"].map((status) => (
+                <SelectItem key={status} value={status}>
+                  {statusLabel(status)}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
           <Select value={exitIpFilter} onValueChange={setExitIpFilter}>
             <SelectTrigger ariaLabel="按出口 IP 筛选节点">
               <SelectValue />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent viewportClassName="max-h-[50vh] overflow-y-auto">
               <SelectItem value="all">全部出口 IP</SelectItem>
               {exitIpOptions.map(({ ip, location, nodeCount }) => (
                 <SelectItem key={ip} value={ip}>
@@ -1314,6 +1314,7 @@ export function SettingsPage() {
           {secondsField("healthCheckIntervalMs", "探活间隔")}
           {secondsField("healthCheckJitterMs", "随机抖动")}
           {numberField("healthCheckConcurrency", "探活并发")}
+          {numberField("exitIpCheckBatchSize", "每轮出口 IP 检查数")}
           {numberField("healthCheckSuccessThreshold", "成功阈值")}
           {numberField("minimumSubscriptionNodes", "订阅最少节点")}
           {secondsField("remoteSubscriptionRefreshIntervalMs", "订阅刷新间隔")}

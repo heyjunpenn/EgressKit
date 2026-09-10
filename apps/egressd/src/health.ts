@@ -3,7 +3,7 @@ import { Agent as HttpsAgent, request as requestHttps } from "node:https";
 import { isIP } from "node:net";
 import { connect as connectTls } from "node:tls";
 
-export type NodeHealthStatus = "cooldown" | "degraded" | "disabled" | "healthy" | "warming";
+export type NodeHealthStatus = "available" | "unavailable";
 
 export interface HealthNode {
   generation?: string;
@@ -49,11 +49,14 @@ export interface NodeHealthControllerOptions {
   intervalMs?: number;
   jitterMs?: number;
   onExitIdentity?: (id: string, identity: ExitIpIdentity) => void;
+  onExitIdentityCleared?: (id: string) => void;
   onProbeResult?: (id: string, succeeded: boolean) => void;
   onStatusChange?: (id: string, status: NodeHealthStatus) => void;
   probe?: HealthProbe;
   random?: () => number;
   successThreshold?: number;
+  scheduledBatchSize?: number;
+  unavailableAfterFailures?: number;
 }
 
 interface NodeHealthState extends NodeHealthSnapshot {
@@ -65,47 +68,35 @@ interface NodeHealthState extends NodeHealthSnapshot {
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
-const EXIT_PROBE_RETRY_MS = 10 * 60_000;
 
 export class NodeHealthController {
-  readonly #concurrency: number;
-  readonly #cooldownAfterFailures: number;
-  readonly #cooldownInitialMs: number;
-  readonly #cooldownMaximumMs: number;
-  readonly #degradedAfterFailures: number;
   readonly #exitProbeLimiter = new ConcurrencyLimiter(5);
   readonly #exitIpProbe: ExitIpProbe | undefined;
-  readonly #healthUrls: readonly URL[];
   readonly #intervalMs: number;
   readonly #jitterMs: number;
   readonly #onExitIdentity: ((id: string, identity: ExitIpIdentity) => void) | undefined;
+  readonly #onExitIdentityCleared: ((id: string) => void) | undefined;
   readonly #onProbeResult: ((id: string, succeeded: boolean) => void) | undefined;
   readonly #onStatusChange: ((id: string, status: NodeHealthStatus) => void) | undefined;
-  readonly #probe: HealthProbe;
   readonly #random: () => number;
-  readonly #successThreshold: number;
+  readonly #scheduledBatchSize: number;
+  readonly #unavailableAfterFailures: number;
+  #nextScheduledRunAt = 0;
+  #scheduledCursor = 0;
   #states = new Map<string, NodeHealthState>();
 
   constructor(options: NodeHealthControllerOptions) {
-    this.#healthUrls = options.healthUrls;
-    this.#successThreshold = options.successThreshold ?? 1;
-    this.#concurrency = options.concurrency ?? 4;
     this.#intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.#jitterMs = options.jitterMs ?? 5_000;
-    this.#degradedAfterFailures = options.degradedAfterFailures ?? 2;
     this.#exitIpProbe = options.exitIpProbe;
-    this.#cooldownAfterFailures = options.cooldownAfterFailures ?? 3;
-    this.#cooldownInitialMs = options.cooldownInitialMs ?? 60_000;
-    this.#cooldownMaximumMs = options.cooldownMaximumMs ?? 15 * 60_000;
-    this.#probe =
-      options.probe ??
-      ((listener, target, signal) =>
-        probeThroughMihomo(listener, target, DEFAULT_PROBE_TIMEOUT_MS, signal));
     this.#random = options.random ?? Math.random;
     this.#onExitIdentity = options.onExitIdentity;
+    this.#onExitIdentityCleared = options.onExitIdentityCleared;
     this.#onProbeResult = options.onProbeResult;
     this.#onStatusChange = options.onStatusChange;
-    validateOptions(options, this.#cooldownAfterFailures);
+    this.#scheduledBatchSize = options.scheduledBatchSize ?? 10;
+    this.#unavailableAfterFailures = options.unavailableAfterFailures ?? 10;
+    validateOptions(options);
   }
 
   replaceNodes(nodes: readonly HealthNode[], now = Date.now()): void {
@@ -126,12 +117,9 @@ export class NodeHealthController {
           manuallyEnabled: existing?.manuallyEnabled ?? true,
           nextExitProbeAt: now,
           nextProbeAt: now + this.#nextJitter(),
-          status: "warming",
+          status: "unavailable",
         });
-        this.#onStatusChange?.(
-          node.id,
-          existing?.manuallyEnabled === false ? "disabled" : "warming",
-        );
+        this.#onStatusChange?.(node.id, "unavailable");
       }
     }
     this.#states = next;
@@ -139,7 +127,7 @@ export class NodeHealthController {
 
   recordConnectionFailure(id: string, now = Date.now()): boolean {
     const state = this.#states.get(id);
-    if (!state?.manuallyEnabled || state.status === "cooldown") {
+    if (!state?.manuallyEnabled) {
       return false;
     }
     this.#applyFailure(state, now);
@@ -151,7 +139,7 @@ export class NodeHealthController {
 
   recordConnectionSuccess(id: string, now = Date.now()): boolean {
     const state = this.#states.get(id);
-    if (!state?.manuallyEnabled || state.status === "cooldown") {
+    if (!state?.manuallyEnabled) {
       return false;
     }
     state.consecutiveFailures = 0;
@@ -171,7 +159,7 @@ export class NodeHealthController {
     state.manuallyEnabled = enabled;
     state.epoch += 1;
     this.#ensureProbeScheduled(state, now);
-    this.#onStatusChange?.(state.id, enabled ? state.status : "disabled");
+    this.#onStatusChange?.(state.id, state.exitIp ? "available" : "unavailable");
     return true;
   }
 
@@ -183,7 +171,10 @@ export class NodeHealthController {
         listener: _listener,
         nextExitProbeAt: _nextExitProbeAt,
         ...snapshot
-      }) => ({ ...snapshot, status: snapshot.manuallyEnabled ? snapshot.status : "disabled" }),
+      }) => ({
+        ...snapshot,
+        status: snapshot.exitIp ? "available" : "unavailable",
+      }),
     );
   }
 
@@ -195,7 +186,9 @@ export class NodeHealthController {
     const exitIpProbe = this.#exitIpProbe;
     if (!state || !exitIpProbe) return undefined;
     const epoch = state.epoch;
-    const identity = await this.#exitProbeLimiter.run(() => exitIpProbe(state.listener, signal));
+    const identity = await this.#exitProbeLimiter
+      .run(() => exitIpProbe(state.listener, signal))
+      .catch(() => undefined);
     if (
       !identity ||
       signal.aborted ||
@@ -203,8 +196,18 @@ export class NodeHealthController {
       state.epoch !== epoch ||
       !state.manuallyEnabled
     ) {
+      if (
+        !signal.aborted &&
+        state.manuallyEnabled &&
+        this.#states.get(id) === state &&
+        state.epoch === epoch
+      ) {
+        this.#onProbeResult?.(id, false);
+        this.#applyFailure(state, Date.now());
+      }
       return undefined;
     }
+    this.#onProbeResult?.(id, true);
     this.#recordExitIdentity(state, identity);
     return identity;
   }
@@ -230,94 +233,29 @@ export class NodeHealthController {
   }
 
   async runDue(now = Date.now(), signal = new AbortController().signal): Promise<void> {
-    const due = [...this.#states.values()]
-      .filter((state) => state.manuallyEnabled && state.nextProbeAt <= now)
-      .map((state) => {
-        if (state.status === "cooldown") {
-          this.#setStatus(state, "warming");
-        }
-        state.nextProbeAt = Number.POSITIVE_INFINITY;
-        return { epoch: state.epoch, state };
-      });
-    if (due.length === 0) {
-      return;
-    }
-
-    const results = new Map<string, number>();
-    const tasks = due.flatMap(({ state }) =>
-      this.#healthUrls.map((target) => async () => {
-        let succeeded = false;
-        try {
-          succeeded = await this.#probe(state.listener, target, signal);
-        } catch {
-          succeeded = false;
-        }
-        if (succeeded) {
-          results.set(state.id, (results.get(state.id) ?? 0) + 1);
-        }
-      }),
-    );
-    await runWithConcurrency(tasks, this.#concurrency);
-    const exitIdentities = new Map<string, ExitIpIdentity>();
-    const exitIpProbe = this.#exitIpProbe;
-    if (exitIpProbe) {
-      await runWithConcurrency(
-        due
-          .filter(({ state }) => state.exitIp === undefined && state.nextExitProbeAt <= now)
-          .map(({ state }) => async () => {
-            state.nextExitProbeAt = now + EXIT_PROBE_RETRY_MS;
-            const identity = await this.#exitProbeLimiter
-              .run(() => exitIpProbe(state.listener, signal))
-              .catch(() => undefined);
-            if (identity !== undefined) exitIdentities.set(state.id, identity);
-          }),
-        5,
-      );
-    }
-
-    for (const { epoch, state } of due) {
-      if (this.#states.get(state.id) !== state || state.epoch !== epoch) {
-        continue;
-      }
-      if (signal.aborted) {
-        this.#ensureProbeScheduled(state, now);
-        continue;
-      }
-      if (!state.manuallyEnabled) {
-        continue;
-      }
-      const succeeded = (results.get(state.id) ?? 0) >= this.#successThreshold;
-      this.#onProbeResult?.(state.id, succeeded);
-      if (succeeded) {
-        const identity = exitIdentities.get(state.id);
-        if (identity !== undefined) this.#recordExitIdentity(state, identity);
-        state.consecutiveFailures = 0;
-        state.cooldownCount = 0;
-        state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
-        state.epoch += 1;
-        this.#setStatus(state, "healthy");
-      } else {
-        this.#applyFailure(state, now);
-        if (state.status !== "cooldown") {
-          state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
-        }
-      }
-    }
+    if (now < this.#nextScheduledRunAt) return;
+    const enabled = [...this.#states.values()].filter(({ manuallyEnabled }) => manuallyEnabled);
+    if (enabled.length === 0) return;
+    const due = Array.from(
+      { length: Math.min(this.#scheduledBatchSize, enabled.length) },
+      (_, offset) => enabled[(this.#scheduledCursor + offset) % enabled.length],
+    ).filter((state): state is NodeHealthState => state !== undefined);
+    this.#scheduledCursor = (this.#scheduledCursor + due.length) % enabled.length;
+    this.#nextScheduledRunAt = now + this.#intervalMs + this.#nextJitter();
+    await Promise.all(due.map(({ id }) => this.verifyExit(id, signal)));
   }
 
   #applyFailure(state: NodeHealthState, now: number): void {
     state.consecutiveFailures += 1;
     state.epoch += 1;
-    if (state.consecutiveFailures >= this.#cooldownAfterFailures) {
-      state.cooldownCount += 1;
-      const cooldownMs = Math.min(
-        this.#cooldownMaximumMs,
-        this.#cooldownInitialMs * 2 ** (state.cooldownCount - 1),
-      );
-      state.nextProbeAt = now + cooldownMs;
-      this.#setStatus(state, "cooldown");
-    } else if (state.consecutiveFailures >= this.#degradedAfterFailures) {
-      this.#setStatus(state, "degraded");
+    state.nextProbeAt = now + this.#intervalMs;
+    if (state.consecutiveFailures >= this.#unavailableAfterFailures && state.exitIp) {
+      delete state.exitIp;
+      delete state.exitLocation;
+      delete state.exitProvider;
+      delete state.exitVerifiedAt;
+      this.#setStatus(state, "unavailable");
+      this.#onExitIdentityCleared?.(state.id);
     }
   }
 
@@ -326,8 +264,11 @@ export class NodeHealthController {
     state.exitProvider = identity.provider;
     state.exitVerifiedAt = identity.verifiedAt;
     state.nextExitProbeAt = Number.POSITIVE_INFINITY;
+    state.consecutiveFailures = 0;
+    state.cooldownCount = 0;
     const location = [identity.country, identity.city].filter(Boolean).join("-");
     if (location) state.exitLocation = location;
+    this.#setStatus(state, "available");
     this.#onExitIdentity?.(state.id, identity);
   }
 
@@ -346,7 +287,7 @@ export class NodeHealthController {
       return;
     }
     state.status = status;
-    this.#onStatusChange?.(state.id, state.manuallyEnabled ? status : "disabled");
+    this.#onStatusChange?.(state.id, status);
   }
 }
 
@@ -547,25 +488,7 @@ class ConcurrencyLimiter {
   }
 }
 
-async function runWithConcurrency(
-  tasks: readonly (() => Promise<void>)[],
-  concurrency: number,
-): Promise<void> {
-  let next = 0;
-  const worker = async () => {
-    while (next < tasks.length) {
-      const task = tasks[next];
-      next += 1;
-      await task?.();
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
-}
-
-function validateOptions(
-  options: NodeHealthControllerOptions,
-  cooldownAfterFailures: number,
-): void {
+function validateOptions(options: NodeHealthControllerOptions): void {
   if (options.healthUrls.length === 0) {
     throw new Error("at least one health URL is required");
   }
@@ -574,21 +497,10 @@ function validateOptions(
       throw new Error("health URLs must use HTTP or HTTPS");
     }
   }
-  const successThreshold = options.successThreshold ?? 1;
-  if (
-    !Number.isInteger(successThreshold) ||
-    successThreshold < 1 ||
-    successThreshold > options.healthUrls.length
-  ) {
-    throw new Error("health success threshold must be within the configured URL count");
-  }
   for (const [name, value] of [
-    ["health concurrency", options.concurrency ?? 4],
-    ["health interval", options.intervalMs ?? DEFAULT_INTERVAL_MS],
-    ["degraded failure threshold", options.degradedAfterFailures ?? 2],
-    ["cooldown failure threshold", cooldownAfterFailures],
-    ["initial cooldown", options.cooldownInitialMs ?? 60_000],
-    ["maximum cooldown", options.cooldownMaximumMs ?? 15 * 60_000],
+    ["exit check interval", options.intervalMs ?? DEFAULT_INTERVAL_MS],
+    ["scheduled exit check batch size", options.scheduledBatchSize ?? 10],
+    ["unavailable failure threshold", options.unavailableAfterFailures ?? 10],
   ] as const) {
     if (!Number.isInteger(value) || value < 1) {
       throw new Error(`${name} must be a positive integer`);
@@ -596,11 +508,5 @@ function validateOptions(
   }
   if ((options.jitterMs ?? 5_000) < 0) {
     throw new Error("health jitter must not be negative");
-  }
-  if ((options.degradedAfterFailures ?? 2) >= cooldownAfterFailures) {
-    throw new Error("degraded failure threshold must be below cooldown threshold");
-  }
-  if ((options.cooldownInitialMs ?? 60_000) > (options.cooldownMaximumMs ?? 15 * 60_000)) {
-    throw new Error("initial cooldown must not exceed maximum cooldown");
   }
 }

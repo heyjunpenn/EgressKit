@@ -214,7 +214,7 @@ test("authenticated metrics and structured logs expose signals without seeded se
   assert.match(metricsBody, /egresskit_connections_total\{result="success"\} 1/);
   assert.match(metricsBody, /egresskit_active_sessions 1/);
   assert.match(metricsBody, /egresskit_connection_latency_ms_count 1/);
-  assert.match(metricsBody, /egresskit_nodes\{status="healthy"\} 1/);
+  assert.match(metricsBody, /egresskit_nodes\{status="available"\} 1/);
   assert.match(metricsBody, /egresskit_operations\{status="/);
   let safeError: unknown;
   try {

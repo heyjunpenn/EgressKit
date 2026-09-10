@@ -150,6 +150,7 @@ export interface ControlState extends SessionBindingStore {
     subscriptionId: string;
   };
   deleteSubscription(subscriptionId: string): boolean;
+  deleteExitIdentity(logicalId: string, generation: string): boolean;
   databasePath: string;
   failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
   failForceOperation(
@@ -248,6 +249,8 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     createRemoteSubscription: (locator, name) =>
       createRemoteSubscription(controlDatabase, locator, name),
     deleteSubscription: (subscriptionId) => deleteSubscription(controlDatabase, subscriptionId),
+    deleteExitIdentity: (logicalId, generation) =>
+      deleteExitIdentity(controlDatabase, logicalId, generation),
     countSessionBindings: () => countSessionBindings(controlDatabase),
     databasePath,
     deleteExpiredSessionBindings: (now, absoluteTtlMs, idleTimeoutMs, activeIdentities) =>
@@ -458,6 +461,18 @@ function saveExitIdentity(database: DatabaseSync, identity: PersistedExitIdentit
     );
 }
 
+function deleteExitIdentity(
+  database: DatabaseSync,
+  logicalId: string,
+  generation: string,
+): boolean {
+  return (
+    database
+      .prepare("DELETE FROM node_exit_identities WHERE logical_id = ? AND generation = ?")
+      .run(logicalId, generation).changes > 0
+  );
+}
+
 function getNodeEnabledOverrides(database: DatabaseSync): ReadonlyMap<string, boolean> {
   const rows = database
     .prepare("SELECT logical_id, enabled FROM node_enabled_overrides")
@@ -569,7 +584,12 @@ function loadRuntimeSettings(database: DatabaseSync, adminToken: string): Runtim
   const existing = database
     .prepare("SELECT value FROM daemon_metadata WHERE key = 'runtime_settings'")
     .get() as { value: string } | undefined;
-  if (existing) return parseRuntimeSettings(JSON.parse(existing.value));
+  if (existing) {
+    return parseRuntimeSettings({
+      ...defaultRuntimeSettings(adminToken),
+      ...(JSON.parse(existing.value) as Record<string, unknown>),
+    });
+  }
   return updateRuntimeSettings(database, defaultRuntimeSettings(adminToken));
 }
 

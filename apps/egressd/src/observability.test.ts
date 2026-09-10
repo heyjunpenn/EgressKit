@@ -11,7 +11,7 @@ test("Prometheus metrics cover bounded operational signals without secret labels
 
   const output = metrics.render({
     activeSessions: 7,
-    nodeStatuses: { cooldown: 1, healthy: 2 },
+    nodeStatuses: { available: 2, unavailable: 1 },
     operationStatuses: { failed: 1, succeeded: 3 },
   });
 
@@ -28,7 +28,7 @@ test("Prometheus metrics cover bounded operational signals without secret labels
   }
   assert.match(output, /egresskit_connections_total\{result="success"\} 1/);
   assert.match(output, /egresskit_connections_total\{result="failure"\} 1/);
-  assert.match(output, /egresskit_nodes\{status="healthy"\} 2/);
+  assert.match(output, /egresskit_nodes\{status="available"\} 2/);
   assert.match(output, /egresskit_operations\{status="succeeded"\} 3/);
   assert.doesNotMatch(
     output,

@@ -245,10 +245,11 @@ export function SelectValue({ placeholder, className }: SelectValueProps) {
 
 export interface SelectContentProps {
   className?: string;
+  viewportClassName?: string;
   children: ReactNode;
 }
 
-export function SelectContent({ className, children }: SelectContentProps) {
+export function SelectContent({ className, viewportClassName, children }: SelectContentProps) {
   const ctx = useSelectContext("SelectContent");
   const innerRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(0);
@@ -354,7 +355,7 @@ export function SelectContent({ className, children }: SelectContentProps) {
         variants={ctx.reduce ? undefined : LIST_VARIANTS}
         initial={false}
         animate={open ? "show" : "hidden"}
-        className="p-1"
+        className={cn("p-1", viewportClassName)}
       >
         {children}
       </motion.div>

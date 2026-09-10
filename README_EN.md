@@ -50,7 +50,7 @@ Open Subscriptions, select Add subscription, enter a name and a Clash / Mihomo H
 
 ![Subscription import completed](docs/images/docker-walkthrough/03-subscription-imported.png)
 
-Imported nodes must still pass health checks and exit-IP discovery. Every node enters the verification queue, with at most five exit probes running concurrently, so large subscriptions may take several minutes.
+Imported nodes must still complete exit-IP discovery. Every node enters the verification queue, with at most five exit probes running concurrently, so large subscriptions may take several minutes.
 
 ```bash
 until curl --fail --silent http://127.0.0.1:8787/ready; do
@@ -133,42 +133,24 @@ flowchart LR
     scheduler --> listeners["Mihomo listeners"]
     listeners --> nodes["Clash / VLESS nodes"]
     subscriptions["Remote subscriptions"] --> registry["Node registry"]
-    health["Health and exit discovery"] --> registry
+    health["Exit-IP checks"] --> registry
     registry --> scheduler
     registry <--> sqlite[("SQLite")]
 ```
 
-Several nodes can share one public IP, so EgressKit schedules verified exit IPs rather than counting nodes as distinct exits. `rotate` selects the least recently used IP group and then a healthy transport within that group. Sticky, strict, and explicit-node routes also bind to an exit IP.
+Several nodes can share one public IP, so EgressKit schedules verified exit IPs rather than counting nodes as distinct exits. `rotate` selects the least recently used IP group and then an available transport within that group. Sticky, strict, and explicit-node routes also bind to an exit IP.
 
 ### Proxy lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Verifying: node imported / generation changed
-
-    Verifying --> AwaitingExit: health passes, but no exit IP
-    AwaitingExit --> Verifying: retry on the next health cycle
-    Verifying --> Schedulable: health and exit IP verified
-    AwaitingExit --> Schedulable: exit IP verified
-
-    Schedulable --> Degraded: failure threshold reached
-    Degraded --> Schedulable: health recovers
-    Degraded --> Cooldown: cooldown threshold reached
-    Cooldown --> Verifying: cooldown expires
-
-    Verifying --> Disabled: manually disabled
-    AwaitingExit --> Disabled: manually disabled
-    Schedulable --> Disabled: manually disabled
-    Degraded --> Disabled: manually disabled
-    Cooldown --> Disabled: manually disabled
-    Disabled --> Verifying: re-enabled
-
-    Schedulable --> Draining: old generation replaced or removed
-    Draining --> Removed: existing connections reach zero
-    Removed --> [*]
+    [*] --> Unavailable: node imported / generation changed
+    Unavailable --> Available: scheduled or manual check finds an exit IP
+    Available --> Available: scheduled check refreshes the exit IP
+    Available --> Unavailable: 10 consecutive check or connection failures
 ```
 
-Passing a health check and becoming schedulable are separate conditions: a proxy enters the scheduling pool only after it is healthy and has a verified exit IP. Consecutive failures move it through `degraded` and then exponentially backed-off `cooldown`; after cooldown it returns to `warming` for another probe. Automatic probes never override a manual disable. A subscription update gives a changed generation a fresh verification cycle while the old generation stops accepting new connections; its listener is removed and its port quarantined after existing connections drain.
+Nodes expose only two states: available and unavailable. A node is available only while it has a verified exit IP. Ten consecutive check or connection failures revoke that identity and remove the node from scheduling. Scheduled checks process 10 nodes in order per round with at most five concurrent probes; manual checks can verify one node or the full set.
 
 For HTTPS, EgressKit can try another exit before returning `200 Connection Established`. After the tunnel is established, EgressKit forwards encrypted bytes without decrypting or replaying requests. The client decides whether to reconnect after a tunnel failure.
 
@@ -179,8 +161,8 @@ For HTTPS, EgressKit can try another exit before returning `200 Connection Estab
 | Setting | Default |
 | --- | ---: |
 | Listen address | `0.0.0.0:8787` |
-| Health-check interval | 30 seconds |
-| Health-check concurrency | 4 |
+| Exit-IP check interval | 30 seconds |
+| Exit-IP checks per round | 10 |
 | Exit-IP probe concurrency | 5 |
 | Subscription refresh interval | 600 seconds |
 | Pre-connect attempts | 3 |
@@ -199,7 +181,7 @@ docker logs --tail 100 egresskit
 
 - `407 Proxy Authentication Required`: the Proxy Token is invalid, or the client did not send proxy credentials.
 - `502 Bad Gateway`: the current candidates cannot reach the target; inspect node health, subscription validity, and container networking.
-- `/ready` returns 503: no node has passed both health checking and exit-IP verification.
+- `/ready` returns 503: no enabled node currently has a verified exit IP.
 - Rotate keeps the same IP: the client may be reusing a CONNECT tunnel, or several nodes may share one public IP.
 - An IP lookup returns 429: the lookup provider rate-limited the request; this does not prove that rotation failed.
 

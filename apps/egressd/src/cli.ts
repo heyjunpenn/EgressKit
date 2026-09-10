@@ -39,6 +39,7 @@ async function main(): Promise<void> {
       };
   const daemon = await startEgressd({
     adminToken: config.adminToken,
+    exitIpCheckBatchSize: settings.exitIpCheckBatchSize,
     controlSocketPath: config.controlSocketPath,
     stateDirectory: config.stateDirectory,
     ...(config.webDirectory ? { webDirectory: config.webDirectory } : {}),

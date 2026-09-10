@@ -162,22 +162,22 @@ test("pre-connect retries exclude attempted nodes and record connection outcomes
   assert.equal(snapshot.find(({ id }) => id === "second")?.consecutiveFailures, 0);
 });
 
-test("runtime health gates selection and survives candidate replacement", () => {
+test("exit availability gates selection and survives candidate replacement", () => {
   const scheduler = new RotateScheduler([candidate("first"), candidate("second")]);
 
-  assert.equal(scheduler.setHealthStatus("first", "warming"), true);
+  assert.equal(scheduler.setHealthStatus("first", "unavailable"), true);
   assert.equal(scheduler.acquireById("first"), undefined);
-  assert.equal(scheduler.setHealthStatus("first", "degraded"), true);
-  const degraded = scheduler.acquireById("first");
-  assert.equal(degraded?.candidate.id, "first");
-  degraded?.reportConnectionFailure();
-  degraded?.release();
+  assert.equal(scheduler.setHealthStatus("first", "available"), true);
+  const available = scheduler.acquireById("first");
+  assert.equal(available?.candidate.id, "first");
+  available?.reportConnectionFailure();
+  available?.release();
 
   scheduler.replaceCandidates([candidate("first"), candidate("second")]);
 
-  assert.equal(scheduler.healthStatus("first"), "degraded");
+  assert.equal(scheduler.healthStatus("first"), "available");
   assert.equal(scheduler.snapshot().find(({ id }) => id === "first")?.consecutiveFailures, 1);
-  assert.equal(scheduler.setHealthStatus("first", "disabled"), true);
+  assert.equal(scheduler.setHealthStatus("first", "unavailable"), true);
   assert.equal(scheduler.acquireBySelector("first"), undefined);
 });
 

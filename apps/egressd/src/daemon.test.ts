@@ -163,8 +163,8 @@ test("authenticated node enabled mutation controls scheduling health", async (t)
   };
   assert.equal(body.gateway.ready, false);
   assert.equal(body.nodes[0]?.enabled, false);
-  assert.equal(body.nodes[0]?.status, "disabled");
-  assert.equal(body.nodeStatusCounts.disabled, 1);
+  assert.equal(body.nodes[0]?.status, "unavailable");
+  assert.equal(body.nodeStatusCounts.unavailable, 1);
   const readiness = await fetch(`${origin}/ready`);
   assert.equal(readiness.status, 503);
 });
@@ -201,7 +201,7 @@ test("manual node enabled override survives a daemon restart", async (t) => {
   });
   const body = (await response.json()) as { nodes: Array<{ enabled: boolean; status: string }> };
   assert.equal(body.nodes[0]?.enabled, false);
-  assert.equal(body.nodes[0]?.status, "disabled");
+  assert.equal(body.nodes[0]?.status, "unavailable");
 });
 
 test("daemon shutdown closes an idle HTTP keep-alive connection", async () => {
@@ -217,17 +217,18 @@ test("daemon shutdown closes an idle HTTP keep-alive connection", async () => {
   assert.equal(client.destroyed, true);
 });
 
-test("daemon probes exits through their listeners and exposes manual health control", async (t) => {
-  const targetRequests: Parameters<typeof startTargetServer>[0] = [];
-  const target = await startTargetServer(targetRequests);
-  t.after(() => target.close());
+test("daemon refreshes exit identities and exposes manual node control", async (t) => {
   const listenerRequests: string[] = [];
   const mihomo = await startSimulatedMihomoListener(undefined, [], listenerRequests);
   t.after(() => mihomo.close());
   const daemon = await startEgressd({
     healthCheckIntervalMs: 100,
     healthCheckJitterMs: 0,
-    healthCheckUrls: [new URL(`http://${target.host}:${target.port}/health`)],
+    healthCheckUrls: [new URL("http://health.example")],
+    exitIpProbe: async (listener) => {
+      listenerRequests.push(listener.href);
+      return { ip: "203.0.113.1", provider: "test", verifiedAt: Date.now() };
+    },
     host: "127.0.0.1",
     mihomoListener: new URL(`http://${mihomo.host}:${mihomo.port}`),
     port: 0,
@@ -235,14 +236,13 @@ test("daemon probes exits through their listeners and exposes manual health cont
   });
   t.after(() => daemon.close());
 
-  await waitFor(async () => daemon.healthSnapshot()[0]?.status === "healthy");
+  await waitFor(async () => daemon.healthSnapshot()[0]?.status === "available");
 
-  assert.deepEqual(listenerRequests, [`GET http://${target.host}:${target.port}/health`]);
-  assert.equal(targetRequests.length, 1);
+  assert.equal(listenerRequests.length, 1);
   assert.equal(daemon.setNodeEnabled("configured", false), true);
   await new Promise<void>((resolve) => setTimeout(resolve, 30));
-  assert.equal(daemon.healthSnapshot()[0]?.status, "disabled");
-  assert.equal(targetRequests.length, 1);
+  assert.equal(daemon.healthSnapshot()[0]?.status, "available");
+  assert.equal(listenerRequests.length, 1);
 });
 
 test("daemon shutdown aborts and waits for an in-flight health probe", async () => {
@@ -253,10 +253,10 @@ test("daemon shutdown aborts and waits for an in-flight health probe", async () 
   const daemon = await startEgressd({
     healthCheckIntervalMs: 1,
     healthCheckJitterMs: 0,
-    healthCheckProbe: async (_listener, _target, signal) => {
+    exitIpProbe: async (_listener, signal) => {
       started?.();
-      return new Promise<boolean>((resolve) =>
-        signal.addEventListener("abort", () => resolve(false), { once: true }),
+      return new Promise<undefined>((resolve) =>
+        signal.addEventListener("abort", () => resolve(undefined), { once: true }),
       );
     },
     healthCheckUrls: [new URL("http://health.example")],

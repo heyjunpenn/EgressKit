@@ -79,6 +79,7 @@ export interface OperationResponse {
 }
 
 export interface RuntimeSettings {
+  exitIpCheckBatchSize: number;
   healthCheckConcurrency: number;
   healthCheckIntervalMs: number;
   healthCheckJitterMs: number;

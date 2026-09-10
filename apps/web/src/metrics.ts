@@ -15,7 +15,7 @@ export function parseMetrics(source: string): MetricsSummary {
   return {
     activeSessions: read("egresskit_active_sessions"),
     failedConnections: read('egresskit_connections_total{result="failure"}'),
-    healthyNodes: read('egresskit_nodes{status="healthy"}'),
+    healthyNodes: read('egresskit_nodes{status="available"}'),
     successConnections: read('egresskit_connections_total{result="success"}'),
     totalNodes: nodeValues.reduce((total, [, value]) => total + value, 0),
   };

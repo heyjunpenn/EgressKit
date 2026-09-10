@@ -6,7 +6,7 @@ describe("parseMetrics", () => {
     expect(
       parseMetrics(`
 egresskit_active_sessions 7
-egresskit_nodes{status="healthy"} 12
+egresskit_nodes{status="available"} 12
 egresskit_nodes{status="cooldown"} 2
 egresskit_connections_total{result="success"} 341
 egresskit_connections_total{result="failure"} 9

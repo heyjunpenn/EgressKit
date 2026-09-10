@@ -112,7 +112,7 @@ export class RotateScheduler {
       if (!existing) {
         return {
           candidate,
-          healthStatus: candidate.healthy ? "healthy" : "cooldown",
+          healthStatus: candidate.healthy ? "available" : "unavailable",
           lastSelectedSequence: 0,
           leasedConnections: 0,
           onDrained: undefined,
@@ -255,7 +255,7 @@ export class RotateScheduler {
     state.healthStatus = healthStatus;
     state.candidate = {
       ...state.candidate,
-      healthy: healthStatus === "healthy" || healthStatus === "degraded",
+      healthy: healthStatus === "available",
     };
     return true;
   }
@@ -276,6 +276,14 @@ export class RotateScheduler {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
     if (!state) return false;
     state.candidate = { ...state.candidate, exitIp };
+    return true;
+  }
+
+  clearExitIp(id: string): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) return false;
+    const { exitIp: _exitIp, ...candidate } = state.candidate;
+    state.candidate = candidate;
     return true;
   }
 

@@ -86,6 +86,7 @@ export interface MihomoApplyContext {
 }
 
 export interface EgressdOptions {
+  exitIpCheckBatchSize?: number;
   adminToken?: string;
   allowUnsafeUnauthenticatedProxy?: boolean;
   controlSocketPath?: string;
@@ -385,6 +386,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
             provider: identity.provider,
           });
         },
+        onExitIdentityCleared: (id) => {
+          const candidate = scheduler.snapshot().find(({ id: candidateId }) => candidateId === id);
+          if (!candidate) return;
+          state?.deleteExitIdentity(id, candidate.generation);
+          exitIdentitiesByNode.delete(id);
+          scheduler.clearExitIp(id);
+          emitLog({
+            event: "egressd.node.lifecycle",
+            level: "info",
+            nodeId: id,
+            status: "unavailable",
+          });
+        },
         onProbeResult: (id, succeeded) => scheduler.reportHealthCheck(id, succeeded),
         onStatusChange: (id, status) => {
           scheduler.setHealthStatus(id, status);
@@ -394,6 +408,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         ...(options.healthCheckSuccessThreshold === undefined
           ? {}
           : { successThreshold: options.healthCheckSuccessThreshold }),
+        ...(options.exitIpCheckBatchSize === undefined
+          ? {}
+          : { scheduledBatchSize: options.exitIpCheckBatchSize }),
       })
     : undefined;
   if (healthController) {
@@ -923,11 +940,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           const health = healthById.get(candidate.id);
           const exitIdentity = exitIdentitiesByNode.get(candidate.id);
           const enabled = candidate.manualWeight > 0 && health?.manuallyEnabled !== false;
-          const status = enabled
-            ? exitIdentity
-              ? (health?.status ?? scheduler.healthStatus(candidate.id) ?? "healthy")
-              : "warming"
-            : "disabled";
+          const status = exitIdentity ? "available" : "unavailable";
           nodeStatuses[status] = (nodeStatuses[status] ?? 0) + 1;
           return {
             activeConnections: candidate.activeConnections,

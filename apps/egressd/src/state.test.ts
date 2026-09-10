@@ -16,6 +16,7 @@ test("runtime settings are initialized from defaults and persist updates", async
   const first = await openControlState(stateDirectory);
   const defaults = first.loadRuntimeSettings("admin-secret");
   assert.equal(defaults.proxyToken, "admin-secret");
+  assert.equal(defaults.exitIpCheckBatchSize, 10);
   assert.equal(defaults.remoteSubscriptionRefreshIntervalMs, 600_000);
   first.updateRuntimeSettings({ ...defaults, port: 9797, proxyToken: "proxy-secret" });
   await first.close();
@@ -80,6 +81,8 @@ test("control state persists egress identity by node generation", async (t) => {
     verifiedAt: 1_757_408_400_000,
   });
   assert.equal(restored.getExitIdentity("asia:tokyo", "sha256:g2"), undefined);
+  assert.equal(restored.deleteExitIdentity("asia:tokyo", "sha256:g1"), true);
+  assert.equal(restored.getExitIdentity("asia:tokyo", "sha256:g1"), undefined);
 });
 
 test("console operation summaries describe the requested action", async (t) => {

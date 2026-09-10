@@ -1,6 +1,7 @@
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 
 export interface RuntimeSettings {
+  exitIpCheckBatchSize: number;
   healthCheckConcurrency: number;
   healthCheckIntervalMs: number;
   healthCheckJitterMs: number;
@@ -24,6 +25,7 @@ export interface RuntimeSettings {
 }
 
 export const restartRequiredSettingFields: readonly (keyof RuntimeSettings)[] = [
+  "exitIpCheckBatchSize",
   "healthCheckConcurrency",
   "healthCheckIntervalMs",
   "healthCheckJitterMs",
@@ -47,6 +49,7 @@ export const restartRequiredSettingFields: readonly (keyof RuntimeSettings)[] = 
 
 export function defaultRuntimeSettings(adminToken: string): RuntimeSettings {
   return {
+    exitIpCheckBatchSize: 10,
     healthCheckConcurrency: 4,
     healthCheckIntervalMs: 30_000,
     healthCheckJitterMs: 5_000,
@@ -107,6 +110,7 @@ export function parseRuntimeSettings(value: unknown): RuntimeSettings {
       throw new Error("healthCheckUrls must use HTTP or HTTPS");
   }
   const settings: RuntimeSettings = {
+    exitIpCheckBatchSize: integer("exitIpCheckBatchSize", 1, 10_000),
     healthCheckConcurrency: integer("healthCheckConcurrency", 1, 100),
     healthCheckIntervalMs: integer("healthCheckIntervalMs", 1_000),
     healthCheckJitterMs: integer("healthCheckJitterMs", 0),

@@ -428,6 +428,9 @@ describe("console router", () => {
 
     await screen.findByText("osaka-b");
     await user.click(screen.getByLabelText("按出口 IP 筛选节点"));
+    const exitIpList = screen.getByRole("listbox");
+    expect(exitIpList.firstElementChild?.className).toContain("max-h-[50vh]");
+    expect(exitIpList.firstElementChild?.className).toContain("overflow-y-auto");
     await user.click(screen.getByRole("option", { name: /198\.51\.100\.8.*JP-Osaka/ }));
     expect(screen.getByText("osaka-b")).toBeTruthy();
     expect(screen.queryByText("tokyo-a")).toBeNull();
@@ -697,7 +700,7 @@ describe("console router", () => {
 
     expect(await screen.findByText("本次运行成功连接")).toBeTruthy();
     expect(screen.getByText("本次运行失败连接")).toBeTruthy();
-    expect(screen.getByText("健康节点")).toBeTruthy();
+    expect(screen.getByText("可用节点")).toBeTruthy();
     expect(screen.getByText("订阅数")).toBeTruthy();
     expect(screen.getByText("当前正在处理连接的代理节点")).toBeTruthy();
     expect(screen.getAllByText("就绪").length).toBeGreaterThan(0);
