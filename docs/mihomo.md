@@ -11,8 +11,8 @@ Run the installer explicitly:
 egresskit runtime install
 ```
 
-The default destination is `$EGRESSKIT_STATE_DIRECTORY/mihomo/mihomo` (or the default EgressKit
-state directory). Use `--destination /absolute/path/to/mihomo` to choose another location. The
+The default destination is `mihomo/mihomo` below the EgressKit state directory. Use
+`--destination /absolute/path/to/mihomo` to choose another location. The
 installer downloads exactly Mihomo `v1.19.30` from the official `MetaCubeX/mihomo` GitHub release,
 checks the compressed asset's pinned SHA-256 before extracting it, and writes the executable
 atomically with private permissions.
@@ -31,10 +31,6 @@ checksum, and executable failures as distinct error codes.
 
 ## Existing binary
 
-To use an already installed executable, start the daemon with:
-
-```sh
-EGRESSKIT_MIHOMO_BINARY=/absolute/path/to/mihomo egressd
-```
-
-EgressKit checks that an explicitly configured path is executable before starting the daemon.
+To use an already installed executable, set its absolute path on the management console Settings
+page and restart the daemon. EgressKit checks that an explicitly configured path is executable
+before starting.

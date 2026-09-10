@@ -67,13 +67,10 @@ test("the packaged release contains both built entry points and legal files", as
       execFileAsync(join(binDirectory, "egressd"), [], {
         env: {
           ...process.env,
-          EGRESSKIT_ADMIN_TOKEN: "package-test-admin",
-          EGRESSKIT_HOST: "0.0.0.0",
-          EGRESSKIT_PROXY_TOKEN: "",
+          EGRESSKIT_ADMIN_TOKEN: "",
         },
       }),
-      (error) =>
-        error.code === 1 && error.stderr.includes("EGRESSKIT_PROXY_TOKEN must not be empty"),
+      (error) => error.code === 1 && error.stderr.includes("EGRESSKIT_ADMIN_TOKEN is required"),
     );
   } finally {
     await unlink(archive);

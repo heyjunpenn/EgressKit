@@ -66,15 +66,15 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 13. 作为用户，我希望订阅中只有经过严格校验的 VLESS 节点进入运行时，从而避免未知配置直接控制 Mihomo。
 14. 作为用户，我希望 EgressKit 从订阅生成自己的专用 Mihomo 配置，从而不修改我的日常 Clash/Mihomo 配置。
 15. 作为用户，我希望每个活跃 VLESS 节点具有独立的内部 listener，从而让 EgressKit 能确定性选择出口。
-16. 作为调用方，我希望使用 `rotate` 模式，从而让每个新的 CONNECT 隧道或普通 HTTP 代理请求重新选择节点。
+16. 作为调用方，我希望使用 `rotate` 模式，从而让每个新的 CONNECT 隧道或普通 HTTP 代理请求选择最长未使用的已验证出口 IP。
 17. 作为调用方，我希望 `rotate` 的语义明确限定在新连接或新代理请求，从而不会错误期待浏览器内每个 HTTPS 请求都更换 IP。
-18. 作为调用方，我希望使用 `sticky` 模式，从而让相同 session key 的新连接尽量使用同一逻辑节点。
+18. 作为调用方，我希望使用 `sticky` 模式，从而让相同 session key 的新连接尽量使用同一出口 IP。
 19. 作为调用方，我希望 soft sticky 节点失败时自动重绑定，从而让后续连接继续工作。
 20. 作为调用方，我希望了解 soft sticky 故障迁移可能短暂存在双出口，从而不会把它误认为存量连接的原子切换。
-21. 作为调用方，我希望使用 `strict` 模式，从而在出口不可变比可用性更重要时禁止自动换节点。
+21. 作为调用方，我希望使用 `strict` 模式，从而在出口不可变比可用性更重要时禁止自动更换出口 IP。
 22. 作为 strict session 使用者，我希望原节点恢复后继续沿用原绑定，从而保持预期的节点身份。
 23. 作为 strict session 使用者，我希望可以使用新 session key 主动建立新会话，从而在原出口故障时自行决定是否换出口。
-24. 作为调试者，我希望显式指定稳定 node ID 或 alias，从而复现某个节点的行为。
+24. 作为调试者，我希望显式指定稳定 node ID 或 alias，从而复现该节点代表的出口 IP，并允许同 IP 节点承接建连。
 25. 作为调试者，我希望指定节点不可用时请求直接失败，从而不会被无提示地路由到其他出口。
 26. 作为 sticky 使用者，我希望一次显式指定节点的调试请求不改变原 session binding，从而不会污染后续正式流量。
 27. 作为并发客户端，我希望同一 session 的首次并发连接得到同一个绑定，从而避免初始化竞态导致多个出口。
@@ -156,10 +156,10 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 - 内部 listeners 只绑定 loopback，不作为公开接口。
 - 代理用户名协议表达调度模式和 session key；代理密码承载访问 token。
 - 用户名模式包括 rotate、soft sticky、strict sticky 和指定 node ID/alias。
-- rotate 按新 CONNECT 隧道或普通 HTTP 代理请求轮换，不承诺按 HTTPS 隧道内部的每个业务请求轮换。
-- soft sticky 对新连接维持逻辑节点绑定；故障迁移允许旧连接和新连接短暂使用不同出口。
-- strict sticky 在节点故障时不自动换节点。节点恢复、绑定 TTL 到期或调用方更换 session key 后才能改变行为。
-- 显式指定节点失败时直接返回错误，不自动回退；显式指定不修改已有 sticky binding。
+- rotate 按新 CONNECT 隧道或普通 HTTP 代理请求轮换出口 IP，不承诺按 HTTPS 隧道内部的每个业务请求轮换。
+- soft sticky 对新连接维持出口 IP 绑定；同 IP 传输节点切换不构成出口迁移。
+- strict sticky 在同 IP 节点全部不可用时失败，不自动更换出口 IP。绑定 TTL 到期或调用方更换 session key 后才能改变行为。
+- 显式指定节点先解析其出口 IP，可在同 IP 节点间建连前回退，但不回退到其他 IP；显式指定不修改已有 sticky binding。
 - 同一 session 的首次绑定使用 session 级互斥，锁只覆盖读取、选择和写入，不覆盖连接生命周期。
 - 默认 absolute TTL 为 30 分钟、最大空闲时间为 5 分钟、单 session 最大并发连接为 50、最大活跃 session 为 10,000。
 

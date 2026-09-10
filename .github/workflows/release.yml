@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
@@ -53,17 +53,17 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @egresskit/egressd build
+      - run: pnpm --filter @egresskit/app-egressd build
       - name: Stamp tag version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref_type == 'tag'
         run: node release/set-package-version.mjs "$GITHUB_REF_NAME" apps/egressd/package.json
       - name: Assemble CLI and daemon archive
         shell: bash
         run: |
           test -f apps/egressd/dist/control-cli-bin.js
           test -f apps/egressd/dist/cli.js
-          pnpm --filter @egresskit/egressd pack --pack-destination release
-          mv release/egresskit-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
+          pnpm --filter @egresskit/app-egressd pack --pack-destination release
+          mv release/egresskit-app-egressd-*.tgz "release/egresskit-${{ matrix.name }}.tgz"
       - name: Install and invoke both packaged commands
         shell: bash
         run: |
@@ -75,11 +75,10 @@ jobs:
             exit 1
           fi
           grep -F -- '--destination requires a path' "$install_dir/egresskit.stderr"
-          if env EGRESSKIT_ADMIN_TOKEN=validation-admin EGRESSKIT_HOST=127.0.0.1 \
-            EGRESSKIT_PROXY_TOKEN= "$install_dir/node_modules/.bin/egressd" 2>"$install_dir/egressd.stderr"; then
+          if env EGRESSKIT_ADMIN_TOKEN= "$install_dir/node_modules/.bin/egressd" 2>"$install_dir/egressd.stderr"; then
             exit 1
           fi
-          grep -F -- 'EGRESSKIT_PROXY_TOKEN must not be empty' "$install_dir/egressd.stderr"
+          grep -F -- 'EGRESSKIT_ADMIN_TOKEN is required' "$install_dir/egressd.stderr"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: egresskit-${{ matrix.name }}
@@ -116,7 +115,6 @@ jobs:
             'test -r /usr/share/licenses/egresskit/LICENSE && test -r /usr/share/licenses/egresskit/THIRD_PARTY_NOTICES.md && test -r /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt'
           container=$(docker run --detach --publish 127.0.0.1::8787 \
             --env EGRESSKIT_ADMIN_TOKEN=validation-admin \
-            --env EGRESSKIT_PROXY_TOKEN=validation-proxy \
             "$image")
           trap 'docker rm --force "$container" >/dev/null' EXIT
           port=$(docker port "$container" 8787/tcp | sed 's/.*://')
@@ -130,7 +128,7 @@ jobs:
           exit 1
 
   docker-publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref_type == 'tag'
     needs: [quality, docker-validation]
     runs-on: ubuntu-latest
     permissions:
@@ -161,7 +159,7 @@ jobs:
           sbom: true
 
   github-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref_type == 'tag'
     needs: [quality, host-artifacts, docker-publish]
     runs-on: ubuntu-latest
     permissions:

@@ -1,4 +1,7 @@
 import { request } from "node:http";
+import { Agent as HttpsAgent, request as requestHttps } from "node:https";
+import { isIP } from "node:net";
+import { connect as connectTls } from "node:tls";
 
 export type NodeHealthStatus = "cooldown" | "degraded" | "disabled" | "healthy" | "warming";
 
@@ -11,6 +14,10 @@ export interface HealthNode {
 export interface NodeHealthSnapshot {
   consecutiveFailures: number;
   cooldownCount: number;
+  exitIp?: string;
+  exitLocation?: string;
+  exitProvider?: string;
+  exitVerifiedAt?: number;
   id: string;
   manuallyEnabled: boolean;
   nextProbeAt: number;
@@ -18,6 +25,18 @@ export interface NodeHealthSnapshot {
 }
 
 export type HealthProbe = (listener: URL, target: URL, signal: AbortSignal) => Promise<boolean>;
+export interface ExitIpIdentity {
+  city?: string;
+  country?: string;
+  ip: string;
+  provider: string;
+  verifiedAt: number;
+}
+
+export type ExitIpProbe = (
+  listener: URL,
+  signal: AbortSignal,
+) => Promise<ExitIpIdentity | undefined>;
 
 export interface NodeHealthControllerOptions {
   concurrency?: number;
@@ -25,9 +44,11 @@ export interface NodeHealthControllerOptions {
   cooldownInitialMs?: number;
   cooldownMaximumMs?: number;
   degradedAfterFailures?: number;
+  exitIpProbe?: ExitIpProbe;
   healthUrls: readonly URL[];
   intervalMs?: number;
   jitterMs?: number;
+  onExitIdentity?: (id: string, identity: ExitIpIdentity) => void;
   onProbeResult?: (id: string, succeeded: boolean) => void;
   onStatusChange?: (id: string, status: NodeHealthStatus) => void;
   probe?: HealthProbe;
@@ -39,10 +60,12 @@ interface NodeHealthState extends NodeHealthSnapshot {
   epoch: number;
   generation: string;
   listener: URL;
+  nextExitProbeAt: number;
 }
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
+const EXIT_PROBE_RETRY_MS = 10 * 60_000;
 
 export class NodeHealthController {
   readonly #concurrency: number;
@@ -50,9 +73,12 @@ export class NodeHealthController {
   readonly #cooldownInitialMs: number;
   readonly #cooldownMaximumMs: number;
   readonly #degradedAfterFailures: number;
+  readonly #exitProbeLimiter = new ConcurrencyLimiter(5);
+  readonly #exitIpProbe: ExitIpProbe | undefined;
   readonly #healthUrls: readonly URL[];
   readonly #intervalMs: number;
   readonly #jitterMs: number;
+  readonly #onExitIdentity: ((id: string, identity: ExitIpIdentity) => void) | undefined;
   readonly #onProbeResult: ((id: string, succeeded: boolean) => void) | undefined;
   readonly #onStatusChange: ((id: string, status: NodeHealthStatus) => void) | undefined;
   readonly #probe: HealthProbe;
@@ -67,6 +93,7 @@ export class NodeHealthController {
     this.#intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.#jitterMs = options.jitterMs ?? 5_000;
     this.#degradedAfterFailures = options.degradedAfterFailures ?? 2;
+    this.#exitIpProbe = options.exitIpProbe;
     this.#cooldownAfterFailures = options.cooldownAfterFailures ?? 3;
     this.#cooldownInitialMs = options.cooldownInitialMs ?? 60_000;
     this.#cooldownMaximumMs = options.cooldownMaximumMs ?? 15 * 60_000;
@@ -75,6 +102,7 @@ export class NodeHealthController {
       ((listener, target, signal) =>
         probeThroughMihomo(listener, target, DEFAULT_PROBE_TIMEOUT_MS, signal));
     this.#random = options.random ?? Math.random;
+    this.#onExitIdentity = options.onExitIdentity;
     this.#onProbeResult = options.onProbeResult;
     this.#onStatusChange = options.onStatusChange;
     validateOptions(options, this.#cooldownAfterFailures);
@@ -96,6 +124,7 @@ export class NodeHealthController {
           id: node.id,
           listener: node.listener,
           manuallyEnabled: existing?.manuallyEnabled ?? true,
+          nextExitProbeAt: now,
           nextProbeAt: now + this.#nextJitter(),
           status: "warming",
         });
@@ -148,11 +177,43 @@ export class NodeHealthController {
 
   snapshot(): readonly NodeHealthSnapshot[] {
     return [...this.#states.values()].map(
-      ({ epoch: _epoch, generation: _generation, listener: _listener, ...snapshot }) => ({
-        ...snapshot,
-        status: snapshot.manuallyEnabled ? snapshot.status : "disabled",
-      }),
+      ({
+        epoch: _epoch,
+        generation: _generation,
+        listener: _listener,
+        nextExitProbeAt: _nextExitProbeAt,
+        ...snapshot
+      }) => ({ ...snapshot, status: snapshot.manuallyEnabled ? snapshot.status : "disabled" }),
     );
+  }
+
+  async verifyExit(
+    id: string,
+    signal = new AbortController().signal,
+  ): Promise<ExitIpIdentity | undefined> {
+    const state = this.#states.get(id);
+    const exitIpProbe = this.#exitIpProbe;
+    if (!state || !exitIpProbe) return undefined;
+    const epoch = state.epoch;
+    const identity = await this.#exitProbeLimiter.run(() => exitIpProbe(state.listener, signal));
+    if (
+      !identity ||
+      signal.aborted ||
+      this.#states.get(id) !== state ||
+      state.epoch !== epoch ||
+      !state.manuallyEnabled
+    ) {
+      return undefined;
+    }
+    this.#recordExitIdentity(state, identity);
+    return identity;
+  }
+
+  restoreExitIdentity(id: string, identity: ExitIpIdentity): boolean {
+    const state = this.#states.get(id);
+    if (!state) return false;
+    this.#recordExitIdentity(state, identity);
+    return true;
   }
 
   async runDue(now = Date.now(), signal = new AbortController().signal): Promise<void> {
@@ -184,6 +245,22 @@ export class NodeHealthController {
       }),
     );
     await runWithConcurrency(tasks, this.#concurrency);
+    const exitIdentities = new Map<string, ExitIpIdentity>();
+    const exitIpProbe = this.#exitIpProbe;
+    if (exitIpProbe) {
+      await runWithConcurrency(
+        due
+          .filter(({ state }) => state.exitIp === undefined && state.nextExitProbeAt <= now)
+          .map(({ state }) => async () => {
+            state.nextExitProbeAt = now + EXIT_PROBE_RETRY_MS;
+            const identity = await this.#exitProbeLimiter
+              .run(() => exitIpProbe(state.listener, signal))
+              .catch(() => undefined);
+            if (identity !== undefined) exitIdentities.set(state.id, identity);
+          }),
+        5,
+      );
+    }
 
     for (const { epoch, state } of due) {
       if (this.#states.get(state.id) !== state || state.epoch !== epoch) {
@@ -199,6 +276,8 @@ export class NodeHealthController {
       const succeeded = (results.get(state.id) ?? 0) >= this.#successThreshold;
       this.#onProbeResult?.(state.id, succeeded);
       if (succeeded) {
+        const identity = exitIdentities.get(state.id);
+        if (identity !== undefined) this.#recordExitIdentity(state, identity);
         state.consecutiveFailures = 0;
         state.cooldownCount = 0;
         state.nextProbeAt = now + this.#intervalMs + this.#nextJitter();
@@ -227,6 +306,16 @@ export class NodeHealthController {
     } else if (state.consecutiveFailures >= this.#degradedAfterFailures) {
       this.#setStatus(state, "degraded");
     }
+  }
+
+  #recordExitIdentity(state: NodeHealthState, identity: ExitIpIdentity): void {
+    state.exitIp = identity.ip;
+    state.exitProvider = identity.provider;
+    state.exitVerifiedAt = identity.verifiedAt;
+    state.nextExitProbeAt = Number.POSITIVE_INFINITY;
+    const location = [identity.country, identity.city].filter(Boolean).join("-");
+    if (location) state.exitLocation = location;
+    this.#onExitIdentity?.(state.id, identity);
   }
 
   #nextJitter(): number {
@@ -288,6 +377,161 @@ export function probeThroughMihomo(
     probe.once("error", () => finish(false));
     probe.end();
   });
+}
+
+export function resolveExitIpThroughMihomo(
+  listener: URL,
+  signal: AbortSignal,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+): Promise<ExitIpIdentity | undefined> {
+  return resolveExitIpWithProviders(listener, signal, timeoutMs);
+}
+
+async function resolveExitIpWithProviders(
+  listener: URL,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<ExitIpIdentity | undefined> {
+  const providers = [
+    { host: "ipinfo.io", name: "ipinfo", path: "/json" },
+    { host: "ipapi.co", name: "ipapi", path: "/json/" },
+    { host: "ifconfig.co", name: "ifconfig", path: "/json" },
+  ] as const;
+  return discoverExitIdentity(
+    providers,
+    (provider) =>
+      requestJsonThroughMihomo(listener, provider.host, provider.path, signal, timeoutMs),
+    Date.now,
+  );
+}
+
+export async function discoverExitIdentity(
+  providers: readonly { host: string; name: string; path: string }[],
+  requestProvider: (provider: {
+    host: string;
+    name: string;
+    path: string;
+  }) => Promise<Record<string, unknown> | undefined>,
+  now: () => number = Date.now,
+): Promise<ExitIpIdentity | undefined> {
+  for (const provider of providers) {
+    const body = await requestProvider(provider);
+    if (!body) continue;
+    const ip = typeof body.ip === "string" ? body.ip : undefined;
+    if (!ip || !isIpAddress(ip) || body.error) continue;
+    const country =
+      typeof body.country === "string"
+        ? body.country
+        : typeof body.country_code === "string"
+          ? body.country_code
+          : typeof body.country_iso === "string"
+            ? body.country_iso
+            : undefined;
+    return {
+      ...(typeof body.city === "string" ? { city: body.city } : {}),
+      ...(country ? { country } : {}),
+      ip,
+      provider: provider.name,
+      verifiedAt: now(),
+    };
+  }
+  return undefined;
+}
+
+function requestJsonThroughMihomo(
+  listener: URL,
+  host: string,
+  path: string,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<Record<string, unknown> | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result?: Record<string, unknown>) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const tunnel = request({
+      host: listener.hostname,
+      method: "CONNECT",
+      path: `${host}:443`,
+      port: Number(listener.port || 80),
+      signal,
+    });
+    tunnel.setTimeout(timeoutMs, () => {
+      tunnel.destroy();
+      finish();
+    });
+    tunnel.once("error", () => finish());
+    tunnel.on("connect", (response, socket, head) => {
+      if (response.statusCode !== 200) {
+        socket.destroy();
+        finish();
+        return;
+      }
+      if (head.length > 0) socket.unshift(head);
+      const secureSocket = connectTls({ servername: host, socket });
+      secureSocket.setTimeout(timeoutMs, () => secureSocket.destroy());
+      secureSocket.once("error", () => finish());
+      const agent = new HttpsAgent({ keepAlive: false });
+      agent.createConnection = () => secureSocket;
+      const probe = requestHttps(
+        {
+          agent,
+          headers: { accept: "application/json", host },
+          hostname: host,
+          path,
+        },
+        (exitResponse) => {
+          const chunks: Buffer[] = [];
+          exitResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
+          exitResponse.once("end", () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+                string,
+                unknown
+              >;
+              finish(exitResponse.statusCode === 200 ? body : undefined);
+            } catch {
+              finish();
+            }
+          });
+        },
+      );
+      probe.setTimeout(timeoutMs, () => probe.destroy());
+      probe.once("error", () => finish());
+      probe.end();
+    });
+    tunnel.end();
+  });
+}
+
+function isIpAddress(value: string): boolean {
+  return isIP(value) !== 0;
+}
+
+class ConcurrencyLimiter {
+  #active = 0;
+  readonly #limit: number;
+  readonly #waiting: Array<() => void> = [];
+
+  constructor(limit: number) {
+    this.#limit = limit;
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#active >= this.#limit) {
+      await new Promise<void>((resolve) => this.#waiting.push(resolve));
+    }
+    this.#active += 1;
+    try {
+      return await task();
+    } finally {
+      this.#active -= 1;
+      this.#waiting.shift()?.();
+    }
+  }
 }
 
 async function runWithConcurrency(

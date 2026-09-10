@@ -2,6 +2,7 @@ import { Clipboard, CloudArrowDown } from "@phosphor-icons/react";
 import { useConsole } from "./App";
 import { AnimatedBadge } from "./components/motion/animated-badge";
 import { Button } from "./components/motion/button/base";
+import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { gatewayAddress } from "./lib/gateway-address";
 
@@ -27,15 +28,16 @@ export function DocsPage() {
             <p className="text-sm text-muted-foreground">当前代理入口</p>
             <code className="text-lg font-semibold">{proxy}</code>
           </div>
-          <Button
-            variant="secondary"
-            size="icon"
-            className="ml-auto"
-            aria-label="复制代理入口"
-            onClick={() => void navigator.clipboard?.writeText(proxy)}
-          >
-            <Clipboard />
-          </Button>
+          <Tooltip content="复制代理入口" wrapperClassName="ml-auto">
+            <Button
+              variant="secondary"
+              size="icon"
+              aria-label="复制代理入口"
+              onClick={() => void navigator.clipboard?.writeText(proxy)}
+            >
+              <Clipboard />
+            </Button>
+          </Tooltip>
         </CardContent>
       </Card>
       <div className="grid gap-4 lg:grid-cols-[.65fr_1.35fr]">
@@ -95,7 +97,6 @@ export function DocsPage() {
   -v egresskit-state:/var/lib/egresskit \
   -p 127.0.0.1:8787:8787 \
   -e EGRESSKIT_ADMIN_TOKEN='…' \
-  -e EGRESSKIT_PROXY_TOKEN='…' \
   ghcr.io/heyjunpenn/egresskit:VERSION`}</code>
             </pre>
           </CardContent>

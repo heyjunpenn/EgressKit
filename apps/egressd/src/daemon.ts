@@ -7,11 +7,19 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { Agent as HttpsAgent, request as requestHttps } from "node:https";
 import { connect, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { Duplex } from "node:stream";
+import { connect as connectTls } from "node:tls";
 import { redactSubscriptionUrl } from "./control-cli.js";
-import { type HealthProbe, NodeHealthController, type NodeHealthSnapshot } from "./health.js";
+import {
+  type ExitIpIdentity,
+  type ExitIpProbe,
+  type HealthProbe,
+  NodeHealthController,
+  type NodeHealthSnapshot,
+} from "./health.js";
 import { MihomoCrashRecovery, type MihomoRecoveryClock } from "./mihomo-recovery.js";
 import { isLoopbackHost, isLoopbackHttpUrl } from "./network.js";
 import { EgressdMetrics, subscriptionLogOrigin } from "./observability.js";
@@ -29,6 +37,7 @@ import {
   validateMinimumSubscriptionNodes,
   validateRemoteSubscriptionTimeout,
 } from "./remote-operation.js";
+import { parseRuntimeSettings, restartRequiredSettingFields } from "./runtime-settings.js";
 import {
   createSchedulerCandidate,
   RotateScheduler,
@@ -83,6 +92,7 @@ export interface EgressdOptions {
   checkMihomoListener?: (listener: URL) => Promise<void>;
   fetchSubscription?: (url: string, options: { signal: AbortSignal }) => Promise<Response>;
   healthCheckConcurrency?: number;
+  exitIpProbe?: ExitIpProbe;
   healthCheckIntervalMs?: number;
   healthCheckJitterMs?: number;
   healthCheckProbe?: HealthProbe;
@@ -102,6 +112,7 @@ export interface EgressdOptions {
   proxyAuthentication?: ProxyAuthentication;
   remoteSubscriptionTimeoutMs?: number;
   remoteOperationClock?: RemoteOperationClock;
+  remoteSubscriptionRefreshIntervalMs?: number;
   schedulerSignals?: ReadonlyMap<string, SchedulerSignals>;
   sessionAbsoluteTtlMs?: number;
   sessionBindingStore?: SessionBindingStore;
@@ -257,14 +268,6 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     }
   };
   if (
-    options.adminToken &&
-    options.proxyAuthentication &&
-    "tokens" in options.proxyAuthentication &&
-    options.proxyAuthentication.tokens.includes(options.adminToken)
-  ) {
-    throw new Error("admin and proxy tokens must be distinct");
-  }
-  if (
     (options.mihomoRuntime?.onUnexpectedExit === undefined) !==
     (options.mihomoRuntime?.restart === undefined)
   ) {
@@ -291,6 +294,10 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
               ? options.proxyAuthentication.tokens
               : [],
         });
+  let configuredProxyToken =
+    options.proxyAuthentication && "tokens" in options.proxyAuthentication
+      ? options.proxyAuthentication.tokens[0]
+      : undefined;
   const activeProxyAuthentication: ProxyAuthentication =
     options.proxyAuthentication === false ? false : (proxyTokenRegistry as ProxyTokenRegistry);
   const scheduler = new RotateScheduler(
@@ -303,6 +310,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           ),
         ]
       : [],
+    { requireExitIdentity: options.exitIpProbe !== undefined },
   );
   const targetReputation = options.targetReputationEnabled
     ? new TargetReputation({
@@ -311,18 +319,32 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           : { now: options.targetReputationClock }),
       })
     : undefined;
+  const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const exitIdentitiesByNode = new Map<string, ExitIpIdentity>();
   const healthController = options.healthCheckUrls
     ? new NodeHealthController({
         ...(options.healthCheckConcurrency === undefined
           ? {}
           : { concurrency: options.healthCheckConcurrency }),
         healthUrls: options.healthCheckUrls,
+        ...(options.exitIpProbe === undefined ? {} : { exitIpProbe: options.exitIpProbe }),
         ...(options.healthCheckIntervalMs === undefined
           ? {}
           : { intervalMs: options.healthCheckIntervalMs }),
         ...(options.healthCheckJitterMs === undefined
           ? {}
           : { jitterMs: options.healthCheckJitterMs }),
+        onExitIdentity: (id, identity) => {
+          const candidate = scheduler.snapshot().find(({ id: candidateId }) => candidateId === id);
+          if (!candidate) return;
+          state?.saveExitIdentity({
+            ...identity,
+            generation: candidate.generation,
+            logicalId: id,
+          });
+          exitIdentitiesByNode.set(id, identity);
+          scheduler.setExitIp(id, identity.ip);
+        },
         onProbeResult: (id, succeeded) => scheduler.reportHealthCheck(id, succeeded),
         onStatusChange: (id, status) => scheduler.setHealthStatus(id, status),
         ...(options.healthCheckProbe === undefined ? {} : { probe: options.healthCheckProbe }),
@@ -333,10 +355,25 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
     : undefined;
   if (healthController) {
     healthController.replaceNodes(
-      scheduler.snapshot().map(({ id, listener }) => ({ generation: "configured", id, listener })),
+      scheduler.snapshot().map(({ generation, id, listener }) => ({ generation, id, listener })),
     );
   }
-  const state = options.stateDirectory ? await openControlState(options.stateDirectory) : undefined;
+  const applyPersistedExitIdentities = () => {
+    for (const candidate of scheduler.snapshot()) {
+      const persisted = state?.getExitIdentity(candidate.id, candidate.generation);
+      if (!persisted) continue;
+      const identity: ExitIpIdentity = {
+        ...(persisted.city === undefined ? {} : { city: persisted.city }),
+        ...(persisted.country === undefined ? {} : { country: persisted.country }),
+        ip: persisted.ip,
+        provider: persisted.provider,
+        verifiedAt: persisted.verifiedAt,
+      };
+      exitIdentitiesByNode.set(candidate.id, identity);
+      scheduler.setExitIp(candidate.id, identity.ip);
+      healthController?.restoreExitIdentity(candidate.id, identity);
+    }
+  };
   const applyNodeEnabledOverrides = () => {
     for (const [id, enabled] of state?.getNodeEnabledOverrides() ?? []) {
       scheduler.setManualEnabled(id, enabled);
@@ -354,15 +391,13 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
   };
   try {
     const persistedProxyTokens = state?.loadProxyTokens();
-    if (proxyTokenRegistry && persistedProxyTokens !== undefined) {
+    if (proxyTokenRegistry && persistedProxyTokens && persistedProxyTokens.length > 0) {
       proxyTokenRegistry.restore(persistedProxyTokens);
     } else if (state && proxyTokenRegistry) {
       state.saveProxyTokens(proxyTokenRegistry.persistedSnapshot());
     }
-    if (options.adminToken && proxyTokenRegistry?.matches(options.adminToken)) {
-      throw new Error("admin and proxy tokens must be distinct");
-    }
     applyNodeEnabledOverrides();
+    applyPersistedExitIdentities();
   } catch (error) {
     await state?.close();
     throw error;
@@ -439,12 +474,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       return softStickySessions.acquireStrict(route.sessionKey, excludedIds);
     }
     if (route.mode === "node") {
-      const lease = scheduler.acquireBySelector(route.selector);
-      if (lease && excludedIds.has(lease.candidate.id)) {
-        lease.release();
-        return undefined;
-      }
-      return lease;
+      return scheduler.acquireBySelector(route.selector, excludedIds);
     }
     return "not-implemented" as const;
   };
@@ -646,6 +676,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         listener: listeners.get(node.name) as URL,
       })),
     );
+    applyPersistedExitIdentities();
     applyNodeEnabledOverrides();
     runtimeConfiguration.active = prepared.imported;
     runtimeConfiguration.candidate = undefined;
@@ -672,7 +703,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       const activated = await activateRevisionUnlocked(revision);
       state?.saveActiveRevision({
         imported: activated,
-        source: { id: "local", kind: "local", locator: "inline" },
+        source: { id: "local", kind: "local", locator: "inline", name: "本地配置" },
       });
     });
     return state?.loadActiveRevision()?.imported ?? revision;
@@ -764,6 +795,32 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      const verifyExitMatch = incoming.url?.match(/^\/nodes\/([^/]+)\/verify-exit$/);
+      if (incoming.method === "POST" && verifyExitMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        const nodeId = decodeURIComponent(verifyExitMatch[1] as string);
+        if (!scheduler.hasCandidate(nodeId)) {
+          writeJson(response, 404, { error: "node not found" });
+          return;
+        }
+        if (!healthController) {
+          writeJson(response, 503, { error: "exit verification unavailable" });
+          return;
+        }
+        void healthController
+          .verifyExit(nodeId)
+          .then((identity) =>
+            identity
+              ? writeJson(response, 200, { ...identity })
+              : writeJson(response, 502, { error: "exit verification failed" }),
+          )
+          .catch(() => writeJson(response, 502, { error: "exit verification failed" }));
+        return;
+      }
+
       if (incoming.method === "GET" && incoming.url === "/console/snapshot") {
         if (!isAuthorizedAdmin(incoming, options.adminToken)) {
           rejectAdminAuthentication(response);
@@ -776,15 +833,26 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         const nodeStatuses: Record<string, number> = {};
         const nodes = candidates.map((candidate) => {
           const health = healthById.get(candidate.id);
+          const exitIdentity = exitIdentitiesByNode.get(candidate.id);
           const enabled = candidate.manualWeight > 0 && health?.manuallyEnabled !== false;
           const status = enabled
-            ? (health?.status ?? scheduler.healthStatus(candidate.id) ?? "healthy")
+            ? exitIdentity
+              ? (health?.status ?? scheduler.healthStatus(candidate.id) ?? "healthy")
+              : "warming"
             : "disabled";
           nodeStatuses[status] = (nodeStatuses[status] ?? 0) + 1;
           return {
             activeConnections: candidate.activeConnections,
             ...(candidate.selectors?.[0] === undefined ? {} : { alias: candidate.selectors[0] }),
             enabled,
+            ...(exitIdentity
+              ? {
+                  exitIp: exitIdentity.ip,
+                  exitLocation: [exitIdentity.country, exitIdentity.city].filter(Boolean).join("-"),
+                  exitProvider: exitIdentity.provider,
+                  exitVerifiedAt: exitIdentity.verifiedAt,
+                }
+              : {}),
             id: candidate.id,
             latencyMs: Math.round(candidate.ewmaLatencyMs),
             status,
@@ -797,7 +865,24 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         }
         const connectionCounts = metrics.connectionSnapshot();
         const activeConnectionCounts = softStickySessions.redactedActiveConnectionCounts();
+        const exitIpStats = new Map<string, { location?: string; nodeCount: number }>();
+        for (const node of nodes) {
+          if (!("exitIp" in node) || typeof node.exitIp !== "string") continue;
+          const existing = exitIpStats.get(node.exitIp);
+          exitIpStats.set(node.exitIp, {
+            ...(existing?.location
+              ? { location: existing.location }
+              : "exitLocation" in node && typeof node.exitLocation === "string"
+                ? { location: node.exitLocation }
+                : {}),
+            nodeCount: (existing?.nodeCount ?? 0) + 1,
+          });
+        }
+        const exitIps = Array.from(exitIpStats, ([ip, statistic]) => ({ ip, ...statistic })).sort(
+          (left, right) => left.ip.localeCompare(right.ip),
+        );
         writeJson(response, 200, {
+          exitIps,
           gateway: {
             host: options.host,
             port: publicPort,
@@ -908,8 +993,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         }
         readBody(incoming)
           .then((body) => parseRemoteSubscriptionRequest(body))
-          .then((url) => ({
-            created: state.createRemoteSubscription(url),
+          .then(({ name, url }) => ({
+            created: state.createRemoteSubscription(url, name),
             subscriptionOrigin: subscriptionLogOrigin(url),
           }))
           .then(({ created, subscriptionOrigin }) => {
@@ -944,6 +1029,100 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      if (incoming.method === "GET" && incoming.url === "/settings") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state || !options.adminToken) {
+          writeJson(response, 503, { error: "durable settings are not configured" });
+          return;
+        }
+        writeJson(response, 200, {
+          restartRequiredFields: restartRequiredSettingFields,
+          settings: state.loadRuntimeSettings(options.adminToken),
+        });
+        return;
+      }
+
+      if (incoming.method === "PUT" && incoming.url === "/settings") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state || !options.adminToken) {
+          writeJson(response, 503, { error: "durable settings are not configured" });
+          return;
+        }
+        readBody(incoming)
+          .then((body) => parseRuntimeSettings(JSON.parse(body)))
+          .then((settings) => {
+            const previous = state.loadRuntimeSettings(options.adminToken as string);
+            state.updateRuntimeSettings(settings);
+            if (
+              proxyTokenRegistry &&
+              settings.proxyAuthEnabled &&
+              settings.proxyToken !== previous.proxyToken
+            ) {
+              proxyTokenRegistry.replaceAll([settings.proxyToken]);
+              state.saveProxyTokens(proxyTokenRegistry.persistedSnapshot());
+              configuredProxyToken = settings.proxyToken;
+            }
+            const changedRestartFields = restartRequiredSettingFields.filter(
+              (key) => JSON.stringify(previous[key]) !== JSON.stringify(settings[key]),
+            );
+            writeJson(response, 200, {
+              restartRequired: changedRestartFields.length > 0,
+              restartRequiredFields: changedRestartFields,
+              settings,
+            });
+          })
+          .catch((error: unknown) =>
+            writeJson(response, 422, {
+              error: error instanceof Error ? error.message : "settings request is invalid",
+            }),
+          );
+        return;
+      }
+
+      if (incoming.method === "GET" && incoming.url === "/playground/config") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        writeJson(response, 200, {
+          proxyToken: configuredProxyToken ?? "",
+          proxyTokenAvailable:
+            options.proxyAuthentication === false || configuredProxyToken !== undefined,
+        });
+        return;
+      }
+
+      if (incoming.method === "POST" && incoming.url === "/playground/execute") {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        readBody(incoming)
+          .then(parsePlaygroundRequest)
+          .then((playground) =>
+            executePlaygroundRequest({
+              host: options.host,
+              port: publicPort,
+              proxyAuthenticationDisabled: options.proxyAuthentication === false,
+              ...(configuredProxyToken === undefined ? {} : { proxyToken: configuredProxyToken }),
+              ...playground,
+            }),
+          )
+          .then((result) => writeJson(response, 200, result))
+          .catch((error: unknown) =>
+            writeJson(response, 422, {
+              error: error instanceof Error ? error.message : "playground request failed",
+            }),
+          );
+        return;
+      }
+
       if (incoming.method === "POST" && incoming.url === "/proxy-tokens") {
         if (!isAuthorizedAdmin(incoming, options.adminToken)) {
           rejectAdminAuthentication(response);
@@ -956,9 +1135,6 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         readBody(incoming)
           .then(parseProxyTokenRequest)
           .then((token) => {
-            if (token === options.adminToken) {
-              throw new Error("admin and proxy tokens must be distinct");
-            }
             const added = commitProxyTokenMutation(proxyTokenRegistry, state, () =>
               proxyTokenRegistry.add(token),
             );
@@ -1039,6 +1215,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         }
         writeJson(response, 200, {
           kind: subscription.kind,
+          name: subscription.name,
           subscriptionId: subscription.id,
           ...(subscription.kind === "remote"
             ? {
@@ -1048,6 +1225,90 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
               }
             : {}),
         });
+        return;
+      }
+
+      if (incoming.method === "PUT" && subscriptionMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state || !remoteOperations) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        readBody(incoming)
+          .then(parseRemoteSubscriptionRequest)
+          .then(({ name, url }) =>
+            state.updateRemoteSubscription(subscriptionMatch[1] as string, url, name),
+          )
+          .then((operation) => {
+            writeJson(response, 202, {
+              operationId: operation.id,
+              revisionId: operation.subscriptionRevisionId,
+              status: operation.status,
+              subscriptionId: operation.subscriptionId,
+            });
+            remoteOperations.enqueue(operation.id, operation.subscriptionId);
+          })
+          .catch(() => writeJson(response, 422, { error: "subscription update is invalid" }));
+        return;
+      }
+
+      if (incoming.method === "DELETE" && subscriptionMatch) {
+        if (!isAuthorizedAdmin(incoming, options.adminToken)) {
+          rejectAdminAuthentication(response);
+          return;
+        }
+        if (!state) {
+          writeJson(response, 503, { error: "durable control state is not configured" });
+          return;
+        }
+        const subscriptionId = subscriptionMatch[1] as string;
+        if (state.hasActiveSubscriptionOperation(subscriptionId)) {
+          writeJson(response, 409, { error: "subscription operation is still running" });
+          return;
+        }
+        void withControlPlaneLock(() => {
+          if (!state.deleteSubscription(subscriptionId)) {
+            writeJson(response, 404, { error: "subscription not found" });
+            return;
+          }
+          const remaining = scheduler
+            .snapshot()
+            .filter(({ id }) => !id.startsWith(`${subscriptionId}:`));
+          scheduler.replaceCandidates(remaining, (drained) => {
+            const key = generationKey(drained.id, drained.generation, drained.listener);
+            const retired = runtimeGenerations.get(key);
+            const runtime = options.mihomoRuntime;
+            if (!retired || !runtime) return;
+            let removal: Promise<void>;
+            removal = runtime
+              .removeListener(retired.listener)
+              .then(() => {
+                state.releaseNodeGeneration(
+                  retired.id,
+                  retired.generation,
+                  retired.listenerPort,
+                  Date.now() + (options.portQuarantineMs ?? 60_000),
+                );
+              })
+              .catch(() => undefined)
+              .finally(() => {
+                if (runtimeGenerations.get(key) === retired) {
+                  runtimeGenerations.delete(key);
+                }
+                retirementOperations.delete(removal);
+              });
+            retirementOperations.add(removal);
+          });
+          healthController?.replaceNodes(
+            remaining.map(({ generation, id, listener }) => ({ generation, id, listener })),
+          );
+          runtimeConfiguration.status = remaining.length === 0 ? "not-ready" : "ready";
+          response.writeHead(204);
+          response.end();
+        }).catch(() => writeJson(response, 500, { error: "subscription could not be deleted" }));
         return;
       }
 
@@ -1341,6 +1602,19 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         Math.min(1_000, options.healthCheckIntervalMs ?? 30_000),
       )
     : undefined;
+  const subscriptionRefreshTimer =
+    state && remoteOperations
+      ? setInterval(
+          () => {
+            for (const subscriptionId of state.listRemoteSubscriptionIds()) {
+              if (state.hasActiveSubscriptionOperation(subscriptionId)) continue;
+              const operation = state.createRefreshOperation(subscriptionId);
+              remoteOperations.enqueue(operation.id, subscriptionId);
+            }
+          },
+          options.remoteSubscriptionRefreshIntervalMs ?? 10 * 60_000,
+        )
+      : undefined;
 
   let closed = false;
   return {
@@ -1358,6 +1632,7 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
       if (healthCheckTimer) {
         clearInterval(healthCheckTimer);
       }
+      if (subscriptionRefreshTimer) clearInterval(subscriptionRefreshTimer);
       healthCheckAbort.abort();
       if (healthCheckRun) {
         await waitForBoundedCompletion(healthCheckRun, 1_000);
@@ -1506,8 +1781,8 @@ function readBody(incoming: IncomingMessage): Promise<string> {
   });
 }
 
-function parseRemoteSubscriptionRequest(body: string): string {
-  const document = JSON.parse(body) as { url?: unknown };
+function parseRemoteSubscriptionRequest(body: string): { name: string; url: string } {
+  const document = JSON.parse(body) as { name?: unknown; url?: unknown };
   if (typeof document.url !== "string") {
     throw new Error("remote subscription URL is required");
   }
@@ -1520,7 +1795,146 @@ function parseRemoteSubscriptionRequest(body: string): string {
   if (url.protocol !== "https:") {
     throw new Error("remote subscription URL must use HTTPS");
   }
-  return document.url;
+  const requestedName = typeof document.name === "string" ? document.name.trim() : "";
+  return { name: requestedName || url.hostname, url: document.url };
+}
+
+interface PlaygroundRequest {
+  mode: "node" | "rotate" | "sticky" | "strict";
+  node?: string;
+  target: string;
+}
+
+function parsePlaygroundRequest(body: string): PlaygroundRequest {
+  const document = JSON.parse(body) as { mode?: unknown; node?: unknown; target?: unknown };
+  if (!["node", "rotate", "sticky", "strict"].includes(String(document.mode))) {
+    throw new Error("代理模式无效");
+  }
+  if (typeof document.target !== "string") throw new Error("目标 URL 不能为空");
+  const target = new URL(document.target);
+  if (!["http:", "https:"].includes(target.protocol))
+    throw new Error("目标 URL 必须使用 HTTP 或 HTTPS");
+  if (document.mode === "node" && (typeof document.node !== "string" || !document.node)) {
+    throw new Error("指定节点不能为空");
+  }
+  return {
+    mode: document.mode as PlaygroundRequest["mode"],
+    ...(typeof document.node === "string" ? { node: document.node } : {}),
+    target: target.href,
+  };
+}
+
+function executePlaygroundRequest(
+  input: PlaygroundRequest & {
+    host: string;
+    port: number;
+    proxyAuthenticationDisabled: boolean;
+    proxyToken?: string;
+  },
+): Promise<{ body: string; durationMs: number; headers: IncomingHttpHeaders; status: number }> {
+  if (!input.proxyAuthenticationDisabled && !input.proxyToken) {
+    throw new Error("当前 Proxy Token 不可恢复，请通过启动配置重新提供");
+  }
+  const username =
+    input.mode === "node"
+      ? `node.${encodeURIComponent(input.node as string)}`
+      : input.mode === "rotate"
+        ? "rotate"
+        : `${input.mode}.playground`;
+  const startedAt = Date.now();
+  const target = new URL(input.target);
+  const authorizationHeaders = input.proxyAuthenticationDisabled
+    ? undefined
+    : {
+        "proxy-authorization": `Basic ${Buffer.from(`${username}:${input.proxyToken}`).toString("base64")}`,
+      };
+  if (target.protocol === "https:") {
+    return new Promise((resolve, reject) => {
+      const tunnel = request({
+        headers: authorizationHeaders,
+        host: input.host,
+        method: "CONNECT",
+        path: `${target.hostname}:${target.port || 443}`,
+        port: input.port,
+      });
+      tunnel.setTimeout(15_000, () => tunnel.destroy(new Error("请求超时")));
+      tunnel.on("error", reject);
+      tunnel.on("connect", (response, socket, head) => {
+        if (response.statusCode !== 200) {
+          socket.destroy();
+          resolve({
+            body: "",
+            durationMs: Date.now() - startedAt,
+            headers: response.headers,
+            status: response.statusCode ?? 502,
+          });
+          return;
+        }
+        if (head.length > 0) socket.unshift(head);
+        const secureSocket = connectTls({ servername: target.hostname, socket });
+        secureSocket.setTimeout(15_000, () => secureSocket.destroy(new Error("请求超时")));
+        secureSocket.on("error", reject);
+        const tunnelAgent = new HttpsAgent({ keepAlive: false });
+        tunnelAgent.createConnection = () => secureSocket;
+        const targetRequest = requestHttps(
+          {
+            agent: tunnelAgent,
+            headers: { host: target.host },
+            hostname: target.hostname,
+            method: "GET",
+            path: `${target.pathname}${target.search}`,
+            port: target.port || 443,
+          },
+          (targetResponse) =>
+            collectPlaygroundResponse(targetResponse, startedAt).then(resolve, reject),
+        );
+        targetRequest.setTimeout(15_000, () => targetRequest.destroy(new Error("请求超时")));
+        targetRequest.on("error", reject);
+        targetRequest.end();
+      });
+      tunnel.end();
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const proxyRequest = request(
+      {
+        headers: authorizationHeaders,
+        host: input.host,
+        method: "GET",
+        path: input.target,
+        port: input.port,
+      },
+      (proxyResponse) => collectPlaygroundResponse(proxyResponse, startedAt).then(resolve, reject),
+    );
+    proxyRequest.setTimeout(15_000, () => proxyRequest.destroy(new Error("请求超时")));
+    proxyRequest.on("error", reject);
+    proxyRequest.end();
+  });
+}
+
+function collectPlaygroundResponse(
+  response: IncomingMessage,
+  startedAt: number,
+): Promise<{ body: string; durationMs: number; headers: IncomingHttpHeaders; status: number }> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    response.on("data", (chunk: Buffer) => {
+      if (size >= 64 * 1024) return;
+      const bounded = chunk.subarray(0, 64 * 1024 - size);
+      chunks.push(bounded);
+      size += bounded.length;
+    });
+    response.on("error", reject);
+    response.on("end", () =>
+      resolve({
+        body: Buffer.concat(chunks).toString("utf8"),
+        durationMs: Date.now() - startedAt,
+        headers: response.headers,
+        status: response.statusCode ?? 502,
+      }),
+    );
+  });
 }
 
 function parseTargetFeedbackRequest(body: string): {
@@ -1988,7 +2402,7 @@ function performConnectHandshake(
 }
 
 function isFallbackRoute(route: ProxyRoute): boolean {
-  return route.mode === "rotate" || route.mode === "sticky";
+  return route.mode === "rotate" || route.mode === "sticky" || route.mode === "node";
 }
 
 function validatePreconnectAttempts(value: number | undefined): void {

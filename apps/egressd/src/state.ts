@@ -3,15 +3,29 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { PersistedProxyToken } from "./proxy-auth.js";
+import {
+  defaultRuntimeSettings,
+  parseRuntimeSettings,
+  type RuntimeSettings,
+} from "./runtime-settings.js";
 import type { PersistedSessionBinding, SessionBindingStore } from "./session.js";
 import type { ImportedVlessRevision, NormalizedVlessNode } from "./subscription.js";
 
 const SQLITE_BUSY = 5;
 
+function subscriptionNameFromLocator(locator: string): string {
+  try {
+    return new URL(locator).hostname || locator;
+  } catch {
+    return locator;
+  }
+}
+
 export interface SubscriptionIdentity {
   id: string;
   kind: "local" | "remote";
   locator: string;
+  name?: string;
 }
 
 export interface PersistedNodeGeneration {
@@ -19,6 +33,16 @@ export interface PersistedNodeGeneration {
   listenerPort: number;
   logicalId: string;
   node: NormalizedVlessNode;
+}
+
+export interface PersistedExitIdentity {
+  city?: string;
+  country?: string;
+  generation: string;
+  ip: string;
+  logicalId: string;
+  provider: string;
+  verifiedAt: number;
 }
 
 export interface PersistedActiveRevision {
@@ -103,6 +127,7 @@ export interface ConsoleSessionSummary {
 
 export interface ConsoleOperationSummary {
   id: string;
+  kind: "force" | "refresh";
   status: OperationStatus;
   subscriptionId: string;
   updatedAt: string;
@@ -112,14 +137,19 @@ export class NodeAliasConflictError extends Error {}
 export class NodeAliasTargetNotFoundError extends Error {}
 
 export interface ControlState extends SessionBindingStore {
+  loadRuntimeSettings(adminToken: string): RuntimeSettings;
   advanceRevision(subscriptionRevisionId: number, status: SubscriptionRevisionStatus): void;
   createForceOperation(subscriptionRevisionId: number): SubscriptionOperation;
   createRefreshOperation(subscriptionId: string): SubscriptionOperation;
-  createRemoteSubscription(locator: string): {
+  createRemoteSubscription(
+    locator: string,
+    name?: string,
+  ): {
     operationId: string;
     subscriptionRevisionId: number;
     subscriptionId: string;
   };
+  deleteSubscription(subscriptionId: string): boolean;
   databasePath: string;
   failOperation(operationId: string, stage: OperationProcessingStage, reason: string): void;
   failForceOperation(
@@ -130,12 +160,15 @@ export interface ControlState extends SessionBindingStore {
   ): void;
   getOperation(operationId: string): SubscriptionOperation | undefined;
   getNodeAliases(): ReadonlyMap<string, string>;
+  getExitIdentity(logicalId: string, generation: string): PersistedExitIdentity | undefined;
   getNodeEnabledOverrides(): ReadonlyMap<string, boolean>;
   getRevision(subscriptionRevisionId: number): PersistedSubscriptionRevision | undefined;
   getSubscription(subscriptionId: string): SubscriptionIdentity | undefined;
+  hasActiveSubscriptionOperation(subscriptionId: string): boolean;
   listConsoleSessions(): ConsoleSessionSummary[];
   listConsoleOperations(): ConsoleOperationSummary[];
   listConsoleSubscriptions(): ConsoleSubscriptionSummary[];
+  listRemoteSubscriptionIds(): string[];
   listDrainingListenerLeases(): PersistedListenerLease[];
   operationStatusCounts(): Record<string, number>;
   loadProxyTokens(): PersistedProxyToken[] | undefined;
@@ -157,6 +190,7 @@ export interface ControlState extends SessionBindingStore {
     source: SubscriptionIdentity;
     subscriptionRevisionId?: number;
   }): PersistedActiveRevision;
+  saveExitIdentity(identity: PersistedExitIdentity): void;
   saveNodeAlias(logicalNodeId: string, alias: string): void;
   saveNodeEnabledOverride(logicalNodeId: string, enabled: boolean): void;
   saveProxyTokens(tokens: readonly PersistedProxyToken[]): void;
@@ -170,6 +204,12 @@ export interface ControlState extends SessionBindingStore {
     synchronous: number;
   };
   transitionOperation(operationId: string, status: OperationStatus): void;
+  updateRuntimeSettings(settings: RuntimeSettings): RuntimeSettings;
+  updateRemoteSubscription(
+    subscriptionId: string,
+    locator: string,
+    name?: string,
+  ): SubscriptionOperation;
   close(): Promise<void>;
 }
 
@@ -205,7 +245,9 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       createForceOperation(controlDatabase, subscriptionRevisionId),
     createRefreshOperation: (subscriptionId) =>
       createRefreshOperation(controlDatabase, subscriptionId),
-    createRemoteSubscription: (locator) => createRemoteSubscription(controlDatabase, locator),
+    createRemoteSubscription: (locator, name) =>
+      createRemoteSubscription(controlDatabase, locator, name),
+    deleteSubscription: (subscriptionId) => deleteSubscription(controlDatabase, subscriptionId),
     countSessionBindings: () => countSessionBindings(controlDatabase),
     databasePath,
     deleteExpiredSessionBindings: (now, absoluteTtlMs, idleTimeoutMs, activeIdentities) =>
@@ -222,23 +264,30 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
       failForceOperation(controlDatabase, operationId, subscriptionRevisionId, stage, reason),
     getOperation: (operationId) => getOperation(controlDatabase, operationId),
     getNodeAliases: () => getNodeAliases(controlDatabase),
+    getExitIdentity: (logicalId, generation) =>
+      getExitIdentity(controlDatabase, logicalId, generation),
     getNodeEnabledOverrides: () => getNodeEnabledOverrides(controlDatabase),
     getRevision: (subscriptionRevisionId) => getRevision(controlDatabase, subscriptionRevisionId),
     getSessionBinding: (identity) => getSessionBinding(controlDatabase, identity),
     getSubscription: (subscriptionId) => getSubscription(controlDatabase, subscriptionId),
+    hasActiveSubscriptionOperation: (subscriptionId) =>
+      hasActiveSubscriptionOperation(controlDatabase, subscriptionId),
     listConsoleSessions: () => listConsoleSessions(controlDatabase),
     listConsoleOperations: () => listConsoleOperations(controlDatabase),
     listConsoleSubscriptions: () => listConsoleSubscriptions(controlDatabase),
+    listRemoteSubscriptionIds: () => listRemoteSubscriptionIds(controlDatabase),
     listDrainingListenerLeases: () => listDrainingListenerLeases(controlDatabase),
     loadOrCreateSessionHmacKey: () => loadOrCreateSessionHmacKey(controlDatabase),
     loadActiveRevision: () => loadActiveRevision(controlDatabase),
     loadProxyTokens: () => loadProxyTokens(controlDatabase),
+    loadRuntimeSettings: (adminToken) => loadRuntimeSettings(controlDatabase, adminToken),
     operationStatusCounts: () => operationStatusCounts(controlDatabase),
     prepareNodeRevision: (sourceId, imported, now) =>
       prepareNodeRevision(controlDatabase, sourceId, imported, now),
     releaseNodeGeneration: (logicalId, generation, listenerPort, reusableAfter) =>
       releaseNodeGeneration(controlDatabase, logicalId, generation, listenerPort, reusableAfter),
     saveActiveRevision: (input) => saveActiveRevision(controlDatabase, input),
+    saveExitIdentity: (identity) => saveExitIdentity(controlDatabase, identity),
     saveNodeAlias: (logicalNodeId, alias) => saveNodeAlias(controlDatabase, logicalNodeId, alias),
     saveNodeEnabledOverride: (logicalNodeId, enabled) =>
       saveNodeEnabledOverride(controlDatabase, logicalNodeId, enabled),
@@ -265,6 +314,9 @@ export async function openControlState(stateDirectory: string): Promise<ControlS
     }),
     transitionOperation: (operationId, status) =>
       transitionOperation(controlDatabase, operationId, status),
+    updateRuntimeSettings: (settings) => updateRuntimeSettings(controlDatabase, settings),
+    updateRemoteSubscription: (subscriptionId, locator, name) =>
+      updateRemoteSubscription(controlDatabase, subscriptionId, locator, name),
     touchSessionBinding: (identity, lastUsedAt, mode) =>
       touchSessionBinding(controlDatabase, identity, lastUsedAt, mode),
     close: async () => {
@@ -320,12 +372,13 @@ function getSessionBinding(
 ): PersistedSessionBinding | undefined {
   const row = database
     .prepare(
-      `SELECT logical_node_id, created_at, last_used_at, mode
+      `SELECT logical_node_id, egress_ip, created_at, last_used_at, mode
        FROM session_bindings WHERE session_identity = ?`,
     )
     .get(identity) as
     | {
         created_at: number;
+        egress_ip: string | null;
         last_used_at: number;
         logical_node_id: string;
         mode: "sticky" | "strict";
@@ -334,6 +387,7 @@ function getSessionBinding(
   return row
     ? {
         createdAt: row.created_at,
+        ...(row.egress_ip === null ? {} : { exitIp: row.egress_ip }),
         lastUsedAt: row.last_used_at,
         logicalNodeId: row.logical_node_id,
         mode: row.mode,
@@ -347,6 +401,61 @@ function getNodeAliases(database: DatabaseSync): ReadonlyMap<string, string> {
     logical_id: string;
   }>;
   return new Map(rows.map((row) => [row.logical_id, row.alias]));
+}
+
+function getExitIdentity(
+  database: DatabaseSync,
+  logicalId: string,
+  generation: string,
+): PersistedExitIdentity | undefined {
+  const row = database
+    .prepare(
+      `SELECT logical_id, generation, ip, country, city, provider, verified_at
+       FROM node_exit_identities WHERE logical_id = ? AND generation = ?`,
+    )
+    .get(logicalId, generation) as
+    | {
+        city: string | null;
+        country: string | null;
+        generation: string;
+        ip: string;
+        logical_id: string;
+        provider: string;
+        verified_at: number;
+      }
+    | undefined;
+  return row
+    ? {
+        ...(row.city === null ? {} : { city: row.city }),
+        ...(row.country === null ? {} : { country: row.country }),
+        generation: row.generation,
+        ip: row.ip,
+        logicalId: row.logical_id,
+        provider: row.provider,
+        verifiedAt: row.verified_at,
+      }
+    : undefined;
+}
+
+function saveExitIdentity(database: DatabaseSync, identity: PersistedExitIdentity): void {
+  database
+    .prepare(
+      `INSERT INTO node_exit_identities
+       (logical_id, generation, ip, country, city, provider, verified_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(logical_id, generation) DO UPDATE SET
+         ip = excluded.ip, country = excluded.country, city = excluded.city,
+         provider = excluded.provider, verified_at = excluded.verified_at`,
+    )
+    .run(
+      identity.logicalId,
+      identity.generation,
+      identity.ip,
+      identity.country ?? null,
+      identity.city ?? null,
+      identity.provider,
+      identity.verifiedAt,
+    );
 }
 
 function getNodeEnabledOverrides(database: DatabaseSync): ReadonlyMap<string, boolean> {
@@ -456,6 +565,22 @@ function saveProxyTokens(database: DatabaseSync, tokens: readonly PersistedProxy
   }
 }
 
+function loadRuntimeSettings(database: DatabaseSync, adminToken: string): RuntimeSettings {
+  const existing = database
+    .prepare("SELECT value FROM daemon_metadata WHERE key = 'runtime_settings'")
+    .get() as { value: string } | undefined;
+  if (existing) return parseRuntimeSettings(JSON.parse(existing.value));
+  return updateRuntimeSettings(database, defaultRuntimeSettings(adminToken));
+}
+
+function updateRuntimeSettings(database: DatabaseSync, settings: RuntimeSettings): RuntimeSettings {
+  const validated = parseRuntimeSettings(settings);
+  database
+    .prepare("INSERT OR REPLACE INTO daemon_metadata (key, value) VALUES ('runtime_settings', ?)")
+    .run(JSON.stringify(validated));
+  return validated;
+}
+
 function saveSessionBinding(
   database: DatabaseSync,
   identity: string,
@@ -464,15 +589,23 @@ function saveSessionBinding(
   database
     .prepare(
       `INSERT INTO session_bindings
-         (session_identity, logical_node_id, created_at, last_used_at, mode)
-       VALUES (?, ?, ?, ?, ?)
+         (session_identity, logical_node_id, egress_ip, created_at, last_used_at, mode)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_identity) DO UPDATE SET
          logical_node_id = excluded.logical_node_id,
+         egress_ip = excluded.egress_ip,
          created_at = excluded.created_at,
          last_used_at = excluded.last_used_at,
          mode = excluded.mode`,
     )
-    .run(identity, binding.logicalNodeId, binding.createdAt, binding.lastUsedAt, binding.mode);
+    .run(
+      identity,
+      binding.logicalNodeId,
+      binding.exitIp ?? null,
+      binding.createdAt,
+      binding.lastUsedAt,
+      binding.mode,
+    );
 }
 
 function touchSessionBinding(
@@ -515,7 +648,8 @@ function migrate(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY,
       kind TEXT NOT NULL CHECK (kind IN ('local', 'remote')),
-      locator TEXT NOT NULL
+      locator TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS subscription_revisions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -586,6 +720,16 @@ function migrate(database: DatabaseSync): void {
       logical_id TEXT PRIMARY KEY,
       enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
     );
+    CREATE TABLE IF NOT EXISTS node_exit_identities (
+      logical_id TEXT NOT NULL,
+      generation TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      country TEXT,
+      city TEXT,
+      provider TEXT NOT NULL,
+      verified_at INTEGER NOT NULL,
+      PRIMARY KEY (logical_id, generation)
+    );
     CREATE TABLE IF NOT EXISTS listener_port_leases (
       listener_port INTEGER PRIMARY KEY,
       logical_id TEXT NOT NULL,
@@ -595,6 +739,7 @@ function migrate(database: DatabaseSync): void {
     );
   `);
   ensureColumn(database, "subscription_revisions", "mihomo_config_json", "TEXT");
+  ensureColumn(database, "subscriptions", "name", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(
     database,
     "subscription_revisions",
@@ -628,10 +773,11 @@ function migrate(database: DatabaseSync): void {
       WHERE NOT EXISTS (
         SELECT 1 FROM revision_events re WHERE re.revision_id = sr.id
       );
-    PRAGMA user_version = 7;
+    PRAGMA user_version = 9;
   `);
   ensureColumn(database, "operation_revisions", "kind", "TEXT NOT NULL DEFAULT 'refresh'");
   ensureColumn(database, "session_bindings", "mode", "TEXT NOT NULL DEFAULT 'sticky'");
+  ensureColumn(database, "session_bindings", "egress_ip", "TEXT");
 }
 
 function ensureColumn(
@@ -649,14 +795,15 @@ function ensureColumn(
 function createRemoteSubscription(
   database: DatabaseSync,
   locator: string,
+  name = subscriptionNameFromLocator(locator),
 ): { operationId: string; subscriptionId: string; subscriptionRevisionId: number } {
   const subscriptionId = randomUUID();
   const operationId = randomUUID();
   database.exec("BEGIN IMMEDIATE");
   try {
     database
-      .prepare("INSERT INTO subscriptions (id, kind, locator) VALUES (?, 'remote', ?)")
-      .run(subscriptionId, locator);
+      .prepare("INSERT INTO subscriptions (id, kind, locator, name) VALUES (?, 'remote', ?, ?)")
+      .run(subscriptionId, locator, name);
     const subscriptionRevisionId = insertPendingRevision(database, subscriptionId);
     insertOperation(database, operationId, subscriptionId, subscriptionRevisionId);
     database.exec("COMMIT");
@@ -686,6 +833,60 @@ function createRefreshOperation(
     throw error;
   }
   return getOperation(database, operationId) as SubscriptionOperation;
+}
+
+function updateRemoteSubscription(
+  database: DatabaseSync,
+  subscriptionId: string,
+  locator: string,
+  name = subscriptionNameFromLocator(locator),
+): SubscriptionOperation {
+  const subscription = getSubscription(database, subscriptionId);
+  if (subscription?.kind !== "remote") {
+    throw new Error(`remote subscription not found: ${subscriptionId}`);
+  }
+  const operationId = randomUUID();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare("UPDATE subscriptions SET locator = ?, name = ? WHERE id = ?")
+      .run(locator, name, subscriptionId);
+    const subscriptionRevisionId = insertPendingRevision(database, subscriptionId);
+    insertOperation(database, operationId, subscriptionId, subscriptionRevisionId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  return getOperation(database, operationId) as SubscriptionOperation;
+}
+
+function deleteSubscription(database: DatabaseSync, subscriptionId: string): boolean {
+  const subscription = getSubscription(database, subscriptionId);
+  if (!subscription) return false;
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare("DELETE FROM operations WHERE subscription_id = ?").run(subscriptionId);
+    database
+      .prepare(
+        `DELETE FROM runtime_revisions WHERE subscription_revision_id IN
+           (SELECT id FROM subscription_revisions WHERE subscription_id = ?)`,
+      )
+      .run(subscriptionId);
+    database
+      .prepare("DELETE FROM subscription_revisions WHERE subscription_id = ?")
+      .run(subscriptionId);
+    database.prepare("DELETE FROM subscriptions WHERE id = ?").run(subscriptionId);
+    const prefix = `${subscriptionId}:%`;
+    database.prepare("DELETE FROM node_aliases WHERE logical_id LIKE ?").run(prefix);
+    database.prepare("DELETE FROM node_enabled_overrides WHERE logical_id LIKE ?").run(prefix);
+    database.prepare("DELETE FROM session_bindings WHERE logical_node_id LIKE ?").run(prefix);
+    database.exec("COMMIT");
+    return true;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export class RevisionForceConflictError extends Error {}
@@ -780,15 +981,42 @@ function getSubscription(
   subscriptionId: string,
 ): SubscriptionIdentity | undefined {
   const row = database
-    .prepare("SELECT id, kind, locator FROM subscriptions WHERE id = ?")
-    .get(subscriptionId) as { id: string; kind: "local" | "remote"; locator: string } | undefined;
-  return row;
+    .prepare("SELECT id, kind, locator, name FROM subscriptions WHERE id = ?")
+    .get(subscriptionId) as
+    | { id: string; kind: "local" | "remote"; locator: string; name: string }
+    | undefined;
+  return row === undefined
+    ? undefined
+    : { ...row, name: row.name.trim() || subscriptionNameFromLocator(row.locator) };
+}
+
+function listRemoteSubscriptionIds(database: DatabaseSync): string[] {
+  return (
+    database
+      .prepare("SELECT id FROM subscriptions WHERE kind = 'remote' ORDER BY id")
+      .all() as Array<{
+      id: string;
+    }>
+  ).map(({ id }) => id);
+}
+
+function hasActiveSubscriptionOperation(database: DatabaseSync, subscriptionId: string): boolean {
+  return Boolean(
+    database
+      .prepare(
+        `SELECT 1 FROM operations
+         WHERE subscription_id = ?
+           AND status NOT IN ('succeeded', 'failed', 'interrupted')
+         LIMIT 1`,
+      )
+      .get(subscriptionId),
+  );
 }
 
 function listConsoleSubscriptions(database: DatabaseSync): ConsoleSubscriptionSummary[] {
   const rows = database
     .prepare(
-      `SELECT s.id, s.kind, s.locator, sr.id AS revision_id,
+      `SELECT s.id, s.kind, s.locator, s.name, sr.id AS revision_id,
               sr.lifecycle_status, sr.normalized_nodes_json, sr.created_at
        FROM subscriptions s
        LEFT JOIN subscription_revisions sr ON sr.id = (
@@ -803,6 +1031,7 @@ function listConsoleSubscriptions(database: DatabaseSync): ConsoleSubscriptionSu
     kind: "local" | "remote";
     lifecycle_status: SubscriptionRevisionStatus | null;
     locator: string;
+    name: string;
     normalized_nodes_json: string | null;
     revision_id: number | null;
   }>;
@@ -810,6 +1039,7 @@ function listConsoleSubscriptions(database: DatabaseSync): ConsoleSubscriptionSu
     id: row.id,
     kind: row.kind,
     locator: row.locator,
+    name: row.name.trim() || subscriptionNameFromLocator(row.locator),
     nodeCount:
       row.normalized_nodes_json === null
         ? 0
@@ -845,19 +1075,23 @@ function listConsoleSessions(database: DatabaseSync): ConsoleSessionSummary[] {
 function listConsoleOperations(database: DatabaseSync): ConsoleOperationSummary[] {
   return database
     .prepare(
-      `SELECT id, subscription_id, status, updated_at
-       FROM operations ORDER BY updated_at DESC LIMIT 12`,
+      `SELECT o.id, o.subscription_id, o.status, o.updated_at, r.kind
+       FROM operations o
+       JOIN operation_revisions r ON r.operation_id = o.id
+       ORDER BY o.updated_at DESC LIMIT 12`,
     )
     .all()
     .map((row) => {
       const value = row as {
         id: string;
+        kind: "force" | "refresh";
         status: OperationStatus;
         subscription_id: string;
         updated_at: string;
       };
       return {
         id: value.id,
+        kind: value.kind,
         status: value.status,
         subscriptionId: value.subscription_id,
         updatedAt: value.updated_at,
@@ -1215,10 +1449,16 @@ function saveActiveRevision(
   try {
     database
       .prepare(
-        `INSERT INTO subscriptions (id, kind, locator) VALUES (?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, locator = excluded.locator`,
+        `INSERT INTO subscriptions (id, kind, locator, name) VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, locator = excluded.locator,
+           name = excluded.name`,
       )
-      .run(input.source.id, input.source.kind, input.source.locator);
+      .run(
+        input.source.id,
+        input.source.kind,
+        input.source.locator,
+        input.source.name ?? subscriptionNameFromLocator(input.source.locator),
+      );
     const subscriptionRevisionId =
       input.subscriptionRevisionId ??
       Number(

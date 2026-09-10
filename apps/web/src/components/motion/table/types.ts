@@ -19,7 +19,7 @@ export type TableColumn<T> = {
   /** Column width as a CSS length, e.g. "160px" or "20%". Omit to share remaining space equally. */
   width?: string;
   /** Custom cell renderer. Falls back to `row[key]`. */
-  cell?: (row: T) => ReactNode;
+  cell?: (row: T, rowIndex: number) => ReactNode;
   /** Render an inline text input for this column's cells (ignored when `cell` is set). */
   editable?: boolean;
   /** Value used for sorting. Falls back to `row[key]`. */

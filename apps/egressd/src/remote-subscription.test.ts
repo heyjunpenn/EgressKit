@@ -84,6 +84,54 @@ test("remote subscription operations expose every successful processing stage an
   assert.equal(applied.length, 2);
 });
 
+test("remote subscriptions can be edited, deleted, and refresh automatically every interval", async (t) => {
+  const stateDirectory = await temporaryStateDirectory(t);
+  const fetchedUrls: string[] = [];
+  const daemon = await startEgressd({
+    adminToken: "admin-token",
+    checkMihomoListener: async () => undefined,
+    fetchSubscription: async (url) => {
+      fetchedUrls.push(url);
+      return new Response(VALID_SUBSCRIPTION);
+    },
+    host: "127.0.0.1",
+    mihomoRuntime: successfulRuntime([]),
+    port: 0,
+    remoteSubscriptionRefreshIntervalMs: 20,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+
+  const created = await adminJson(daemon.address, "/subscriptions/remote", {
+    body: { url: "https://provider.example/original" },
+    method: "POST",
+  });
+  await waitForTerminalOperation(daemon.address, created.body.operationId as string);
+  const updated = await adminJson(
+    daemon.address,
+    `/subscriptions/${created.body.subscriptionId as string}`,
+    { body: { url: "https://provider.example/edited" }, method: "PUT" },
+  );
+  await waitForTerminalOperation(daemon.address, updated.body.operationId as string);
+  assert.equal(fetchedUrls.at(-1), "https://provider.example/edited");
+
+  for (let attempt = 0; attempt < 40 && fetchedUrls.length < 3; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(fetchedUrls.length >= 3);
+
+  const deleted = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/subscriptions/${created.body.subscriptionId as string}`,
+    { headers: { authorization: "Bearer admin-token" }, method: "DELETE" },
+  );
+  assert.equal(deleted.status, 204);
+  const missing = await adminJson(
+    daemon.address,
+    `/subscriptions/${created.body.subscriptionId as string}`,
+  );
+  assert.equal(missing.status, 404);
+});
+
 test("remote operations are serialized in creation order", async (t) => {
   const stateDirectory = await temporaryStateDirectory(t);
   let activeRequests = 0;

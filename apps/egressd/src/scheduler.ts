@@ -4,6 +4,7 @@ export interface SchedulerCandidate {
   activeConnections: number;
   consecutiveFailures: number;
   ewmaLatencyMs: number;
+  exitIp?: string;
   generation: string;
   healthy: boolean;
   id: string;
@@ -46,8 +47,8 @@ export interface SchedulerLease {
 
 interface CandidateState {
   candidate: SchedulerCandidate;
-  currentWeight: number;
   healthStatus: NodeHealthStatus;
+  lastSelectedSequence: number;
   leasedConnections: number;
   onDrained: ((candidate: SchedulerCandidate) => void) | undefined;
 }
@@ -72,9 +73,16 @@ export function validateSelectorUniqueness(
 
 export class RotateScheduler {
   readonly #drainingStates = new Set<CandidateState>();
+  readonly #requireExitIdentity: boolean;
+  readonly #lastSelectedByExitIp = new Map<string, number>();
+  #selectionSequence = 0;
   #states: CandidateState[] = [];
 
-  constructor(candidates: readonly SchedulerCandidate[] = []) {
+  constructor(
+    candidates: readonly SchedulerCandidate[] = [],
+    options: { requireExitIdentity?: boolean } = {},
+  ) {
+    this.#requireExitIdentity = options.requireExitIdentity ?? false;
     this.replaceCandidates(candidates);
   }
 
@@ -104,8 +112,8 @@ export class RotateScheduler {
       if (!existing) {
         return {
           candidate,
-          currentWeight: 0,
           healthStatus: candidate.healthy ? "healthy" : "cooldown",
+          lastSelectedSequence: 0,
           leasedConnections: 0,
           onDrained: undefined,
         };
@@ -114,6 +122,9 @@ export class RotateScheduler {
         ...candidate,
         consecutiveFailures: existing.candidate.consecutiveFailures,
         ewmaLatencyMs: existing.candidate.ewmaLatencyMs,
+        ...((candidate.exitIp ?? existing.candidate.exitIp)
+          ? { exitIp: candidate.exitIp ?? existing.candidate.exitIp }
+          : {}),
         healthy: existing.candidate.healthy,
         successRate: existing.candidate.successRate,
       };
@@ -126,6 +137,7 @@ export class RotateScheduler {
     const eligible = this.#states.filter(
       ({ candidate }) =>
         !excludedIds.has(candidate.id) &&
+        (!this.#requireExitIdentity || candidate.exitIp !== undefined) &&
         candidate.healthy &&
         candidate.manualWeight > 0 &&
         candidate.successRate > 0,
@@ -134,47 +146,60 @@ export class RotateScheduler {
       return undefined;
     }
 
-    const rawWeights = eligible.map(effectiveWeight);
-    const highestWeight = Math.max(...rawWeights);
-    const weights = rawWeights.map((weight) =>
-      Math.max(1, Math.round((weight / highestWeight) * 10)),
-    );
-    const totalWeight = weights.reduce((total, weight) => total + weight, 0);
-    for (const [index, state] of eligible.entries()) {
-      state.currentWeight += weights[index] ?? 0;
-    }
-    const selected = eligible.reduce((best, state) =>
-      state.currentWeight > best.currentWeight ? state : best,
-    );
-    selected.currentWeight -= totalWeight;
-    return lease(selected);
+    const selected = this.#requireExitIdentity
+      ? this.#selectByExitIp(eligible)
+      : eligible.reduce((oldest, state) =>
+          state.lastSelectedSequence < oldest.lastSelectedSequence ? state : oldest,
+        );
+    return this.#leaseSelected(selected);
   }
 
   acquireById(id: string): SchedulerLease | undefined {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
     if (
       !state?.candidate.healthy ||
+      (this.#requireExitIdentity && state.candidate.exitIp === undefined) ||
       state.candidate.manualWeight <= 0 ||
       state.candidate.successRate <= 0
     ) {
       return undefined;
     }
-    return lease(state);
+    return this.#leaseSelected(state);
   }
 
-  acquireBySelector(selector: string): SchedulerLease | undefined {
-    const state = this.#states.find(
+  acquireBySelector(
+    selector: string,
+    excludedIds: ReadonlySet<string> = new Set(),
+  ): SchedulerLease | undefined {
+    const selected = this.#states.find(
       ({ candidate }) =>
         candidate.id === selector || (candidate.selectors ?? []).includes(selector),
     );
+    const state =
+      this.#requireExitIdentity && selected?.candidate.exitIp
+        ? this.#states
+            .filter(({ candidate }) => candidate.exitIp === selected.candidate.exitIp)
+            .filter(({ candidate }) => !excludedIds.has(candidate.id))
+            .filter(({ candidate }) => this.#isEligible(candidate))
+            .reduce<CandidateState | undefined>(
+              (oldest, candidate) =>
+                !oldest || candidate.lastSelectedSequence < oldest.lastSelectedSequence
+                  ? candidate
+                  : oldest,
+              undefined,
+            )
+        : selected && !excludedIds.has(selected.candidate.id)
+          ? selected
+          : undefined;
     if (
       !state?.candidate.healthy ||
+      (this.#requireExitIdentity && state.candidate.exitIp === undefined) ||
       state.candidate.manualWeight <= 0 ||
       state.candidate.successRate <= 0
     ) {
       return undefined;
     }
-    return lease(state);
+    return this.#leaseSelected(state);
   }
 
   hasCandidate(id: string): boolean {
@@ -184,7 +209,10 @@ export class RotateScheduler {
   hasSchedulableCandidate(): boolean {
     return this.#states.some(
       ({ candidate }) =>
-        candidate.healthy && candidate.manualWeight > 0 && candidate.successRate > 0,
+        (!this.#requireExitIdentity || candidate.exitIp !== undefined) &&
+        candidate.healthy &&
+        candidate.manualWeight > 0 &&
+        candidate.successRate > 0,
     );
   }
 
@@ -244,6 +272,30 @@ export class RotateScheduler {
     return true;
   }
 
+  setExitIp(id: string, exitIp: string): boolean {
+    const state = this.#states.find(({ candidate }) => candidate.id === id);
+    if (!state) return false;
+    state.candidate = { ...state.candidate, exitIp };
+    return true;
+  }
+
+  acquireByExitIp(
+    exitIp: string,
+    excludedIds: ReadonlySet<string> = new Set(),
+  ): SchedulerLease | undefined {
+    const eligible = this.#states.filter(
+      ({ candidate }) =>
+        candidate.exitIp === exitIp &&
+        !excludedIds.has(candidate.id) &&
+        this.#isEligible(candidate),
+    );
+    if (eligible.length === 0) return undefined;
+    const selected = eligible.reduce((oldest, state) =>
+      state.lastSelectedSequence < oldest.lastSelectedSequence ? state : oldest,
+    );
+    return this.#leaseSelected(selected);
+  }
+
   setSelectors(id: string, selectors: readonly string[]): boolean {
     const state = this.#states.find(({ candidate }) => candidate.id === id);
     if (!state) {
@@ -255,6 +307,39 @@ export class RotateScheduler {
     validateSelectorUniqueness(candidates);
     state.candidate = { ...state.candidate, selectors };
     return true;
+  }
+
+  #leaseSelected(state: CandidateState): SchedulerLease {
+    this.#selectionSequence += 1;
+    state.lastSelectedSequence = this.#selectionSequence;
+    if (state.candidate.exitIp) {
+      this.#lastSelectedByExitIp.set(state.candidate.exitIp, this.#selectionSequence);
+    }
+    return lease(state);
+  }
+
+  #isEligible(candidate: SchedulerCandidate): boolean {
+    return (
+      (!this.#requireExitIdentity || candidate.exitIp !== undefined) &&
+      candidate.healthy &&
+      candidate.manualWeight > 0 &&
+      candidate.successRate > 0
+    );
+  }
+
+  #selectByExitIp(eligible: CandidateState[]): CandidateState {
+    const oldestIp = [
+      ...new Set(eligible.map(({ candidate }) => candidate.exitIp as string)),
+    ].reduce((oldest, ip) =>
+      (this.#lastSelectedByExitIp.get(ip) ?? 0) < (this.#lastSelectedByExitIp.get(oldest) ?? 0)
+        ? ip
+        : oldest,
+    );
+    return eligible
+      .filter(({ candidate }) => candidate.exitIp === oldestIp)
+      .reduce((oldest, state) =>
+        state.lastSelectedSequence < oldest.lastSelectedSequence ? state : oldest,
+      );
   }
 }
 
@@ -318,15 +403,6 @@ function notifyIfDrained(state: CandidateState): void {
   const onDrained = state.onDrained;
   state.onDrained = undefined;
   onDrained(state.candidate);
-}
-
-function effectiveWeight(state: CandidateState): number {
-  const { candidate } = state;
-  const load = candidate.activeConnections + state.leasedConnections;
-  return (
-    (candidate.manualWeight * candidate.successRate) /
-    (Math.max(1, candidate.ewmaLatencyMs) * (candidate.consecutiveFailures + 1) * (load + 1))
-  );
 }
 
 function validateCandidate(candidate: SchedulerCandidate): void {

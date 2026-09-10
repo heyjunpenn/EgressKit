@@ -16,7 +16,7 @@ Windows 不在 v1 的正式支持范围。发布流水线通过独立任务执�
 `linux/amd64` 与 `linux/arm64`。正式镜像与 GitHub Release 都依赖完整质量验证成功。
 
 带版本的 GitHub Release 附件是 v1 CLI 和 daemon 归档的正式下载渠道；项目不从 npm registry
-发布。归档内部 package version 必须与 `v` 前缀 release tag 完全一致。容器镜像从同一 tag 发布到
+发布。归档内部 package version 必须与无前缀的 `x.y.z` release tag 完全一致。容器镜像从同一 tag 发布到
 `ghcr.io/heyjunpenn/egresskit`，并附带构建 provenance 与 SBOM。
 
 ## State-directory security
@@ -41,9 +41,12 @@ docker run --rm \
   -v egresskit-state:/var/lib/egresskit \
   -p 127.0.0.1:8787:8787 \
   -e EGRESSKIT_ADMIN_TOKEN='replace-me' \
-  -e EGRESSKIT_PROXY_TOKEN='replace-me' \
-  ghcr.io/heyjunpenn/egresskit:VERSION
+  ghcr.io/heyjunpenn/egresskit:0.1.0
 ```
 
 镜像内的 daemon 监听 `0.0.0.0:8787` 以穿过容器网络；上述端口映射只把服务暴露到宿主机
 loopback。若要对其他网络开放端口，必须保留代理认证，并由部署者额外配置防火墙和访问控制。
+
+首次启动时，其余运行参数会以默认值写入 SQLite；Proxy Token 默认与 Admin Token 相同。登录管理
+控制台后可在“设置”页修改 Proxy Token、监听参数、Mihomo、探活、订阅刷新与会话限制。除 Proxy
+Token 可立即生效外，页面标记的运行参数需要重启 daemon 才会应用。

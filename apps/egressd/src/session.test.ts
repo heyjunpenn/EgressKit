@@ -45,9 +45,25 @@ test("persisted session bindings retain the requested sticky mode without exposi
   lease.release();
 });
 
+test("sticky sessions bind to egress IP instead of one transport node", () => {
+  const scheduler = new TrackingScheduler();
+  const store = new FaultingSessionStore();
+  const sessions = new SoftStickySessions({ scheduler, store });
+
+  sessions.acquire("crawler")?.release();
+  sessions.acquire("crawler")?.release();
+
+  assert.equal(store.binding?.exitIp, "203.0.113.24");
+  assert.equal(scheduler.lastExitIp, "203.0.113.24");
+});
+
 class TrackingScheduler {
   activeLeases = 0;
-  readonly #candidate = createSchedulerCandidate("only", new URL("http://127.0.0.1:20000"));
+  lastExitIp: string | undefined;
+  readonly #candidate = {
+    ...createSchedulerCandidate("only", new URL("http://127.0.0.1:20000")),
+    exitIp: "203.0.113.24",
+  };
 
   acquire(): SchedulerLease {
     this.activeLeases += 1;
@@ -66,6 +82,11 @@ class TrackingScheduler {
   }
 
   acquireById(): SchedulerLease {
+    return this.acquire();
+  }
+
+  acquireByExitIp(exitIp: string): SchedulerLease {
+    this.lastExitIp = exitIp;
     return this.acquire();
   }
 }

@@ -47,7 +47,17 @@ test("console snapshot is authenticated and redacts management data", async (t) 
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));
   const daemon = await startEgressd({
     adminToken: "console-admin",
+    exitIpProbe: async () => ({
+      city: "Tokyo",
+      country: "JP",
+      ip: "203.0.113.24",
+      provider: "ipinfo",
+      verifiedAt: 1_757_408_400_000,
+    }),
     fetchSubscription: async () => new Response("proxies: []"),
+    healthCheckJitterMs: 0,
+    healthCheckProbe: async () => true,
+    healthCheckUrls: [new URL("https://health.example/status")],
     host: "127.0.0.1",
     mihomoListener: new URL("http://127.0.0.1:20001"),
     port: 0,
@@ -72,13 +82,16 @@ test("console snapshot is authenticated and redacts management data", async (t) 
   });
   assert.equal(created.status, 202);
 
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
   const response = await fetch(`${origin}/console/snapshot`, {
     headers: { authorization: "Bearer console-admin" },
   });
   assert.equal(response.status, 200);
   const body = (await response.json()) as {
+    exitIps: Array<{ ip: string; location?: string; nodeCount: number }>;
     gateway: { host: string; port: number; ready: boolean };
-    nodes: Array<{ id: string; listener?: string }>;
+    nodes: Array<{ exitIp?: string; exitLocation?: string; id: string; listener?: string }>;
     sessions: unknown[];
     subscriptions: Array<{ locator: string }>;
   };
@@ -88,11 +101,27 @@ test("console snapshot is authenticated and redacts management data", async (t) 
     ready: true,
   });
   assert.equal(body.nodes[0]?.id, "configured");
+  assert.equal(body.nodes[0]?.exitIp, "203.0.113.24");
+  assert.equal(body.nodes[0]?.exitLocation, "JP-Tokyo");
+  assert.deepEqual(body.exitIps, [{ ip: "203.0.113.24", location: "JP-Tokyo", nodeCount: 1 }]);
   assert.equal(body.nodes[0]?.listener, undefined);
   assert.deepEqual(body.sessions, []);
   assert.equal(body.subscriptions.length, 1);
   assert.equal(body.subscriptions[0]?.locator, "https://provider.example/[redacted]");
   assert.doesNotMatch(JSON.stringify(body), /password|secret/);
+
+  const verification = await fetch(`${origin}/nodes/configured/verify-exit`, {
+    headers: { authorization: "Bearer console-admin" },
+    method: "POST",
+  });
+  assert.equal(verification.status, 200);
+  assert.deepEqual(await verification.json(), {
+    city: "Tokyo",
+    country: "JP",
+    ip: "203.0.113.24",
+    provider: "ipinfo",
+    verifiedAt: 1_757_408_400_000,
+  });
 });
 
 test("authenticated node enabled mutation controls scheduling health", async (t) => {
@@ -267,8 +296,9 @@ test("unauthenticated non-loopback proxy listeners require an explicit warned ov
 });
 
 test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) => {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-cli-state-"));
-  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const homeDirectory = await mkdtemp("/tmp/egresskit-cli-home-");
+  t.after(() => rm(homeDirectory, { force: true, recursive: true }));
+  const stateDirectory = join(homeDirectory, ".local", "state", "egresskit");
   const binaryDirectory = await mkdtemp(join(tmpdir(), "egresskit-cli-mihomo-"));
   t.after(() => rm(binaryDirectory, { force: true, recursive: true }));
   const binaryPath = join(binaryDirectory, "mihomo");
@@ -276,15 +306,21 @@ test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) 
   await chmod(binaryPath, 0o700);
   const mihomo = await startSimulatedMihomoListener();
   t.after(() => mihomo.close());
+  const settingsState = await openControlState(stateDirectory);
+  const settings = settingsState.loadRuntimeSettings("cli-admin-token");
+  settingsState.updateRuntimeSettings({
+    ...settings,
+    host: "127.0.0.1",
+    port: 0,
+    mihomoHttpListener: `http://${mihomo.host}:${mihomo.port}`,
+  });
+  await settingsState.close();
   const child = spawn(process.execPath, ["dist/cli.js"], {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
-      EGRESSKIT_HOST: "127.0.0.1",
       EGRESSKIT_ADMIN_TOKEN: "cli-admin-token",
-      EGRESSKIT_MIHOMO_HTTP_LISTENER: `http://${mihomo.host}:${mihomo.port}`,
-      EGRESSKIT_PORT: "0",
-      EGRESSKIT_STATE_DIRECTORY: stateDirectory,
+      HOME: homeDirectory,
       PATH: `${binaryDirectory}:${process.env.PATH ?? ""}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -656,7 +692,7 @@ test("each new HTTP proxy request performs a fresh rotate selection", async (t) 
 
   assert.deepEqual(
     observedRequests.map((request) => request.headers["x-egresskit-test-exit"]),
-    ["first", "first", "first", "second"],
+    ["first", "second", "first", "second"],
   );
 });
 

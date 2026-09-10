@@ -4,7 +4,15 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/motion/button/base";
 import { Checkbox } from "@/components/motion/checkbox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/motion/select";
 import { cn } from "@/lib/utils";
 import { EditableCell } from "./editable-cell";
 import { RowHandle } from "./row-handle";
@@ -32,6 +40,7 @@ const INPUT_COLUMN_WIDTH = 120;
 
 /** The root font size Tailwind's rem scale assumes, and the pre-measure guess. */
 const DEFAULT_ROOT_FONT_SIZE = 16;
+const PAGE_SIZE_OPTIONS = [10, 20, 30] as const;
 
 /**
  * What one `rem` is worth here, in px. The default until the first client
@@ -119,6 +128,13 @@ export function Table<T>({
     onSortChange,
   });
 
+  const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>(10);
+  const [requestedPage, setRequestedPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const page = Math.min(requestedPage, pageCount - 1);
+  const pageStart = page * pageSize;
+  const pagedRows = sortedRows.slice(pageStart, pageStart + pageSize);
+
   const { widths, startResize, moveResize, endResize } = useColumnResize({
     orderedColumns,
     thRefs,
@@ -134,7 +150,7 @@ export function Table<T>({
   });
 
   const virtualizer = useVirtualizer({
-    count: sortedRows.length,
+    count: pagedRows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => rowHeight,
     overscan,
@@ -223,19 +239,15 @@ export function Table<T>({
   const activeRowEl = activeRow ? rowRefs.current[activeRow.id] : null;
   // Real columns + checkbox; the trailing spacer adds one more in colSpans.
   const leadColumns = columns.length + (selectable ? 1 : 0);
+  const viewportHeight = Math.max(144, 48 + pagedRows.length * rowHeight);
 
   return (
-    <div
-      className={cn(
-        "w-full overflow-hidden rounded-2xl border border-border bg-background text-sm",
-        className,
-      )}
-    >
+    <div className={cn("w-full rounded-2xl border border-border bg-background text-sm", className)}>
       <div
         ref={scrollRef}
         onScroll={handleScroll}
         className="isolate overflow-auto"
-        style={{ height }}
+        style={{ height: Math.min(height, viewportHeight) }}
       >
         <table
           className={cn("border-collapse", sized ? "w-max" : undefined)}
@@ -285,7 +297,7 @@ export function Table<T>({
           />
 
           <tbody>
-            {sortedRows.length === 0 ? (
+            {pagedRows.length === 0 ? (
               loading ? (
                 <SkeletonRows
                   count={Math.max(1, Math.ceil(height / rowHeight))}
@@ -308,7 +320,7 @@ export function Table<T>({
                   </tr>
                 ) : null}
                 {virtualItems.map((vItem) => {
-                  const entry = sortedRows[vItem.index];
+                  const entry = pagedRows[vItem.index];
                   const isSelected = selected.has(entry.id);
                   return (
                     <tr
@@ -351,7 +363,7 @@ export function Table<T>({
                               onChange={(next) => onCellEdit?.(entry.id, column.key, next)}
                             />
                           ) : (
-                            readCell(entry.row, column)
+                            readCell(entry.row, column, pageStart + vItem.index)
                           )}
                         </td>
                       ))}
@@ -387,6 +399,59 @@ export function Table<T>({
           onEnter={() => activateRow(activeRow.id, activeRow.index)}
           onLeave={deactivateRow}
         />
+      ) : null}
+      {sortedRows.length > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-border border-t px-4 py-3 text-xs text-muted-foreground">
+          <span>
+            {pageStart + 1}–{Math.min(pageStart + pageSize, sortedRows.length)} /{" "}
+            {sortedRows.length}
+          </span>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2">
+              <span>每页</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(value) => {
+                  setPageSize(Number(value) as (typeof PAGE_SIZE_OPTIONS)[number]);
+                  setRequestedPage(0);
+                }}
+                className="w-20"
+              >
+                <SelectTrigger ariaLabel="每页条数" className="h-8 py-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((option) => (
+                    <SelectItem key={option} value={String(option)}>
+                      {String(option)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page === 0}
+              aria-label="上一页"
+              onClick={() => setRequestedPage(page - 1)}
+            >
+              上一页
+            </Button>
+            <span className="min-w-12 text-center text-foreground">
+              {page + 1} / {pageCount}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page >= pageCount - 1}
+              aria-label="下一页"
+              onClick={() => setRequestedPage(page + 1)}
+            >
+              下一页
+            </Button>
+          </div>
+        </div>
       ) : null}
     </div>
   );

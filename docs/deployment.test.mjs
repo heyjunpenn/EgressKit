@@ -15,7 +15,7 @@ test("deployment docs disclose the exact v1 support and state-security contract"
   assert.match(deployment, /SQLite[^\n]*明文/);
   assert.match(deployment, /状态目录[^\n]*(敏感|秘密)/);
   assert.match(deployment, /备份[^\n]*(凭据|敏感|秘密)/);
-  assert.match(deployment, /EGRESSKIT_PROXY_TOKEN/);
+  assert.doesNotMatch(deployment, /-e EGRESSKIT_PROXY_TOKEN/);
   assert.doesNotMatch(deployment, /EGRESSKIT_PROXY_TOKENS/);
   assert.match(deployment, /127\.0\.0\.1:8787:8787/);
   assert.match(deployment, /GitHub Release/);

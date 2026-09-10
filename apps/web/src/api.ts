@@ -14,6 +14,11 @@ export interface ApiClient {
 }
 
 export interface ConsoleSnapshot {
+  exitIps: Array<{
+    ip: string;
+    location?: string;
+    nodeCount: number;
+  }>;
   generatedAt: string;
   gateway: { host: string; port: number; ready: boolean };
   metrics: {
@@ -27,6 +32,10 @@ export interface ConsoleSnapshot {
     activeConnections: number;
     alias?: string;
     enabled: boolean;
+    exitIp?: string;
+    exitLocation?: string;
+    exitProvider?: string;
+    exitVerifiedAt?: number;
     id: string;
     latencyMs: number;
     status: string;
@@ -36,6 +45,7 @@ export interface ConsoleSnapshot {
   operationCounts: Record<string, number>;
   operations: Array<{
     id: string;
+    kind: "force" | "refresh";
     status: string;
     subscriptionId: string;
     updatedAt: string;
@@ -52,6 +62,7 @@ export interface ConsoleSnapshot {
     id: string;
     kind: "local" | "remote";
     locator: string;
+    name: string;
     nodeCount: number;
     revisionId?: number;
     status: string;
@@ -65,6 +76,35 @@ export interface OperationResponse {
   revisionId?: number;
   status: string;
   subscriptionId: string;
+}
+
+export interface RuntimeSettings {
+  healthCheckConcurrency: number;
+  healthCheckIntervalMs: number;
+  healthCheckJitterMs: number;
+  healthCheckSuccessThreshold: number;
+  healthCheckUrls: string[];
+  host: string;
+  mihomoBinary: string;
+  mihomoHttpListener: string;
+  minimumSubscriptionNodes: number;
+  port: number;
+  preconnectAttempts: number;
+  preconnectTimeoutMs: number;
+  proxyAuthEnabled: boolean;
+  proxyToken: string;
+  remoteSubscriptionRefreshIntervalMs: number;
+  sessionAbsoluteTtlMs: number;
+  sessionIdleTimeoutMs: number;
+  sessionMaximumActiveSessions: number;
+  sessionMaximumConcurrentConnections: number;
+  targetReputationEnabled: boolean;
+}
+
+export interface SettingsResponse {
+  restartRequired?: boolean;
+  restartRequiredFields: string[];
+  settings: RuntimeSettings;
 }
 
 export const consoleSnapshotPath = "/console/snapshot";

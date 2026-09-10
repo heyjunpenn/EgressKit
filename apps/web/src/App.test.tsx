@@ -8,6 +8,7 @@ import { App } from "./App";
 import { gatewayAddress } from "./pages";
 
 const snapshot = {
+  exitIps: [{ ip: "203.0.113.24", location: "JP-Tokyo", nodeCount: 1 }],
   generatedAt: "2026-09-09T09:00:00.000Z",
   gateway: { host: "127.0.0.1", port: 8787, ready: true },
   metrics: {
@@ -22,6 +23,8 @@ const snapshot = {
       activeConnections: 2,
       alias: "tokyo-a",
       enabled: true,
+      exitIp: "203.0.113.24",
+      exitLocation: "JP-Tokyo",
       id: "asia:tokyo",
       latencyMs: 42,
       status: "healthy",
@@ -33,6 +36,7 @@ const snapshot = {
   operations: [
     {
       id: "op-1",
+      kind: "refresh",
       status: "succeeded",
       subscriptionId: "asia",
       updatedAt: "2026-09-09T08:59:00.000Z",
@@ -53,10 +57,34 @@ const snapshot = {
       id: "asia",
       kind: "remote",
       locator: "https://provider.example/…",
+      name: "Provider Asia",
       nodeCount: 1,
       status: "healthy",
     },
   ],
+};
+
+const runtimeSettings = {
+  healthCheckConcurrency: 4,
+  healthCheckIntervalMs: 30_000,
+  healthCheckJitterMs: 5_000,
+  healthCheckSuccessThreshold: 1,
+  healthCheckUrls: ["https://www.gstatic.com/generate_204"],
+  host: "0.0.0.0",
+  mihomoBinary: "",
+  mihomoHttpListener: "",
+  minimumSubscriptionNodes: 1,
+  port: 8787,
+  preconnectAttempts: 3,
+  preconnectTimeoutMs: 10_000,
+  proxyAuthEnabled: true,
+  proxyToken: "old-proxy-token",
+  remoteSubscriptionRefreshIntervalMs: 600_000,
+  sessionAbsoluteTtlMs: 1_800_000,
+  sessionIdleTimeoutMs: 300_000,
+  sessionMaximumActiveSessions: 10_000,
+  sessionMaximumConcurrentConnections: 50,
+  targetReputationEnabled: false,
 };
 
 describe("console router", () => {
@@ -135,12 +163,27 @@ describe("console router", () => {
     expect(screen.queryByText(/Administrator|Admin 已认证|退出登录/)).toBeNull();
   });
 
+  it("presents the connection screen as a responsive product introduction and form", () => {
+    render(
+      <MemoryRouter initialEntries={["/app/connect"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("region", { name: "EgressKit 简介" })).toBeTruthy();
+    expect(screen.getByText("Clash/Vless -> Http Proxy")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "EgressKit 代理路由示意图" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "连接表单" })).toBeTruthy();
+    expect(screen.getByAltText("EgressKit").className).toContain("h-8");
+  });
+
   it.each([
     ["/app", "运行概览"],
     ["/app/subscriptions", "订阅管理"],
     ["/app/proxies", "代理管理"],
     ["/app/sessions", "活跃会话"],
     ["/app/playground", "快速操作"],
+    ["/app/settings", "设置"],
     ["/app/docs", "使用文档"],
   ])("renders authenticated route %s", async (path, label) => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
@@ -184,6 +227,46 @@ describe("console router", () => {
     expect(await screen.findByRole("main", { name: "运行概览面板" })).toBeTruthy();
   });
 
+  it("only edits the proxy token in the gateway section and resets it to a random value", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/settings") {
+        const settings = init?.method === "PUT" ? JSON.parse(String(init.body)) : runtimeSettings;
+        return new Response(JSON.stringify({ restartRequiredFields: [], settings }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(snapshot), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", request);
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/app/settings"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByLabelText("Proxy Token")).toBeTruthy();
+    expect(screen.queryByLabelText("监听地址")).toBeNull();
+    expect(screen.queryByLabelText("监听端口")).toBeNull();
+    expect(screen.queryByLabelText("Mihomo 路径")).toBeNull();
+    expect(screen.getByLabelText("探活间隔（秒）").getAttribute("value")).toBe("30");
+    expect(screen.getByLabelText("订阅刷新间隔（秒）").getAttribute("value")).toBe("600");
+
+    await user.click(screen.getByRole("button", { name: "随机重置 Proxy Token" }));
+    await waitFor(() => {
+      const put = request.mock.calls.find(([, init]) => init?.method === "PUT");
+      expect(put).toBeTruthy();
+      const body = JSON.parse(String(put?.[1]?.body));
+      expect(body.proxyToken).not.toBe("old-proxy-token");
+      expect(body.proxyToken).toMatch(/^ek_[a-f0-9]{48}$/);
+      expect(body.healthCheckIntervalMs).toBe(30_000);
+    });
+  });
+
   it("renders the branded header and language placeholder", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
@@ -210,7 +293,10 @@ describe("console router", () => {
     expect(screen.queryByRole("heading", { name: "订阅管理" })).toBeNull();
     expect(screen.getByRole("link", { name: "EgressKit" })).toBeTruthy();
     expect(screen.getByLabelText("界面语言 / Language")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "使用文档" })).toBeTruthy();
+    const docsLink = screen.getByRole("link", { name: "使用文档" });
+    expect(docsLink.getAttribute("href")).toBe("https://github.com/heyjunpenn/EgressKit#readme");
+    expect(docsLink.getAttribute("target")).toBe("_blank");
+    expect(docsLink.getAttribute("rel")).toBe("noopener noreferrer");
   });
 
   it("offers Chinese and English without translating or refetching", async () => {
@@ -231,14 +317,44 @@ describe("console router", () => {
     );
 
     await screen.findByRole("main", { name: "运行概览面板" });
-    await user.click(screen.getByLabelText("界面语言 / Language"));
+    const languageTrigger = screen.getByLabelText("界面语言 / Language");
+    await user.click(languageTrigger);
+    expect(languageTrigger.style.borderBottomLeftRadius).not.toBe("0px");
+    expect(languageTrigger.style.borderBottomRightRadius).not.toBe("0px");
     expect(screen.getByRole("option", { name: "中文" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "English" })).toBeTruthy();
     await user.click(screen.getByRole("option", { name: "English" }));
 
     expect(screen.getByText("代理入口")).toBeTruthy();
-    expect(screen.getByLabelText("界面语言 / Language").textContent).toContain("English");
+    expect(screen.getByLabelText("界面语言 / Language")).toBeTruthy();
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs out from the header and returns to the connection screen", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(snapshot), {
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/app"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("main", { name: "运行概览面板" });
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+
+    expect(sessionStorage.getItem("egresskit-admin-token")).toBeNull();
+    expect(await screen.findByRole("main")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "连接控制台" })).toBeTruthy();
   });
 
   it("maps a legacy hash to its canonical route and mounts one panel", async () => {
@@ -260,11 +376,61 @@ describe("console router", () => {
     );
 
     expect(await screen.findByRole("main", { name: "代理管理面板" })).toBeTruthy();
+    expect(screen.getByText("出口 IP")).toBeTruthy();
+    expect(screen.getByText("203.0.113.24")).toBeTruthy();
+    expect(screen.getByText("JP-Tokyo")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "验证 tokyo-a 出口 IP" })).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "运行概览" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "订阅管理" })).toBeNull();
     expect(screen.getByRole("button", { name: "代理管理" }).getAttribute("aria-current")).toBe(
       "page",
     );
+  });
+
+  it("filters proxy nodes by exit IP", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    const nodes = [
+      snapshot.nodes[0],
+      {
+        ...snapshot.nodes[0],
+        alias: "osaka-b",
+        exitIp: "198.51.100.8",
+        exitLocation: "JP-Osaka",
+        id: "asia:osaka",
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ...snapshot,
+              exitIps: [
+                { ip: "198.51.100.8", location: "JP-Osaka", nodeCount: 1 },
+                { ip: "203.0.113.24", location: "JP-Tokyo", nodeCount: 1 },
+              ],
+              nodes,
+            }),
+            {
+              headers: { "content-type": "application/json" },
+            },
+          ),
+      ),
+    );
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/app/proxies"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("osaka-b");
+    await user.click(screen.getByLabelText("按出口 IP 筛选节点"));
+    await user.click(screen.getByRole("option", { name: /198\.51\.100\.8.*JP-Osaka/ }));
+    expect(screen.getByText("osaka-b")).toBeTruthy();
+    expect(screen.queryByText("tokyo-a")).toBeNull();
   });
 
   it("switches routes without mounting the other management panels", async () => {
@@ -327,6 +493,42 @@ describe("console router", () => {
     expect(screen.queryByText(/个会话 · .*个绑定/)).toBeNull();
   });
 
+  it("confirms subscription deletion in the styled dialog", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/subscriptions/asia" && init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify(snapshot), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", request);
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/app/subscriptions"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("main", { name: "订阅管理面板" });
+    await user.click(screen.getByRole("button", { name: "删除 asia" }));
+    expect(screen.getByRole("dialog", { name: "删除订阅" })).toBeTruthy();
+    expect(request).not.toHaveBeenCalledWith(
+      "/subscriptions/asia",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith(
+        "/subscriptions/asia",
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
+  });
+
   it("teaches how active sessions appear in an empty state", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
@@ -353,7 +555,38 @@ describe("console router", () => {
     expect(await screen.findByText(/客户端使用 sticky 或 strict 模式建立连接后/)).toBeTruthy();
   });
 
-  it("deduplicates repeated connection snapshots", async () => {
+  it("paginates management tables with 10, 20, or 30 rows per page", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    const sessions = Array.from({ length: 31 }, (_, index) => ({
+      ...snapshot.sessions[0],
+      id: `session-${index + 1}`,
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ ...snapshot, sessions }), {
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/app/sessions"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("1–10 / 31")).toBeTruthy();
+    await user.click(screen.getByLabelText("每页条数"));
+    await user.click(screen.getByRole("option", { name: "20" }));
+    expect(screen.getByText("1–20 / 31")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    expect(screen.getByText("21–31 / 31")).toBeTruthy();
+  });
+
+  it("shows active proxies without exposing sampling history", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
       "fetch",
@@ -372,11 +605,13 @@ describe("console router", () => {
       </MemoryRouter>,
     );
 
-    await screen.findByText("最近 1 次");
+    await screen.findByText("活跃代理");
+    expect(screen.getByText("tokyo-a")).toBeTruthy();
+    expect(screen.getByText("当前活动连接")).toBeTruthy();
     await user.click(screen.getAllByRole("button", { name: "刷新" })[0] as HTMLElement);
 
-    await waitFor(() => expect(screen.getByText("最近 1 次")).toBeTruthy());
-    expect(screen.queryByText("最近 2 次")).toBeNull();
+    await waitFor(() => expect(screen.getByText("tokyo-a")).toBeTruthy());
+    expect(screen.queryByText("连接采样")).toBeNull();
   });
 
   it("explains process-lifetime metrics and localizes machine statuses", async () => {
@@ -399,8 +634,12 @@ describe("console router", () => {
 
     expect(await screen.findByText("本次运行成功连接")).toBeTruthy();
     expect(screen.getByText("本次运行失败连接")).toBeTruthy();
-    expect(screen.getAllByText("健康").length).toBeGreaterThan(0);
+    expect(screen.getByText("健康节点")).toBeTruthy();
+    expect(screen.getByText("订阅数")).toBeTruthy();
+    expect(screen.getByText("当前正在处理连接的代理节点")).toBeTruthy();
     expect(screen.getAllByText("就绪").length).toBeGreaterThan(0);
+    expect(screen.getByText("同步订阅")).toBeTruthy();
+    expect(screen.queryByText(snapshot.operations[0].subscriptionId)).toBeNull();
   });
 
   it("opens the requested route after validating the token", async () => {
@@ -425,7 +664,8 @@ describe("console router", () => {
     await user.click(screen.getByRole("button", { name: "连接" }));
 
     await waitFor(() => expect(screen.getByRole("main", { name: "订阅管理面板" })).toBeTruthy());
-    expect(screen.getAllByText("asia", { exact: false }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Provider Asia")).toBeTruthy();
+    expect(screen.queryByText("asia")).toBeNull();
     expect(screen.getByRole("navigation", { name: "主要导航" })).toBeTruthy();
     expect(sessionStorage.getItem("egresskit-admin-token")).toBe("admin-secret");
   });
@@ -471,16 +711,21 @@ describe("console router", () => {
     expect(sessionStorage.getItem("egresskit-admin-token")).toBeNull();
   });
 
-  it("uses a literal Playground token placeholder and generates every routing mode", async () => {
+  it("uses the real proxy token, generates routing modes, and executes a request", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
       "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify(snapshot), {
-            headers: { "content-type": "application/json" },
-          }),
-      ),
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        const body = path.includes("/playground/config")
+          ? { proxyToken: "real-proxy-token", proxyTokenAvailable: true }
+          : path.includes("/playground/execute")
+            ? { body: '{"origin":"203.0.113.1"}', durationMs: 42, headers: {}, status: 200 }
+            : snapshot;
+        return new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        });
+      }),
     );
     const user = userEvent.setup();
     render(
@@ -492,20 +737,31 @@ describe("console router", () => {
     await screen.findByRole("main", { name: "快速操作面板" });
     expect(screen.queryByText("请在你信任的终端中执行")).toBeNull();
     expect(screen.queryByText("命令已复制")).toBeNull();
-    expect(screen.getByText(/rotate:PROXY_TOKEN/)).toBeTruthy();
-    expect(screen.queryByText(/\$PROXY_TOKEN/)).toBeNull();
+    expect(await screen.findByText(/rotate:real-proxy-token/)).toBeTruthy();
 
     await user.click(screen.getByLabelText("代理模式"));
     await user.click(screen.getByRole("option", { name: "Strict sticky" }));
-    expect(screen.getByText(/strict\.session-demo:PROXY_TOKEN/)).toBeTruthy();
+    expect(screen.getByText(/strict\.session-demo:real-proxy-token/)).toBeTruthy();
     await user.click(screen.getByLabelText("代理模式"));
     await user.click(screen.getByRole("option", { name: "指定节点" }));
-    expect(screen.getByText(/node\.tokyo-a:PROXY_TOKEN/)).toBeTruthy();
+    expect(screen.getByText(/node\.tokyo-a:real-proxy-token/)).toBeTruthy();
 
     const target = screen.getByLabelText("目标 URL");
     await user.clear(target);
     await user.type(target, "https://example.com; touch /tmp/pwned");
     expect(screen.getByText(/'https:\/\/example\.com; touch \/tmp\/pwned'/)).toBeTruthy();
+    await user.clear(target);
+    await user.type(target, "https://example.com");
+    await user.click(screen.getByRole("button", { name: "发起请求" }));
+    expect(await screen.findByText(/203\.0\.113\.1/)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "请求日志" })).toBeTruthy();
+    const requestLog = screen.getByRole("button", { name: /https:\/\/example\.com.*成功/ });
+    expect(requestLog.textContent).toContain("HTTP 200");
+    await user.click(screen.getByRole("button", { name: "检查出口 IP" }));
+    expect((target as HTMLInputElement).value).toBe("https://ipinfo.io/json");
+    await user.click(requestLog);
+    expect((target as HTMLInputElement).value).toBe("https://example.com");
+    expect(screen.getByText(/203\.0\.113\.1/)).toBeTruthy();
   });
 
   it("uses the browser hostname when the daemon listens on all interfaces", async () => {

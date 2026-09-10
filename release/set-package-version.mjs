@@ -1,14 +1,12 @@
 import { readFile, writeFile } from "node:fs/promises";
 
 const [, , tag, packagePath] = process.argv;
-const match = tag?.match(
-  /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
-);
+const match = tag?.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
 
 if (!(match && packagePath)) {
-  throw new Error("release tag must be a valid v-prefixed semantic version");
+  throw new Error("release tag must be a valid x.y.z semantic version without a prefix");
 }
 
 const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
-packageJson.version = tag.slice(1);
+packageJson.version = tag;
 await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);

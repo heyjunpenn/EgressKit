@@ -10,6 +10,21 @@ import { test } from "node:test";
 import { openControlState } from "./state.js";
 import { importLocalVlessYaml } from "./subscription.js";
 
+test("runtime settings are initialized from defaults and persist updates", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-settings-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const first = await openControlState(stateDirectory);
+  const defaults = first.loadRuntimeSettings("admin-secret");
+  assert.equal(defaults.proxyToken, "admin-secret");
+  assert.equal(defaults.remoteSubscriptionRefreshIntervalMs, 600_000);
+  first.updateRuntimeSettings({ ...defaults, port: 9797, proxyToken: "proxy-secret" });
+  await first.close();
+  const reopened = await openControlState(stateDirectory);
+  t.after(() => reopened.close());
+  assert.equal(reopened.loadRuntimeSettings("different-admin").port, 9797);
+  assert.equal(reopened.loadRuntimeSettings("different-admin").proxyToken, "proxy-secret");
+});
+
 test("control state enables durable SQLite settings and holds a single-writer lock", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-state-"));
   t.after(() => rm(stateDirectory, { force: true, recursive: true }));
@@ -36,6 +51,53 @@ test("control state persists manual node enabled overrides", async (t) => {
   const restored = await openControlState(stateDirectory);
   t.after(() => restored.close());
   assert.equal(restored.getNodeEnabledOverrides().get("subscription:node"), false);
+});
+
+test("control state persists egress identity by node generation", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-exit-identity-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const first = await openControlState(stateDirectory);
+  first.saveExitIdentity({
+    city: "Tokyo",
+    country: "JP",
+    generation: "sha256:g1",
+    ip: "203.0.113.24",
+    logicalId: "asia:tokyo",
+    provider: "ipinfo",
+    verifiedAt: 1_757_408_400_000,
+  });
+  await first.close();
+
+  const restored = await openControlState(stateDirectory);
+  t.after(() => restored.close());
+  assert.deepEqual(restored.getExitIdentity("asia:tokyo", "sha256:g1"), {
+    city: "Tokyo",
+    country: "JP",
+    generation: "sha256:g1",
+    ip: "203.0.113.24",
+    logicalId: "asia:tokyo",
+    provider: "ipinfo",
+    verifiedAt: 1_757_408_400_000,
+  });
+  assert.equal(restored.getExitIdentity("asia:tokyo", "sha256:g2"), undefined);
+});
+
+test("console operation summaries describe the requested action", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-operation-summary-"));
+  t.after(() => rm(stateDirectory, { force: true, recursive: true }));
+  const state = await openControlState(stateDirectory);
+  t.after(() => state.close());
+
+  const created = state.createRemoteSubscription("https://provider.example/subscription.yaml");
+  assert.equal(state.getSubscription(created.subscriptionId)?.name, "provider.example");
+
+  assert.deepEqual(state.listConsoleOperations()[0], {
+    id: created.operationId,
+    kind: "refresh",
+    status: "queued",
+    subscriptionId: created.subscriptionId,
+    updatedAt: state.listConsoleOperations()[0]?.updatedAt,
+  });
 });
 
 test("session rebinding updates the persisted routing mode", async (t) => {

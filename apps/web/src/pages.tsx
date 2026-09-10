@@ -3,15 +3,23 @@ import {
   CheckCircle,
   Copy,
   MagnifyingGlass,
+  PencilSimple,
   Plus,
   Pulse,
+  Trash,
   UsersThree,
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { useConsole } from "./App";
-import type { ApiClient, ConsoleSnapshot, OperationResponse } from "./api";
+import type {
+  ApiClient,
+  ConsoleSnapshot,
+  OperationResponse,
+  RuntimeSettings,
+  SettingsResponse,
+} from "./api";
 import { AnimatedBadge, type AnimatedBadgeStatus } from "./components/motion/animated-badge";
 import { Button } from "./components/motion/button/base";
 import { Input } from "./components/motion/input";
@@ -25,6 +33,7 @@ import {
 } from "./components/motion/select";
 import { Switch } from "./components/motion/switch";
 import { Table, type TableColumn } from "./components/motion/table";
+import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Textarea } from "./components/ui/textarea";
 import { gatewayAddress } from "./lib/gateway-address";
@@ -34,6 +43,21 @@ export { gatewayAddress } from "./lib/gateway-address";
 type Subscription = ConsoleSnapshot["subscriptions"][number];
 type Node = ConsoleSnapshot["nodes"][number];
 type Session = ConsoleSnapshot["sessions"][number];
+type PlaygroundResult = {
+  body: string;
+  durationMs: number;
+  headers: Record<string, string | string[]>;
+  status: number;
+};
+type PlaygroundLog = {
+  error?: string;
+  id: string;
+  mode: string;
+  node?: string;
+  requestedAt: string;
+  result?: PlaygroundResult;
+  target: string;
+};
 
 function statusVariant(value: string): AnimatedBadgeStatus {
   if (["healthy", "ready", "succeeded", "accepted"].includes(value)) return "success";
@@ -116,8 +140,14 @@ function Modal({
 
   useEffect(() => {
     const dialog = dialogRef.current;
-    if (dialog && !dialog.open) dialog.showModal();
-    return () => dialog?.close();
+    if (dialog && !dialog.open) {
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+    }
+    return () => {
+      if (dialog && typeof dialog.close === "function") dialog.close();
+      else dialog?.removeAttribute("open");
+    };
   }, []);
 
   return (
@@ -134,9 +164,11 @@ function Modal({
         <h2 id="modal-title" className="text-lg font-semibold">
           {title}
         </h2>
-        <Button variant="ghost" size="icon" aria-label="关闭弹窗" onClick={onClose}>
-          <X size={18} />
-        </Button>
+        <Tooltip content="关闭">
+          <Button variant="ghost" size="icon" aria-label="关闭弹窗" onClick={onClose}>
+            <X size={18} />
+          </Button>
+        </Tooltip>
       </div>
       {children}
     </dialog>
@@ -144,28 +176,26 @@ function Modal({
 }
 
 export function OverviewPage() {
-  const { connectionSamples, refresh, snapshot } = useConsole();
+  const { refresh, snapshot } = useConsole();
   const { metrics } = snapshot;
+  const activeProxies = snapshot.nodes
+    .filter((node) => node.activeConnections > 0)
+    .sort((left, right) => right.activeConnections - left.activeConnections)
+    .slice(0, 4);
   const gateway = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
   const [copied, setCopied] = useState(false);
-  const lifecycleStatuses = [
-    "warming",
-    "healthy",
-    "degraded",
-    "cooldown",
-    "draining",
-    "disabled",
-  ] as const;
-  const lifecycleNodeCount = lifecycleStatuses.reduce(
-    (total, status) => total + (snapshot.nodeStatusCounts[status] ?? 0),
-    0,
-  );
   const copyGateway = async () => {
     await navigator.clipboard?.writeText(gateway);
     setCopied(true);
     setTimeout(() => setCopied(false), 1_500);
   };
   const stats = [
+    {
+      label: "订阅数",
+      value: snapshot.subscriptions.length,
+      icon: Plus,
+      iconClassName: "text-foreground",
+    },
     {
       label: "健康节点",
       value: metrics.healthyNodes,
@@ -233,7 +263,7 @@ export function OverviewPage() {
 
       <section
         aria-label="关键指标"
-        className="grid grid-cols-2 gap-x-6 gap-y-7 rounded-2xl bg-card px-5 py-7 sm:grid-cols-4 sm:px-6 md:px-8 md:py-8"
+        className="grid grid-cols-2 gap-x-6 gap-y-7 rounded-2xl bg-card px-5 py-7 sm:grid-cols-3 sm:px-6 lg:grid-cols-5 md:px-8 md:py-8"
       >
         {stats.map(({ icon: Icon, iconClassName, label, suffix, value }) => (
           <div className="flex min-w-0 items-start gap-3" key={label}>
@@ -251,43 +281,35 @@ export function OverviewPage() {
         ))}
       </section>
 
-      <section className="rounded-2xl bg-muted px-5 py-7 sm:px-6 md:px-8">
-        <div className="flex items-baseline justify-between gap-4">
-          <h2 className="text-lg font-semibold">节点生命周期</h2>
-          <span className="shrink-0 text-xs text-muted-foreground">
-            共 {lifecycleNodeCount} 个节点
-          </span>
-        </div>
-        <div className="mt-6 grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          {lifecycleStatuses.map((status) => (
-            <div className="flex items-center justify-between gap-4 py-1 sm:block" key={status}>
-              <StatusBadge value={status} />
-              <NumberTicker
-                value={snapshot.nodeStatusCounts[status] ?? 0}
-                className="text-lg font-semibold sm:mt-3 sm:block"
-              />
-            </div>
-          ))}
-        </div>
-      </section>
-
       <div className="grid gap-8 md:grid-cols-2">
         <section className="rounded-2xl bg-card px-5 py-7 sm:px-6 md:px-8">
           <div className="flex items-center justify-between gap-3">
-            <h2 className="font-semibold">连接采样</h2>
-            <span className="text-xs text-muted-foreground">
-              最近 {connectionSamples.length} 次
-            </span>
+            <div>
+              <h2 className="font-semibold">活跃代理</h2>
+              <p className="mt-1 text-xs text-muted-foreground">当前正在处理连接的代理节点</p>
+            </div>
+            <span className="text-xs text-muted-foreground">{activeProxies.length} 个</span>
           </div>
-          <div className="mt-4 flex flex-wrap gap-2">
-            {connectionSamples.length ? (
-              connectionSamples.slice(-6).map((sample) => (
-                <AnimatedBadge key={sample.at} status="info" showIcon={false}>
-                  {new Date(sample.at).toLocaleTimeString()} · {sample.value}
-                </AnimatedBadge>
+          <div className="mt-4 divide-y divide-border">
+            {activeProxies.length ? (
+              activeProxies.map((node) => (
+                <div
+                  className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
+                  key={node.id}
+                >
+                  <div className="min-w-0">
+                    <strong className="block truncate text-sm">
+                      {node.alias ?? nodeDisplayName(node.id)}
+                    </strong>
+                    <p className="text-xs text-muted-foreground">当前活动连接</p>
+                  </div>
+                  <AnimatedBadge status="success" showIcon={false}>
+                    {node.activeConnections} 个
+                  </AnimatedBadge>
+                </div>
               ))
             ) : (
-              <AnimatedBadge status="neutral">等待下一次采样</AnimatedBadge>
+              <AnimatedBadge status="neutral">暂无活跃代理</AnimatedBadge>
             )}
           </div>
         </section>
@@ -308,7 +330,9 @@ export function OverviewPage() {
                 key={operation.id}
               >
                 <div className="min-w-0">
-                  <strong className="block truncate text-sm">{operation.subscriptionId}</strong>
+                  <strong className="block text-sm">
+                    {operation.kind === "force" ? "强制应用订阅" : "同步订阅"}
+                  </strong>
                   <p className="text-xs text-muted-foreground">
                     {new Date(operation.updatedAt).toLocaleString()}
                   </p>
@@ -329,7 +353,11 @@ export function OverviewPage() {
 export function SubscriptionsPage() {
   const { api, refresh, snapshot } = useConsole();
   const [adding, setAdding] = useState(false);
+  const [editingSubscription, setEditingSubscription] = useState<Subscription>();
+  const [deletingSubscription, setDeletingSubscription] = useState<Subscription>();
+  const [forcingRevisionId, setForcingRevisionId] = useState<number>();
   const [kind, setKind] = useState<"local" | "remote">("remote");
+  const [name, setName] = useState("");
   const [value, setValue] = useState("");
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
@@ -347,7 +375,7 @@ export function SubscriptionsPage() {
     (item) =>
       (sourceFilter === "all" || item.kind === sourceFilter) &&
       (statusFilter === "all" || item.status === statusFilter) &&
-      `${item.id} ${item.locator}`.toLowerCase().includes(query.toLowerCase()),
+      `${item.id} ${item.name} ${item.locator}`.toLowerCase().includes(query.toLowerCase()),
   );
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -355,7 +383,10 @@ export function SubscriptionsPage() {
     try {
       const operation =
         kind === "remote"
-          ? await api.send<OperationResponse>("/subscriptions/remote", "POST", { url: value })
+          ? await api.send<OperationResponse>("/subscriptions/remote", "POST", {
+              name,
+              url: value,
+            })
           : await api.sendText<{ nodes: unknown[] }>("/subscriptions/local", value);
       setNotice(
         "operationId" in operation
@@ -363,6 +394,7 @@ export function SubscriptionsPage() {
           : "本地订阅已应用",
       );
       setValue("");
+      setName("");
       setAdding(false);
       await refresh();
       if ("operationId" in operation) {
@@ -386,10 +418,39 @@ export function SubscriptionsPage() {
       setRetryAction(() => () => void refreshSubscription(id));
     }
   };
+  const updateSubscription = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!editingSubscription) return;
+    try {
+      const operation = await api.send<OperationResponse>(
+        `/subscriptions/${encodeURIComponent(editingSubscription.id)}`,
+        "PUT",
+        { name, url: value },
+      );
+      setEditingSubscription(undefined);
+      setValue("");
+      setName("");
+      setNotice("订阅地址已更新，正在同步");
+      await refresh();
+      watchOperation(operation, () => void refreshSubscription(editingSubscription.id));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "订阅更新失败");
+    }
+  };
+  const deleteSubscription = async (id: string) => {
+    try {
+      await api.send(`/subscriptions/${encodeURIComponent(id)}`, "DELETE");
+      setDeletingSubscription(undefined);
+      setNotice("订阅已删除");
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "订阅删除失败");
+    }
+  };
   const forceRevision = async (revisionId: number) => {
-    if (!window.confirm("强制应用可疑 revision 会显著改变节点池，确定继续吗？")) return;
     try {
       const operation = await api.send<OperationResponse>(`/revisions/${revisionId}/force`, "POST");
+      setForcingRevisionId(undefined);
       setNotice(`强制应用任务 ${operation.operationId} 已进入队列`);
       watchOperation(operation, () => void forceRevision(revisionId));
     } catch (error) {
@@ -400,11 +461,17 @@ export function SubscriptionsPage() {
 
   const columns: TableColumn<Subscription>[] = [
     {
-      key: "id",
-      header: "订阅",
+      key: "sequence",
+      header: "序号",
+      width: "5rem",
+      cell: (_item, index) => index + 1,
+    },
+    {
+      key: "name",
+      header: "名称",
       width: "12rem",
       sortable: true,
-      cell: (item) => <strong>{item.id}</strong>,
+      cell: (item) => <strong>{item.name}</strong>,
     },
     {
       key: "locator",
@@ -431,22 +498,51 @@ export function SubscriptionsPage() {
       key: "actions",
       header: "操作",
       align: "right",
-      width: "10rem",
+      width: "14rem",
       cell: (item) => (
         <div className="flex justify-end gap-2">
           {item.status === "suspicious" && item.revisionId ? (
-            <Button size="sm" onClick={() => void forceRevision(item.revisionId as number)}>
+            <Button size="sm" onClick={() => setForcingRevisionId(item.revisionId as number)}>
               强制应用
             </Button>
           ) : null}
-          <Button
-            variant="secondary"
-            size="icon"
-            aria-label={`刷新 ${item.id}`}
-            onClick={() => void refreshSubscription(item.id)}
-          >
-            <ArrowClockwise size={17} />
-          </Button>
+          <Tooltip content="刷新订阅">
+            <Button
+              variant="secondary"
+              size="icon"
+              aria-label={`刷新 ${item.id}`}
+              onClick={() => void refreshSubscription(item.id)}
+            >
+              <ArrowClockwise size={17} />
+            </Button>
+          </Tooltip>
+          {item.kind === "remote" ? (
+            <Tooltip content="编辑订阅">
+              <Button
+                variant="secondary"
+                size="icon"
+                aria-label={`编辑 ${item.id}`}
+                onClick={() => {
+                  setValue("");
+                  setName(item.name);
+                  setNotice("");
+                  setEditingSubscription(item);
+                }}
+              >
+                <PencilSimple size={17} />
+              </Button>
+            </Tooltip>
+          ) : null}
+          <Tooltip content="删除订阅">
+            <Button
+              size="icon"
+              className="bg-destructive text-white hover:bg-destructive/90"
+              aria-label={`删除 ${item.id}`}
+              onClick={() => setDeletingSubscription(item)}
+            >
+              <Trash size={17} />
+            </Button>
+          </Tooltip>
         </div>
       ),
     },
@@ -474,14 +570,22 @@ export function SubscriptionsPage() {
                 </SelectContent>
               </Select>
               {kind === "remote" ? (
-                <Input
-                  aria-label="订阅 URL"
-                  type="url"
-                  required
-                  placeholder="https://provider.example/sub"
-                  value={value}
-                  onChange={setValue}
-                />
+                <div className="space-y-4">
+                  <Input
+                    aria-label="订阅名称"
+                    placeholder="可选，默认使用订阅域名"
+                    value={name}
+                    onChange={setName}
+                  />
+                  <Input
+                    aria-label="订阅 URL"
+                    type="url"
+                    required
+                    placeholder="https://provider.example/sub"
+                    value={value}
+                    onChange={setValue}
+                  />
+                </div>
               ) : (
                 <Textarea
                   className="min-h-28"
@@ -505,6 +609,85 @@ export function SubscriptionsPage() {
               <Button type="submit">导入</Button>
             </div>
           </form>
+        </Modal>
+      ) : null}
+      {editingSubscription ? (
+        <Modal
+          title="编辑订阅"
+          onClose={() => {
+            setEditingSubscription(undefined);
+            setValue("");
+            setName("");
+          }}
+        >
+          <form className="space-y-5 px-6 pb-6 pt-5" onSubmit={updateSubscription}>
+            <p className="text-sm text-muted-foreground">
+              当前地址：{editingSubscription.locator}。为保护凭据，管理端不会返回完整 URL。
+            </p>
+            <Input
+              aria-label="订阅名称"
+              placeholder="可选，默认使用订阅域名"
+              value={name}
+              onChange={setName}
+            />
+            <Input
+              aria-label="新的订阅 URL"
+              type="url"
+              required
+              placeholder="https://provider.example/sub"
+              value={value}
+              onChange={setValue}
+            />
+            {notice ? <p className="text-sm text-destructive">{notice}</p> : null}
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setEditingSubscription(undefined);
+                  setName("");
+                }}
+              >
+                取消
+              </Button>
+              <Button type="submit">保存并同步</Button>
+            </div>
+          </form>
+        </Modal>
+      ) : null}
+      {deletingSubscription ? (
+        <Modal title="删除订阅" onClose={() => setDeletingSubscription(undefined)}>
+          <div className="space-y-6 px-6 pb-6 pt-5">
+            <p className="text-sm leading-6 text-muted-foreground">
+              确定删除“{deletingSubscription.name}”吗？删除后，其节点将停止接收新连接。
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={() => setDeletingSubscription(undefined)}>
+                取消
+              </Button>
+              <Button
+                className="bg-destructive text-white hover:bg-destructive/90"
+                onClick={() => void deleteSubscription(deletingSubscription.id)}
+              >
+                确认删除
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      ) : null}
+      {forcingRevisionId !== undefined ? (
+        <Modal title="强制应用订阅" onClose={() => setForcingRevisionId(undefined)}>
+          <div className="space-y-6 px-6 pb-6 pt-5">
+            <p className="text-sm leading-6 text-muted-foreground">
+              该版本被判定为可疑，强制应用可能显著改变当前节点池。确定继续吗？
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={() => setForcingRevisionId(undefined)}>
+                取消
+              </Button>
+              <Button onClick={() => void forceRevision(forcingRevisionId)}>确认应用</Button>
+            </div>
+          </div>
         </Modal>
       ) : null}
       {notice && !adding ? (
@@ -596,12 +779,16 @@ export function ProxiesPage() {
   const { api, refresh, snapshot } = useConsole();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
+  const [exitIpFilter, setExitIpFilter] = useState("all");
   const [editing, setEditing] = useState<string>();
   const [alias, setAlias] = useState("");
   const [notice, setNotice] = useState("");
+  const [verifying, setVerifying] = useState<string>();
+  const exitIpOptions = snapshot.exitIps;
   const visible = snapshot.nodes.filter(
     (node) =>
       (filter === "all" || node.status === filter) &&
+      (exitIpFilter === "all" || node.exitIp === exitIpFilter) &&
       `${node.id} ${node.alias ?? ""}`.toLowerCase().includes(query.toLowerCase()),
   );
   const toggle = async (id: string, enabled: boolean) => {
@@ -623,14 +810,34 @@ export function ProxiesPage() {
       setNotice(error instanceof Error ? error.message : "别名保存失败");
     }
   };
+  const verifyExit = async (node: Node) => {
+    setVerifying(node.id);
+    try {
+      const identity = await api.send<{ city?: string; country?: string; ip: string }>(
+        `/nodes/${encodeURIComponent(node.id)}/verify-exit`,
+        "POST",
+      );
+      setNotice(`出口验证成功：${identity.ip}`);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "出口验证失败");
+    } finally {
+      setVerifying(undefined);
+    }
+  };
 
   const columns: TableColumn<Node>[] = [
     {
+      key: "sequence",
+      header: "序号",
+      width: "4rem",
+      cell: (_node, index) => index + 1,
+    },
+    {
       key: "id",
       header: "节点",
-      width: "18rem",
       sortable: true,
-      sortValue: (node) => node.alias ?? node.id,
+      sortValue: (node) => node.alias ?? nodeDisplayName(node.id),
       cell: (node) =>
         editing === node.id ? (
           <form
@@ -646,9 +853,11 @@ export function ProxiesPage() {
               onChange={setAlias}
               className="max-w-44"
             />
-            <Button variant="secondary" size="icon" type="submit" aria-label="保存别名">
-              <CheckCircle />
-            </Button>
+            <Tooltip content="保存别名">
+              <Button variant="secondary" size="icon" type="submit" aria-label="保存别名">
+                <CheckCircle />
+              </Button>
+            </Tooltip>
           </form>
         ) : (
           <Button
@@ -659,38 +868,50 @@ export function ProxiesPage() {
               setAlias(node.alias ?? "");
             }}
           >
-            <span>
-              <strong className="block">{node.alias ?? node.id}</strong>
-              {node.alias ? <small className="text-muted-foreground">{node.id}</small> : null}
-            </span>
+            <strong className="block truncate">{node.alias ?? nodeDisplayName(node.id)}</strong>
           </Button>
         ),
     },
     {
+      key: "exitIp",
+      header: "出口 IP",
+      width: "10rem",
+      sortable: true,
+      sortValue: (node) => node.exitIp ?? "",
+      cell: (node) => (
+        <div className="leading-tight">
+          <span className="font-mono text-sm">{node.exitIp ?? "—"}</span>
+          {node.exitLocation ? (
+            <span className="mt-1 block text-xs text-muted-foreground">{node.exitLocation}</span>
+          ) : null}
+        </div>
+      ),
+    },
+    {
       key: "status",
       header: "状态",
-      width: "9rem",
+      width: "8rem",
       sortable: true,
       cell: (node) => <StatusBadge value={node.status} />,
     },
     {
       key: "latencyMs",
       header: "延迟",
-      width: "8rem",
+      width: "6rem",
       sortable: true,
       cell: (node) => `${node.latencyMs}ms`,
     },
     {
       key: "activeConnections",
       header: "连接",
-      width: "8rem",
+      width: "6rem",
       sortable: true,
       cell: (node) => <NumberTicker value={node.activeConnections} />,
     },
     {
       key: "successRate",
       header: "成功率",
-      width: "9rem",
+      width: "7rem",
       sortable: true,
       cell: (node) => (
         <NumberTicker value={node.successRate * 100} suffix="%" className="font-medium" />
@@ -699,13 +920,31 @@ export function ProxiesPage() {
     {
       key: "enabled",
       header: "调度",
-      width: "8rem",
+      width: "6rem",
       cell: (node) => (
         <Switch
           checked={node.enabled}
           ariaLabel={`${node.enabled ? "停用" : "启用"} ${node.alias ?? node.id}`}
           onCheckedChange={(enabled) => void toggle(node.id, enabled)}
         />
+      ),
+    },
+    {
+      key: "actions",
+      header: "操作",
+      width: "5rem",
+      cell: (node) => (
+        <Tooltip content="验证出口 IP">
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label={`验证 ${node.alias ?? nodeDisplayName(node.id)} 出口 IP`}
+            disabled={verifying === node.id}
+            onClick={() => void verifyExit(node)}
+          >
+            <Pulse size={17} />
+          </Button>
+        </Tooltip>
       ),
     },
   ];
@@ -723,7 +962,7 @@ export function ProxiesPage() {
       ) : null}
       <Card>
         <CardContent className="space-y-4">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[13rem_minmax(14rem,1fr)_auto]">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[12rem_15rem_minmax(14rem,1fr)_auto]">
             <Select value={filter} onValueChange={setFilter}>
               <SelectTrigger ariaLabel="按状态筛选节点">
                 <SelectValue />
@@ -737,6 +976,19 @@ export function ProxiesPage() {
                     </SelectItem>
                   ),
                 )}
+              </SelectContent>
+            </Select>
+            <Select value={exitIpFilter} onValueChange={setExitIpFilter}>
+              <SelectTrigger ariaLabel="按出口 IP 筛选节点">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部出口 IP</SelectItem>
+                {exitIpOptions.map(({ ip, location, nodeCount }) => (
+                  <SelectItem key={ip} value={ip}>
+                    {location ? `${ip} · ${location}` : ip}（{nodeCount}）
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <Input
@@ -844,12 +1096,200 @@ export function SessionsPage() {
   );
 }
 
+export function SettingsPage() {
+  const { api } = useConsole();
+  const [settings, setSettings] = useState<RuntimeSettings>();
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void api
+      .get<SettingsResponse>("/settings")
+      .then((result) => setSettings(result.settings))
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : "无法读取设置");
+      });
+  }, [api]);
+
+  const update = <K extends keyof RuntimeSettings>(key: K, value: RuntimeSettings[K]) => {
+    setSettings((current) => (current ? { ...current, [key]: value } : current));
+  };
+  const persist = async (next: RuntimeSettings) => {
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.send<SettingsResponse>("/settings", "PUT", next);
+      setSettings(result.settings);
+      setNotice(
+        result.restartRequired ? "设置已保存，部分修改将在重启服务后生效。" : "设置已保存并生效。",
+      );
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "保存设置失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    if (settings) void persist(settings);
+  };
+
+  if (!settings)
+    return (
+      <div className="py-20 text-center text-sm text-muted-foreground">
+        {error || "正在读取设置…"}
+      </div>
+    );
+  const numberField = (key: keyof RuntimeSettings, label: string, suffix?: string) => (
+    <div className="space-y-2 text-sm">
+      <Input
+        label={suffix ? `${label}（${suffix}）` : label}
+        type="number"
+        value={String(settings[key])}
+        onChange={(value) => update(key, Number(value) as never)}
+      />
+    </div>
+  );
+  const secondsField = (key: keyof RuntimeSettings, label: string) => (
+    <div className="space-y-2 text-sm">
+      <Input
+        label={`${label}（秒）`}
+        type="number"
+        value={String(Number(settings[key]) / 1_000)}
+        onChange={(value) => update(key, (Number(value) * 1_000) as never)}
+      />
+    </div>
+  );
+  const textField = (
+    key: keyof RuntimeSettings,
+    label: string,
+    placeholder?: string,
+    type = "text",
+  ) => (
+    <div className="space-y-2 text-sm">
+      <Input
+        label={label}
+        type={type}
+        value={String(settings[key])}
+        placeholder={placeholder}
+        onChange={(value) => update(key, value as never)}
+      />
+    </div>
+  );
+
+  return (
+    <form className="space-y-6" onSubmit={save}>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-sm text-muted-foreground">运行配置保存在本机 SQLite 数据库中</p>
+          <h1 className="mt-1 text-2xl font-semibold">设置</h1>
+        </div>
+        <Button type="submit" disabled={saving}>
+          {saving ? "保存中…" : "保存设置"}
+        </Button>
+      </div>
+      {(error || notice) && (
+        <div
+          role="status"
+          className={`rounded-xl px-4 py-3 text-sm ${error ? "bg-destructive/10 text-destructive" : "bg-muted"}`}
+        >
+          {error || notice}
+        </div>
+      )}
+      <section className="rounded-2xl bg-card p-5 sm:p-6">
+        <h2 className="mb-5 text-lg font-semibold">服务与代理入口</h2>
+        <div className="flex items-end gap-3">
+          <div className="min-w-0 flex-1">
+            {textField("proxyToken", "Proxy Token", "", "password")}
+          </div>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={saving}
+            aria-label="随机重置 Proxy Token"
+            onClick={() => {
+              const bytes = crypto.getRandomValues(new Uint8Array(24));
+              const proxyToken = `ek_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+              void persist({ ...settings, proxyToken });
+            }}
+          >
+            随机重置
+          </Button>
+        </div>
+      </section>
+      <section className="rounded-2xl bg-card p-5 sm:p-6">
+        <h2 className="mb-5 text-lg font-semibold">探活与订阅</h2>
+        <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-3">
+          <div className="space-y-2 text-sm md:col-span-2 lg:col-span-3">
+            <label className="font-medium" htmlFor="health-check-urls">
+              探活 URL（每行一个）
+            </label>
+            <Textarea
+              id="health-check-urls"
+              value={settings.healthCheckUrls.join("\n")}
+              onChange={(event) =>
+                update(
+                  "healthCheckUrls",
+                  event.target.value
+                    .split("\n")
+                    .map((v) => v.trim())
+                    .filter(Boolean),
+                )
+              }
+            />
+          </div>
+          {secondsField("healthCheckIntervalMs", "探活间隔")}
+          {secondsField("healthCheckJitterMs", "随机抖动")}
+          {numberField("healthCheckConcurrency", "探活并发")}
+          {numberField("healthCheckSuccessThreshold", "成功阈值")}
+          {numberField("minimumSubscriptionNodes", "订阅最少节点")}
+          {secondsField("remoteSubscriptionRefreshIntervalMs", "订阅刷新间隔")}
+          {numberField("preconnectAttempts", "预连接尝试次数")}
+          {secondsField("preconnectTimeoutMs", "预连接超时")}
+          <div className="flex items-end pb-2">
+            <Switch
+              checked={settings.targetReputationEnabled}
+              onCheckedChange={(value) => update("targetReputationEnabled", value)}
+              label="启用目标信誉"
+            />
+          </div>
+        </div>
+      </section>
+      <section className="rounded-2xl bg-card p-5 sm:p-6">
+        <h2 className="mb-5 text-lg font-semibold">会话</h2>
+        <div className="grid gap-5 md:grid-cols-2">
+          {secondsField("sessionAbsoluteTtlMs", "绝对有效期")}
+          {secondsField("sessionIdleTimeoutMs", "空闲超时")}
+          {numberField("sessionMaximumActiveSessions", "最大活跃会话")}
+          {numberField("sessionMaximumConcurrentConnections", "单会话最大并发")}
+        </div>
+      </section>
+    </form>
+  );
+}
+
 export function PlaygroundPage() {
-  const { snapshot } = useConsole();
+  const { api, snapshot } = useConsole();
   const [mode, setMode] = useState("rotate");
-  const [target, setTarget] = useState("https://httpbin.org/ip");
+  const [target, setTarget] = useState("https://ipinfo.io/json");
   const [node, setNode] = useState(snapshot.nodes[0]?.alias ?? snapshot.nodes[0]?.id ?? "node-id");
   const [copied, setCopied] = useState(false);
+  const [proxyToken, setProxyToken] = useState("");
+  const [result, setResult] = useState<PlaygroundResult>();
+  const [requestLogs, setRequestLogs] = useState<PlaygroundLog[]>([]);
+  const requestSequence = useRef(0);
+  const [requesting, setRequesting] = useState(false);
+  const [requestError, setRequestError] = useState("");
+  useEffect(() => {
+    void api
+      .get<{ proxyToken: string; proxyTokenAvailable: boolean }>("/playground/config")
+      .then((config) => setProxyToken(config.proxyToken))
+      .catch((error: unknown) =>
+        setRequestError(error instanceof Error ? error.message : "无法读取 Proxy Token"),
+      );
+  }, [api]);
   const proxy = `http://${gatewayAddress(snapshot.gateway.host, snapshot.gateway.port)}`;
   const username =
     mode === "node"
@@ -857,9 +1297,9 @@ export function PlaygroundPage() {
       : mode === "rotate"
         ? "rotate"
         : `${mode}.session-demo`;
-  const command = `curl --proxy ${shellQuote(proxy)} --proxy-user "${username}:PROXY_TOKEN" ${shellQuote(target)}`;
+  const command = `curl --proxy ${shellQuote(proxy)} --proxy-user "${username}:${proxyToken}" ${shellQuote(target)}`;
   const examples = [
-    { label: "检查出口 IP", value: "https://httpbin.org/ip" },
+    { label: "检查出口 IP", value: "https://ipinfo.io/json" },
     { label: "访问网站", value: "https://example.com" },
     { label: "查询隧道", value: "https://httpbin.org/anything" },
     { label: "自定义请求", value: "https://" },
@@ -869,77 +1309,173 @@ export function PlaygroundPage() {
     setCopied(true);
     setTimeout(() => setCopied(false), 1_500);
   };
+  const execute = async (event: FormEvent) => {
+    event.preventDefault();
+    if (requesting) return;
+    setRequesting(true);
+    setRequestError("");
+    const requestSnapshot = {
+      id: `${Date.now()}-${requestSequence.current++}`,
+      mode,
+      ...(mode === "node" ? { node } : {}),
+      requestedAt: new Date().toISOString(),
+      target,
+    };
+    try {
+      const nextResult = await api.send<PlaygroundResult>("/playground/execute", "POST", {
+        mode,
+        ...(mode === "node" ? { node } : {}),
+        target,
+      });
+      setResult(nextResult);
+      setRequestLogs((logs) => [{ ...requestSnapshot, result: nextResult }, ...logs].slice(0, 20));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "请求执行失败";
+      setResult(undefined);
+      setRequestError(message);
+      setRequestLogs((logs) => [{ ...requestSnapshot, error: message }, ...logs].slice(0, 20));
+    } finally {
+      setRequesting(false);
+    }
+  };
 
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <Card>
-        <CardHeader>
-          <CardTitle>
-            <h2>构建请求</h2>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div>
-            <p className="mb-1.5 px-1 text-sm font-medium">代理模式</p>
-            <Select value={mode} onValueChange={setMode}>
-              <SelectTrigger ariaLabel="代理模式">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="rotate">Rotate</SelectItem>
-                <SelectItem value="sticky">Soft sticky</SelectItem>
-                <SelectItem value="strict">Strict sticky</SelectItem>
-                <SelectItem value="node">指定节点</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {mode === "node" ? <Input label="节点" value={node} onChange={setNode} /> : null}
-          <Input label="目标 URL" type="url" value={target} onChange={setTarget} />
-          <div className="grid gap-2 sm:grid-cols-2">
-            {examples.map((example) => (
-              <Button
-                variant="secondary"
-                size="sm"
-                className="h-auto min-w-0 justify-start px-3 py-2 text-left"
-                key={example.label}
-                onClick={() => setTarget(example.value)}
-              >
-                <span className="min-w-0">
-                  <strong className="block truncate font-medium">{example.label}</strong>
-                  <small className="block truncate font-mono text-muted-foreground">
-                    {example.value}
-                  </small>
-                </span>
-              </Button>
-            ))}
+        <CardContent className="pt-6">
+          <form className="space-y-4" onSubmit={execute}>
+            <div>
+              <p className="mb-1.5 px-1 text-sm font-medium">代理模式</p>
+              <Select value={mode} onValueChange={setMode}>
+                <SelectTrigger ariaLabel="代理模式">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="rotate">Rotate</SelectItem>
+                  <SelectItem value="sticky">Soft sticky</SelectItem>
+                  <SelectItem value="strict">Strict sticky</SelectItem>
+                  <SelectItem value="node">指定节点</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {mode === "node" ? <Input label="节点" value={node} onChange={setNode} /> : null}
+            <Input label="目标 URL" type="url" value={target} onChange={setTarget} />
+            <div className="grid gap-2 sm:grid-cols-2">
+              {examples.map((example) => (
+                <button
+                  type="button"
+                  className="h-9 cursor-pointer rounded-xl border border-border bg-card px-3 text-left text-xs font-medium text-foreground hover:border-foreground/20"
+                  key={example.label}
+                  onClick={() => setTarget(example.value)}
+                >
+                  {example.label}
+                </button>
+              ))}
+            </div>
+            {requestError ? (
+              <p className="text-sm text-destructive" role="alert">
+                {requestError}
+              </p>
+            ) : null}
+            <Button
+              className="w-full"
+              type="submit"
+              hoverScale={1}
+              pressScale={1}
+              disabled={!target}
+            >
+              {requesting ? "请求中…" : "发起请求"}
+            </Button>
+          </form>
+          <div className="mt-6 border-border border-t pt-5">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold">请求日志</h2>
+              <span className="text-xs text-muted-foreground">最近 {requestLogs.length} 条</span>
+            </div>
+            <div className="max-h-[40vh] divide-y divide-border overflow-auto">
+              {requestLogs.map((log) => (
+                <button
+                  type="button"
+                  className="flex w-full cursor-pointer items-center justify-between gap-3 py-3 text-left first:pt-0 last:pb-0 hover:text-foreground"
+                  key={log.id}
+                  onClick={() => {
+                    setMode(log.mode);
+                    setTarget(log.target);
+                    if (log.node) setNode(log.node);
+                    setResult(log.result);
+                    setRequestError(log.error ?? "");
+                  }}
+                >
+                  <span className="min-w-0">
+                    <strong className="block truncate text-sm">{log.target}</strong>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {log.mode}
+                      {log.result ? ` · HTTP ${log.result.status}` : ""} ·{" "}
+                      {new Date(log.requestedAt).toLocaleTimeString()}
+                    </span>
+                  </span>
+                  <StatusBadge
+                    value={
+                      log.error || !log.result || log.result.status >= 400 ? "failed" : "succeeded"
+                    }
+                  />
+                </button>
+              ))}
+              {requestLogs.length === 0 ? (
+                <p className="py-3 text-sm text-muted-foreground">暂无请求记录</p>
+              ) : null}
+            </div>
           </div>
         </CardContent>
       </Card>
       <Card>
         <CardHeader>
           <CardTitle>
-            <h2>请求示例</h2>
+            <h2>curl 示例</h2>
           </CardTitle>
           <CardAction>
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="复制请求命令"
-              onClick={() => void copyCommand()}
-            >
-              {copied ? <CheckCircle size={18} /> : <Copy size={18} />}
-            </Button>
+            <Tooltip content="复制 curl 命令">
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="复制请求命令"
+                onClick={() => void copyCommand()}
+              >
+                {copied ? <CheckCircle size={18} /> : <Copy size={18} />}
+              </Button>
+            </Tooltip>
           </CardAction>
         </CardHeader>
         <CardContent>
-          <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg bg-foreground p-4 text-sm leading-6 text-background">
-            <code>{command}</code>
-          </pre>
-          {copied ? (
-            <div className="mt-4 text-sm text-success" role="status" aria-live="polite">
-              命令已复制
+          <div className="space-y-5">
+            <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-foreground p-4 text-sm leading-6 text-background">
+              <code>{command}</code>
+            </pre>
+            {copied ? (
+              <div className="text-sm text-success" role="status" aria-live="polite">
+                命令已复制
+              </div>
+            ) : null}
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-base font-semibold">请求结果</h2>
+              {result ? <StatusBadge value={result.status < 400 ? "succeeded" : "failed"} /> : null}
             </div>
-          ) : null}
+            {result ? (
+              <div className="space-y-3">
+                <div className="flex gap-4 text-sm">
+                  <span>HTTP {result.status}</span>
+                  <span className="text-muted-foreground">{result.durationMs}ms</span>
+                </div>
+                <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-foreground p-4 text-sm leading-6 text-background">
+                  <code>{result.body || "（空响应）"}</code>
+                </pre>
+              </div>
+            ) : (
+              <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-foreground p-4 text-sm leading-6 text-background/60">
+                <code>在左侧发起请求后，响应会显示在这里。</code>
+              </pre>
+            )}
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -993,6 +1529,11 @@ async function observeOperation(
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function nodeDisplayName(id: string): string {
+  const separator = id.indexOf(":");
+  return separator === -1 ? id : id.slice(separator + 1);
 }
 
 function encodeProxyUsernameValue(value: string): string {

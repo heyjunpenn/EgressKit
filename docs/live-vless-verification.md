@@ -11,7 +11,7 @@ the resulting executable path, an authorized HTTPS subscription, and an HTTPS JS
 response has an `ip` field:
 
 ```sh
-export EGRESSKIT_MIHOMO_BINARY=/private/path/to/mihomo
+export EGRESSKIT_LIVE_MIHOMO_BINARY=/private/path/to/mihomo
 export EGRESSKIT_LIVE_SUBSCRIPTION_URL='set-in-your-secret-store'
 export EGRESSKIT_LIVE_TARGET_URL='https://your-authorized-ip-echo.example/json'
 pnpm test:live:vless

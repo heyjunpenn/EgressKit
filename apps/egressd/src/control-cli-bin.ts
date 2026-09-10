@@ -1,18 +1,14 @@
 #!/usr/bin/env node
 
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { defaultStateDirectory } from "./config.js";
 
 import { runControlCli } from "./control-cli.js";
 import { UnixControlClient } from "./control-client.js";
 import { MihomoInstallError, runMihomoInstallCommand } from "./mihomo-install.js";
 
 async function main(): Promise<void> {
-  const stateDirectory =
-    process.env.EGRESSKIT_STATE_DIRECTORY ??
-    (process.env.XDG_STATE_HOME
-      ? join(process.env.XDG_STATE_HOME, "egresskit")
-      : join(homedir(), ".local", "state", "egresskit"));
+  const stateDirectory = defaultStateDirectory();
   const arguments_ = process.argv.slice(2);
   if (arguments_[0] === "runtime" && arguments_[1] === "install") {
     await runMihomoInstallCommand(arguments_.slice(2), stateDirectory, (value) =>
@@ -20,7 +16,7 @@ async function main(): Promise<void> {
     );
     return;
   }
-  const socketPath = process.env.EGRESSKIT_CONTROL_SOCKET ?? join(stateDirectory, "egressd.sock");
+  const socketPath = join(stateDirectory, "egressd.sock");
   const adminToken = process.env.EGRESSKIT_ADMIN_TOKEN;
 
   if (!adminToken) throw new Error("EGRESSKIT_ADMIN_TOKEN is required");

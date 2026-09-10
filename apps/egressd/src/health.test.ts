@@ -2,7 +2,34 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
 
-import { NodeHealthController, probeThroughMihomo } from "./health.js";
+import { discoverExitIdentity, NodeHealthController, probeThroughMihomo } from "./health.js";
+
+test("exit discovery falls back across providers and normalizes location fields", async () => {
+  const attempted: string[] = [];
+  const identity = await discoverExitIdentity(
+    [
+      { host: "one.example", name: "one", path: "/json" },
+      { host: "two.example", name: "two", path: "/json" },
+      { host: "three.example", name: "three", path: "/json" },
+    ],
+    async ({ name }) => {
+      attempted.push(name);
+      if (name === "one") return undefined;
+      if (name === "two") return { error: true, ip: "not-an-ip" };
+      return { city: "Osaka", country_code: "JP", ip: "198.51.100.8" };
+    },
+    () => 123,
+  );
+
+  assert.deepEqual(attempted, ["one", "two", "three"]);
+  assert.deepEqual(identity, {
+    city: "Osaka",
+    country: "JP",
+    ip: "198.51.100.8",
+    provider: "three",
+    verifiedAt: 123,
+  });
+});
 
 test("active probes use the node's internal Mihomo listener", async () => {
   let observedUrl: string | undefined;
@@ -55,6 +82,174 @@ test("aborting a listener-backed probe destroys a hanging request", async () => 
   await new Promise<void>((resolve, reject) =>
     listener.close((error) => (error ? reject(error) : resolve())),
   );
+});
+
+test("a successful health cycle records the node's public exit IP", async () => {
+  let exitProbeCalls = 0;
+  const controller = new NodeHealthController({
+    exitIpProbe: async () => {
+      exitProbeCalls += 1;
+      return {
+        city: "Tokyo",
+        country: "JP",
+        ip: "203.0.113.24",
+        provider: "ipinfo",
+        verifiedAt: 10_000,
+      };
+    },
+    healthUrls: [new URL("https://health.example/status")],
+    jitterMs: 0,
+    probe: async () => true,
+  });
+  controller.replaceNodes([{ id: "tokyo", listener: new URL("http://127.0.0.1:20001") }], 10_000);
+
+  await controller.runDue(10_000);
+
+  assert.equal(controller.snapshot()[0]?.exitIp, "203.0.113.24");
+  assert.equal(controller.snapshot()[0]?.exitLocation, "JP-Tokyo");
+  await controller.runDue(40_000);
+  assert.equal(exitProbeCalls, 1);
+});
+
+test("exit discovery queues every node with at most five concurrent probes", async () => {
+  let active = 0;
+  let maximumActive = 0;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const controller = new NodeHealthController({
+    exitIpProbe: async (listener) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await gate;
+      active -= 1;
+      return {
+        ip: `203.0.113.${Number(listener.port) - 20_000}`,
+        provider: "test",
+        verifiedAt: 10_000,
+      };
+    },
+    healthUrls: [new URL("https://health.example/status")],
+    jitterMs: 0,
+    probe: async () => true,
+  });
+  controller.replaceNodes(
+    Array.from({ length: 12 }, (_, index) => ({
+      id: `node-${index + 1}`,
+      listener: new URL(`http://127.0.0.1:${20_001 + index}`),
+    })),
+    10_000,
+  );
+
+  const running = controller.runDue(10_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(maximumActive, 5);
+  release?.();
+  await running;
+  assert.equal(controller.snapshot().filter(({ exitIp }) => exitIp).length, 12);
+});
+
+test("manual exit verification shares the five-probe concurrency limit", async () => {
+  let active = 0;
+  let maximumActive = 0;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const controller = new NodeHealthController({
+    exitIpProbe: async (listener) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await gate;
+      active -= 1;
+      return {
+        ip: `203.0.113.${Number(listener.port) - 20_000}`,
+        provider: "test",
+        verifiedAt: 10_000,
+      };
+    },
+    healthUrls: [new URL("https://health.example/status")],
+    jitterMs: 0,
+    probe: async () => true,
+  });
+  controller.replaceNodes(
+    Array.from({ length: 12 }, (_, index) => ({
+      id: `node-${index + 1}`,
+      listener: new URL(`http://127.0.0.1:${20_001 + index}`),
+    })),
+    10_000,
+  );
+
+  const running = Promise.all(
+    Array.from({ length: 12 }, (_, index) => controller.verifyExit(`node-${index + 1}`)),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(maximumActive, 5);
+  release?.();
+  await running;
+});
+
+test("manual exit verification discards a result from a replaced generation", async () => {
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const recorded: string[] = [];
+  const controller = new NodeHealthController({
+    exitIpProbe: async () => {
+      markStarted?.();
+      await gate;
+      return { ip: "203.0.113.24", provider: "test", verifiedAt: 10_000 };
+    },
+    healthUrls: [new URL("https://health.example/status")],
+    jitterMs: 0,
+    onExitIdentity: (id) => recorded.push(id),
+    probe: async () => true,
+  });
+  controller.replaceNodes(
+    [
+      {
+        generation: "first",
+        id: "node",
+        listener: new URL("http://127.0.0.1:20001"),
+      },
+    ],
+    10_000,
+  );
+
+  const verifying = controller.verifyExit("node");
+  await started;
+  controller.replaceNodes(
+    [
+      {
+        generation: "second",
+        id: "node",
+        listener: new URL("http://127.0.0.1:20002"),
+      },
+    ],
+    10_001,
+  );
+  release?.();
+
+  assert.equal(await verifying, undefined);
+  assert.deepEqual(recorded, []);
+  assert.equal(controller.snapshot()[0]?.exitIp, undefined);
+});
+
+test("exit discovery rejects malformed IPv4 and IPv6 values", async () => {
+  for (const invalidIp of ["999.999.999.999", ":"]) {
+    const identity = await discoverExitIdentity(
+      [{ host: "invalid.example", name: "invalid", path: "/json" }],
+      async () => ({ ip: invalidIp }),
+    );
+
+    assert.equal(identity, undefined, invalidIp);
+  }
 });
 
 test("health checks apply multiple-target threshold, global concurrency, and jitter", async () => {

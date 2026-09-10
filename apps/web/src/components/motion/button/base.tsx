@@ -20,6 +20,7 @@ export type ButtonSize = "sm" | "md" | "lg" | "icon";
 export interface ButtonProps extends Omit<HTMLMotionProps<"button">, "children"> {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  hoverScale?: number;
   pressScale?: number;
   /** Spawn a Material-style ripple from the press point. Off by default. */
   ripple?: boolean;
@@ -56,6 +57,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   {
     variant = "primary",
     size = "md",
+    hoverScale = 1.02,
     pressScale = 0.93,
     ripple = false,
     className,
@@ -96,14 +98,14 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type="button"
       whileTap={reduce ? undefined : { scale: pressScale }}
-      whileHover={reduce || !canHover ? undefined : { scale: 1.02 }}
+      whileHover={reduce || !canHover ? undefined : { scale: hoverScale }}
       transition={SPRING_PRESS}
       onPointerDown={handlePointerDown}
       className={cn(
-        "inline-flex items-center justify-center font-medium select-none",
+        "inline-flex cursor-pointer items-center justify-center font-medium select-none",
         "transition-colors",
         FOCUS_CLASS,
-        "disabled:pointer-events-none disabled:opacity-50",
+        "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
         ripple && "relative overflow-hidden",
         VARIANT_CLASS[variant],
         SIZE_CLASS[size],
@@ -155,7 +157,7 @@ export const ButtonLink = forwardRef<HTMLAnchorElement, ButtonLinkProps>(functio
       whileHover={reduce || !canHover ? undefined : { scale: 1.02 }}
       transition={SPRING_PRESS}
       className={cn(
-        "inline-flex items-center justify-center font-medium select-none",
+        "inline-flex cursor-pointer items-center justify-center font-medium select-none",
         "transition-colors",
         FOCUS_CLASS,
         VARIANT_CLASS[variant],

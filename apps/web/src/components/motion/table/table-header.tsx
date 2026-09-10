@@ -253,7 +253,7 @@ export function TableHeader<T>({
                       type="button"
                       onClick={() => onToggleSort(column.key)}
                       className={cn(
-                        "flex h-full min-w-0 flex-1 select-none items-center gap-1 px-4 outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                        "flex h-full min-w-0 flex-1 cursor-pointer select-none items-center gap-1 px-4 outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                         alignFlex(column.align),
                         active && "text-foreground",
                       )}

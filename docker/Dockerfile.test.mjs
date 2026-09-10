@@ -18,7 +18,7 @@ test("the Docker release pins and verifies the matching Mihomo asset for both ar
   assert.match(dockerfile, /sha256sum -c/);
   assert.doesNotMatch(dockerfile, /releases\/latest/);
   assert.doesNotMatch(dockerfile, /apt-get/);
-  assert.match(dockerfile, /EGRESSKIT_HOST=0\.0\.0\.0/);
+  assert.doesNotMatch(dockerfile, /ENV EGRESSKIT_(?!ADMIN_TOKEN)/);
   assert.match(dockerfile, /EXPOSE 8787/);
 });
 
@@ -34,5 +34,5 @@ test("the Docker build embeds the web application in the backend image", async (
 
   assert.match(dockerfile, /@egresskit\/app-web build/);
   assert.match(dockerfile, /COPY --from=build \/workspace\/apps\/web\/dist \/opt\/egresskit\/web/);
-  assert.match(dockerfile, /EGRESSKIT_WEB_DIRECTORY=\/opt\/egresskit\/web/);
+  assert.doesNotMatch(dockerfile, /EGRESSKIT_WEB_DIRECTORY/);
 });

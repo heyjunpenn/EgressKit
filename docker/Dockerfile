@@ -38,10 +38,6 @@ COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/egresskit/
 COPY licenses/Mihomo-GPL-3.0.txt /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt
 RUN mkdir --parents /var/lib/egresskit \
     && chown node:node /var/lib/egresskit
-ENV EGRESSKIT_STATE_DIRECTORY=/var/lib/egresskit
-ENV EGRESSKIT_MIHOMO_BINARY=/usr/local/bin/mihomo
-ENV EGRESSKIT_HOST=0.0.0.0
-ENV EGRESSKIT_WEB_DIRECTORY=/opt/egresskit/web
 EXPOSE 8787
 USER node
 ENTRYPOINT ["node", "/opt/egresskit/dist/cli.js"]

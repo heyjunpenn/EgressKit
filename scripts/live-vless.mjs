@@ -100,8 +100,9 @@ function parseObservedIp(output) {
 export async function main() {
   const subscriptionUrl = required("EGRESSKIT_LIVE_SUBSCRIPTION_URL");
   const targetUrl = validateTargetUrl(required("EGRESSKIT_LIVE_TARGET_URL")).href;
-  const mihomoBinary = required("EGRESSKIT_MIHOMO_BINARY");
-  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-live-vless-"));
+  const mihomoBinary = required("EGRESSKIT_LIVE_MIHOMO_BINARY");
+  const homeDirectory = await mkdtemp(join(tmpdir(), "egresskit-live-vless-"));
+  const stateDirectory = join(homeDirectory, ".local", "state", "egresskit");
   const adminToken = randomBytes(24).toString("hex");
   const proxyToken = randomBytes(24).toString("hex");
   const childEnvironment = cleanChildEnvironment(process.env);
@@ -120,14 +121,22 @@ export async function main() {
   try {
     run("pnpm", ["--filter", "@egresskit/app-egressd", "build"], { env: childEnvironment });
     ensureNotCancelled();
+    const { openControlState } = await import("../apps/egressd/dist/state.js");
+    const settingsState = await openControlState(stateDirectory);
+    const settings = settingsState.loadRuntimeSettings(adminToken);
+    settingsState.updateRuntimeSettings({
+      ...settings,
+      host: "127.0.0.1",
+      mihomoBinary,
+      port: 0,
+      proxyToken,
+    });
+    await settingsState.close();
     daemon = spawn("node", ["apps/egressd/dist/cli.js"], {
       env: {
         ...childEnvironment,
         EGRESSKIT_ADMIN_TOKEN: adminToken,
-        EGRESSKIT_MIHOMO_BINARY: mihomoBinary,
-        EGRESSKIT_PORT: "0",
-        EGRESSKIT_PROXY_TOKEN: proxyToken,
-        EGRESSKIT_STATE_DIRECTORY: stateDirectory,
+        HOME: homeDirectory,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -137,7 +146,7 @@ export async function main() {
       env: {
         ...childEnvironment,
         EGRESSKIT_ADMIN_TOKEN: adminToken,
-        EGRESSKIT_STATE_DIRECTORY: stateDirectory,
+        HOME: homeDirectory,
       },
       input: subscriptionUrl,
     });
@@ -176,7 +185,7 @@ export async function main() {
     try {
       await stopDaemon(daemon);
     } finally {
-      await rm(stateDirectory, { force: true, recursive: true });
+      await rm(homeDirectory, { force: true, recursive: true });
     }
   }
 }

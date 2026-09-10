@@ -123,6 +123,11 @@ export class ProxyTokenRegistry {
     }
   }
 
+  replaceAll(tokens: readonly string[]): void {
+    this.#tokens.clear();
+    for (const token of tokens) this.add(token);
+  }
+
   #removeExpired(): void {
     const now = this.#now();
     for (const [id, stored] of this.#tokens) {

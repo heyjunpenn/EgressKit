@@ -11,9 +11,12 @@ test("the release workflow builds both commands on every supported host architec
   for (const runner of ["ubuntu-latest", "ubuntu-24.04-arm", "macos-15-intel", "macos-15"]) {
     assert.match(workflow, new RegExp(`runner: ${runner}`));
   }
-  assert.match(workflow, /pnpm --filter @egresskit\/egressd build/);
+  assert.match(workflow, /tags:\s*\n\s*- "\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+"/);
+  assert.match(workflow, /pnpm --filter @egresskit\/app-egressd build/);
   assert.match(workflow, /dist\/control-cli-bin\.js/);
   assert.match(workflow, /dist\/cli\.js/);
+  assert.match(workflow, /release\/egresskit-app-egressd-\*\.tgz/);
+  assert.doesNotMatch(workflow, /release\/egresskit-egressd-\*\.tgz/);
   assert.match(workflow, /archive=.*egresskit-\$\{\{ matrix\.name \}\}\.tgz/);
   assert.match(workflow, /pnpm --dir .* add "\$archive"/);
   assert.doesNotMatch(workflow, /add --offline "\$archive"/);
@@ -27,6 +30,7 @@ test("the release workflow builds both commands on every supported host architec
   assert.match(workflow, /packages: write/);
   assert.match(workflow, /contents: write/);
   assert.match(workflow, /actionlint/);
+  assert.doesNotMatch(workflow, /refs\/tags\/v/);
   assert.match(workflow, /quality:[\s\S]*?run: pnpm verify/);
   assert.match(workflow, /needs: \[quality, docker-validation\]/);
   assert.match(workflow, /needs: \[quality, host-artifacts, docker-publish\]/);

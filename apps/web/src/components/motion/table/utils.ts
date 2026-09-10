@@ -19,8 +19,8 @@ export function alignText(align: TableColumn<unknown>["align"]) {
   return "text-left";
 }
 
-export function readCell<T>(row: T, column: TableColumn<T>): ReactNode {
-  if (column.cell) return column.cell(row);
+export function readCell<T>(row: T, column: TableColumn<T>, rowIndex = 0): ReactNode {
+  if (column.cell) return column.cell(row, rowIndex);
   return (row as Record<string, ReactNode>)[column.key];
 }
 

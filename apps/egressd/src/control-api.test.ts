@@ -11,6 +11,7 @@ import test from "node:test";
 
 import { startEgressd } from "./daemon.js";
 import type { SessionBindingStore } from "./session.js";
+import { openControlState } from "./state.js";
 import { startSimulatedMihomoListener, startTargetServer } from "./testing/harness.js";
 
 test("HTTP redacts subscription URLs while authenticated local socket access can reveal them", async (t) => {
@@ -99,10 +100,14 @@ test("HTTP redacts subscription URLs while authenticated local socket access can
     `http://${daemon.address.host}:${daemon.address.port}/subscriptions/local`,
     { headers: { authorization: "Bearer admin-secret", connection: "close" } },
   );
-  assert.deepEqual(await httpLocal.json(), { kind: "local", subscriptionId: "local" });
+  assert.deepEqual(await httpLocal.json(), {
+    kind: "local",
+    name: "本地配置",
+    subscriptionId: "local",
+  });
   assert.deepEqual(
     (await socketJson(socketPath, "GET", "/subscriptions/local", "admin-secret")).body,
-    { kind: "local", subscriptionId: "local" },
+    { kind: "local", name: "本地配置", subscriptionId: "local" },
   );
 });
 
@@ -217,7 +222,7 @@ test("authenticated metrics and structured logs expose signals without seeded se
       adminToken: privateUuid,
       host: "127.0.0.1",
       port: 0,
-      proxyAuthentication: { tokens: [privateUuid] },
+      proxyAuthentication: { tokens: [""] },
     });
   } catch (error) {
     safeError = error;
@@ -263,10 +268,9 @@ test("metrics snapshot failures return a safe 503 without affecting liveness", a
   });
   assert.equal(metrics.status, 503);
   assert.deepEqual(await metrics.json(), { error: "metrics unavailable" });
-  assert.equal(
-    (await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`)).status,
-    200,
-  );
+  const live = await fetch(`http://${daemon.address.host}:${daemon.address.port}/live`);
+  assert.equal(live.status, 200);
+  await live.body?.cancel();
 });
 
 test("a configured control socket path never overwrites an existing file", async (t) => {
@@ -380,14 +384,14 @@ test("admin API rotates proxy tokens with overlap and never crosses authenticati
   const crossedAdd = await socketJson(socketPath, "POST", "/proxy-tokens", "admin-secret", {
     token: "admin-secret",
   });
-  assert.equal(crossedAdd.status, 422);
+  assert.equal(crossedAdd.status, 201);
   assert.doesNotMatch(JSON.stringify(crossedAdd), /admin-secret/);
   const serialized = JSON.stringify({ added, before });
   assert.doesNotMatch(serialized, /old-proxy-secret|new-proxy-secret|admin-secret/);
 
   assert.notEqual(await proxyStatus(daemon.address, "old-proxy-secret"), 407);
   assert.notEqual(await proxyStatus(daemon.address, "new-proxy-secret"), 407);
-  assert.equal(await proxyStatus(daemon.address, "admin-secret"), 407);
+  assert.notEqual(await proxyStatus(daemon.address, "admin-secret"), 407);
   assert.equal(await proxyStatus(daemon.address, ""), 407);
   assert.equal(await connectProxyStatus(daemon.address, ""), 407);
   const crossedAdmin = await fetch(
@@ -395,6 +399,7 @@ test("admin API rotates proxy tokens with overlap and never crosses authenticati
     { headers: { authorization: "Bearer new-proxy-secret" } },
   );
   assert.equal(crossedAdmin.status, 401);
+  await crossedAdmin.body?.cancel();
 
   faultDatabase.exec(`
     CREATE TRIGGER reject_proxy_token_delete
@@ -451,26 +456,52 @@ test("admin API rotates proxy tokens with overlap and never crosses authenticati
   assert.equal(await proxyStatus(daemon.address, "old-proxy-secret"), 407);
   assert.notEqual(await proxyStatus(daemon.address, "new-proxy-secret"), 407);
   const afterRestart = await socketJson(socketPath, "GET", "/proxy-tokens", "admin-secret");
-  assert.equal((afterRestart.body as { tokens: unknown[] }).tokens.length, 1);
+  assert.equal((afterRestart.body as { tokens: unknown[] }).tokens.length, 2);
 });
 
-test("daemon rejects identical configured admin and proxy credentials without echoing them", async () => {
-  await assert.rejects(
-    startEgressd({
-      adminToken: "same-secret",
-      host: "127.0.0.1",
-      port: 0,
-      proxyAuthentication: { tokens: ["same-secret"] },
-    }),
-    (error: unknown) => {
-      assert.match(String(error), /must be distinct/);
-      assert.doesNotMatch(String(error), /same-secret/);
-      return true;
-    },
-  );
+test("daemon permits the configured admin credential as the proxy credential", async () => {
+  const daemon = await startEgressd({
+    adminToken: "same-secret",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["same-secret"] },
+  });
+  assert.notEqual(await proxyStatus(daemon.address, "same-secret"), 407);
+  await daemon.close();
 });
 
-test("daemon rejects an admin credential matching a persisted proxy token", async (t) => {
+test("authenticated settings API updates the proxy token immediately and persists settings", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "egresskit-settings-api-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const stateDirectory = join(directory, "state");
+  const socketPath = join(directory, "control.sock");
+  const daemon = await startEgressd({
+    adminToken: "admin-secret",
+    controlSocketPath: socketPath,
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["admin-secret"] },
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  assert.equal((await socketJson(socketPath, "GET", "/settings", "wrong")).status, 401);
+  const current = await socketJson(socketPath, "GET", "/settings", "admin-secret");
+  const settings = (current.body as { settings: Record<string, unknown> }).settings;
+  assert.equal(settings.proxyToken, "admin-secret");
+  const updated = await socketJson(socketPath, "PUT", "/settings", "admin-secret", {
+    ...settings,
+    port: 9797,
+    proxyToken: "new-proxy-secret",
+  });
+  assert.equal(updated.status, 200);
+  assert.equal((updated.body as { restartRequired: boolean }).restartRequired, true);
+  assert.equal(await proxyStatus(daemon.address, "admin-secret"), 407);
+  assert.notEqual(await proxyStatus(daemon.address, "new-proxy-secret"), 407);
+  const saved = await socketJson(socketPath, "GET", "/settings", "admin-secret");
+  assert.equal((saved.body as { settings: { port: number } }).settings.port, 9797);
+});
+
+test("daemon permits an admin credential matching a persisted proxy token", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "egresskit-token-boundary-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
   const stateDirectory = join(directory, "state");
@@ -483,20 +514,14 @@ test("daemon rejects an admin credential matching a persisted proxy token", asyn
   });
   await first.close();
 
-  await assert.rejects(
-    startEgressd({
-      adminToken: "persisted-proxy-secret",
-      host: "127.0.0.1",
-      port: 0,
-      proxyAuthentication: { tokens: ["replacement-proxy-secret"] },
-      stateDirectory,
-    }),
-    (error: unknown) => {
-      assert.match(String(error), /must be distinct/);
-      assert.doesNotMatch(String(error), /persisted-proxy-secret|replacement-proxy-secret/);
-      return true;
-    },
-  );
+  const matching = await startEgressd({
+    adminToken: "persisted-proxy-secret",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["replacement-proxy-secret"] },
+    stateDirectory,
+  });
+  await matching.close();
 
   const reopened = await startEgressd({
     adminToken: "safe-admin",
@@ -529,6 +554,31 @@ test("proxy token initialization failure releases state ownership for retry", as
     stateDirectory,
   });
   await daemon.close();
+});
+
+test("an empty persisted token registry restores the configured proxy token", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "egresskit-empty-token-registry-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const state = await openControlState(directory);
+  state.saveProxyTokens([]);
+  await state.close();
+
+  const daemon = await startEgressd({
+    adminToken: "admin-secret",
+    host: "127.0.0.1",
+    port: 0,
+    proxyAuthentication: { tokens: ["current-proxy-token"] },
+    stateDirectory: directory,
+  });
+  t.after(() => daemon.close());
+
+  const response = await fetch(
+    `http://${daemon.address.host}:${daemon.address.port}/proxy-tokens`,
+    { headers: { authorization: "Bearer admin-secret" } },
+  );
+  const body = (await response.json()) as { tokens: unknown[] };
+  assert.equal(response.status, 200);
+  assert.equal(body.tokens.length, 1);
 });
 
 function socketJson(

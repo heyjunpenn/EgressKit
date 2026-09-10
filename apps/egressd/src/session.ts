@@ -5,6 +5,7 @@ import type { SchedulerLease } from "./scheduler.js";
 export interface SessionScheduler {
   acquire(excludedIds?: ReadonlySet<string>): SchedulerLease | undefined;
   acquireById(id: string): SchedulerLease | undefined;
+  acquireByExitIp?(exitIp: string, excludedIds?: ReadonlySet<string>): SchedulerLease | undefined;
 }
 
 export interface SessionClock {
@@ -13,6 +14,7 @@ export interface SessionClock {
 
 export interface PersistedSessionBinding {
   createdAt: number;
+  exitIp?: string;
   lastUsedAt: number;
   logicalNodeId: string;
   mode: "sticky" | "strict";
@@ -134,9 +136,11 @@ export class SoftStickySessions {
 
     let binding = this.#store.getSessionBinding(identity);
     let lease =
-      binding && !excludedIds.has(binding.logicalNodeId)
-        ? this.#scheduler.acquireById(binding.logicalNodeId)
-        : undefined;
+      binding?.exitIp && this.#scheduler.acquireByExitIp
+        ? this.#scheduler.acquireByExitIp(binding.exitIp, excludedIds)
+        : binding && !excludedIds.has(binding.logicalNodeId)
+          ? this.#scheduler.acquireById(binding.logicalNodeId)
+          : undefined;
     if (binding && !lease && !rebindUnavailable) {
       this.#store.touchSessionBinding(identity, now, rebindUnavailable ? "sticky" : "strict");
       return undefined;
@@ -155,6 +159,7 @@ export class SoftStickySessions {
       }
       binding = {
         createdAt: now,
+        ...(lease.candidate.exitIp ? { exitIp: lease.candidate.exitIp } : {}),
         lastUsedAt: now,
         logicalNodeId: lease.candidate.id,
         mode: rebindUnavailable ? "sticky" : "strict",

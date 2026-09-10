@@ -9,6 +9,7 @@ describe("console navigation", () => {
       "proxies",
       "sessions",
       "playground",
+      "settings",
       "docs",
     ]);
   });
@@ -20,6 +21,7 @@ describe("console navigation", () => {
       "/app/proxies",
       "/app/sessions",
       "/app/playground",
+      "/app/settings",
       "/app/docs",
     ]);
   });

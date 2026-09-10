@@ -14,9 +14,9 @@ test("a release tag stamps the package with the exact semantic version", async (
   const packagePath = join(directory, "package.json");
   await writeFile(packagePath, '{"name":"fixture","version":"0.0.0"}\n');
 
-  await execFileAsync(process.execPath, [script.pathname, "v1.2.3-rc.1+build.5", packagePath]);
+  await execFileAsync(process.execPath, [script.pathname, "1.2.3", packagePath]);
 
-  assert.equal(JSON.parse(await readFile(packagePath, "utf8")).version, "1.2.3-rc.1+build.5");
+  assert.equal(JSON.parse(await readFile(packagePath, "utf8")).version, "1.2.3");
 });
 
 test("invalid or ambiguous release tags are rejected without changing metadata", async () => {
@@ -26,8 +26,8 @@ test("invalid or ambiguous release tags are rejected without changing metadata",
   await writeFile(packagePath, original);
 
   await assert.rejects(
-    execFileAsync(process.execPath, [script.pathname, "v01.2.3", packagePath]),
-    /release tag must be a valid v-prefixed semantic version/,
+    execFileAsync(process.execPath, [script.pathname, "v1.2.3", packagePath]),
+    /release tag must be a valid x\.y\.z semantic version without a prefix/,
   );
   assert.equal(await readFile(packagePath, "utf8"), original);
 });

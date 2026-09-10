@@ -18,26 +18,61 @@ function candidate(id: string, overrides: Partial<SchedulerCandidate> = {}): Sch
   };
 }
 
-test("rotate selection favors stronger candidates without starving other healthy exits", () => {
+test("rotate selects the available proxy that has been unused for the longest", () => {
   const scheduler = new RotateScheduler([
     candidate("fast", { ewmaLatencyMs: 10 }),
     candidate("slower", { ewmaLatencyMs: 20 }),
+    candidate("third", { ewmaLatencyMs: 30 }),
   ]);
 
-  const selections = Array.from({ length: 12 }, () => {
+  const selections = Array.from({ length: 6 }, () => {
     const lease = scheduler.acquire();
     assert.ok(lease);
     lease.release();
     return lease.candidate.id;
   });
 
-  const fastSelections = selections.filter((id) => id === "fast").length;
-  const slowerSelections = selections.filter((id) => id === "slower").length;
-  assert.ok(fastSelections > slowerSelections);
-  assert.ok(slowerSelections > 0);
+  assert.deepEqual(selections, ["fast", "slower", "third", "fast", "slower", "third"]);
 });
 
-test("rotate selection accounts for health, weight, reliability, failures, and load", () => {
+test("verified-only rotate schedules egress IP groups instead of duplicate node slots", () => {
+  const scheduler = new RotateScheduler(
+    [
+      candidate("a1", { exitIp: "203.0.113.1" }),
+      candidate("a2", { exitIp: "203.0.113.1" }),
+      candidate("b1", { exitIp: "198.51.100.8" }),
+      candidate("pending"),
+    ],
+    { requireExitIdentity: true },
+  );
+
+  const selections = Array.from({ length: 4 }, () => {
+    const lease = scheduler.acquire();
+    assert.ok(lease);
+    lease.release();
+    return lease.candidate.exitIp;
+  });
+
+  assert.deepEqual(selections, ["203.0.113.1", "198.51.100.8", "203.0.113.1", "198.51.100.8"]);
+  assert.equal(scheduler.acquireBySelector("pending"), undefined);
+});
+
+test("specified node resolves to its egress IP group", () => {
+  const scheduler = new RotateScheduler(
+    [
+      candidate("a1", { exitIp: "203.0.113.1", healthy: false, selectors: ["primary"] }),
+      candidate("a2", { exitIp: "203.0.113.1" }),
+      candidate("b1", { exitIp: "198.51.100.8" }),
+    ],
+    { requireExitIdentity: true },
+  );
+
+  const lease = scheduler.acquireBySelector("primary");
+  assert.equal(lease?.candidate.id, "a2");
+  lease?.release();
+});
+
+test("rotate excludes proxies that are unavailable", () => {
   const scheduler = new RotateScheduler([
     candidate("fast", { activeConnections: 100, manualWeight: 2 }),
     candidate("slower", {
@@ -49,33 +84,23 @@ test("rotate selection accounts for health, weight, reliability, failures, and l
     candidate("unhealthy", { healthy: false, manualWeight: 100 }),
   ]);
 
-  const selections = Array.from({ length: 10 }, () => {
+  const selections = Array.from({ length: 4 }, () => {
     const lease = scheduler.acquire();
     assert.ok(lease);
     lease.release();
     return lease.candidate.id;
   });
 
-  assert.ok(selections.includes("fast"));
-  assert.ok(selections.includes("slower"));
+  assert.deepEqual(selections, ["fast", "slower", "fast", "slower"]);
   assert.ok(!selections.includes("unhealthy"));
 });
 
-test("each scheduling signal can independently change the next selection", () => {
-  for (const penalty of [
-    { manualWeight: 0.5 },
-    { ewmaLatencyMs: 40 },
-    { successRate: 0.5 },
-    { consecutiveFailures: 1 },
-    { activeConnections: 1 },
-  ]) {
-    const scheduler = new RotateScheduler([candidate("penalized", penalty), candidate("baseline")]);
-
-    const lease = scheduler.acquire();
-    assert.ok(lease);
-    assert.equal(lease.candidate.id, "baseline");
-    lease.release();
-  }
+test("explicit and sticky use also update which proxy was used most recently", () => {
+  const scheduler = new RotateScheduler([candidate("first"), candidate("second")]);
+  scheduler.acquireById("first")?.release();
+  const rotate = scheduler.acquire();
+  assert.equal(rotate?.candidate.id, "second");
+  rotate?.release();
 });
 
 test("manual enabled state excludes and restores a candidate", () => {
