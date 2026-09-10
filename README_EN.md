@@ -154,6 +154,14 @@ Nodes expose only two states: available and unavailable. A node is available onl
 
 For HTTPS, EgressKit can try another exit before returning `200 Connection Established`. After the tunnel is established, EgressKit forwards encrypted bytes without decrypting or replaying requests. The client decides whether to reconnect after a tunnel failure.
 
+## Known limitations
+
+- EgressKit does not provide nodes or subscriptions. It currently imports only VLESS nodes from Clash / Mihomo subscriptions.
+- `rotate` selects an exit for each new HTTP request or CONNECT tunnel. When a client reuses a connection, multiple HTTPS requests inside that tunnel keep the same exit.
+- EgressKit cannot switch an established CONNECT tunnel or replay its requests transparently. The client must reconnect after an upstream connection failure.
+- A public proxy port must receive HTTP Proxy / CONNECT traffic directly. A regular CDN or HTTP reverse proxy that only handles web requests cannot replace Layer 4 TCP forwarding.
+- SQLite stores subscription URLs, node credentials, and the Proxy Token in plaintext. Operators must protect the state directory and its backups.
+
 ## Configuration and data
 
 `EGRESSKIT_ADMIN_TOKEN` is the only environment variable. Other settings are initialized in SQLite and updated through the console.

@@ -154,6 +154,14 @@ stateDiagram-v2
 
 对于 HTTPS，EgressKit 在返回 `200 Connection Established` 前可以尝试其他出口。隧道建立后只转发加密字节，不解密内容，也不会自动重放请求；连接中断时由客户端决定是否重连。
 
+## 已知限制
+
+- EgressKit 不提供节点或订阅；当前只从 Clash / Mihomo 订阅中导入 VLESS 节点。
+- `rotate` 按新的 HTTP 请求或 CONNECT 隧道选择出口。客户端复用连接时，隧道内的多个 HTTPS 请求仍使用同一出口。
+- CONNECT 隧道建立后不能无感切换出口或重放请求。上游连接中断时，由客户端重新连接。
+- 公开部署的代理端口必须直接接收 HTTP Proxy / CONNECT 流量。普通 CDN 或只处理网页请求的 HTTP 反向代理不能代替四层 TCP 转发。
+- SQLite 会明文保存订阅 URL、节点凭据和 Proxy Token。部署者需要保护状态目录及其备份。
+
 ## 配置与数据
 
 `EGRESSKIT_ADMIN_TOKEN` 是唯一环境变量。其他配置首次启动时写入 SQLite，并通过控制台更新。
