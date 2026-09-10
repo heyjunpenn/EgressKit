@@ -25,10 +25,14 @@ test("the release workflow builds both commands on every supported host architec
   assert.doesNotMatch(workflow, /host-artifacts:[\s\S]*?- run: pnpm verify/);
   assert.match(workflow, /docker\/build-push-action/);
   assert.match(workflow, /linux\/amd64,linux\/arm64/);
+  assert.match(workflow, /username: \$\{\{ secrets\.DOCKERHUB_USERNAME \}\}/);
+  assert.match(workflow, /password: \$\{\{ secrets\.DOCKERHUB_TOKEN \}\}/);
+  assert.match(workflow, /images: heyjunpenn\/egresskit/);
+  assert.doesNotMatch(workflow, /ghcr\.io\/heyjunpenn\/egresskit/);
   assert.match(workflow, /gh release (create|upload)/);
   assert.match(workflow, /GH_REPO: \$\{\{ github\.repository \}\}/);
   assert.doesNotMatch(workflow, /uses: [^\n]+@v\d/);
-  assert.match(workflow, /packages: write/);
+  assert.doesNotMatch(workflow, /packages: write/);
   assert.match(workflow, /contents: write/);
   assert.match(workflow, /actionlint/);
   assert.doesNotMatch(workflow, /refs\/tags\/v/);

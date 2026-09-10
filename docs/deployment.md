@@ -17,7 +17,7 @@ Windows 不在 v1 的正式支持范围。发布流水线通过独立任务执�
 
 带版本的 GitHub Release 附件是 v1 CLI 和 daemon 归档的正式下载渠道；项目不从 npm registry
 发布。归档内部 package version 必须与无前缀的 `x.y.z` release tag 完全一致。容器镜像从同一 tag 发布到
-`ghcr.io/heyjunpenn/egresskit`，并附带构建 provenance 与 SBOM。
+Docker Hub 的 `heyjunpenn/egresskit`，并附带构建 provenance 与 SBOM。
 
 ## State-directory security
 
@@ -41,7 +41,7 @@ docker run --rm \
   -v egresskit-state:/var/lib/egresskit \
   -p 127.0.0.1:8787:8787 \
   -e EGRESSKIT_ADMIN_TOKEN='replace-me' \
-  ghcr.io/heyjunpenn/egresskit:0.1.0
+  heyjunpenn/egresskit:0.1.0
 ```
 
 镜像内的 daemon 监听 `0.0.0.0:8787` 以穿过容器网络；上述端口映射只把服务暴露到宿主机

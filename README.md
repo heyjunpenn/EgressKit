@@ -27,7 +27,7 @@ docker run --detach \
   --volume egresskit-state:/var/lib/egresskit \
   --publish 127.0.0.1:8787:8787 \
   --env EGRESSKIT_ADMIN_TOKEN='change-this-admin-token' \
-  ghcr.io/heyjunpenn/egresskit:0.1.0
+  heyjunpenn/egresskit:0.1.0
 ```
 
 打开 <http://127.0.0.1:8787>，输入 Admin Token，然后在“订阅”页面添加 Clash / Mihomo HTTPS 订阅。Proxy Token 首次与 Admin Token 相同，可以在“设置”页面随机重置。
@@ -227,7 +227,7 @@ SQLite 是 daemon 的控制面数据库，保存订阅、规范化节点、gener
 
 ## 部署说明
 
-镜像发布在 `ghcr.io/heyjunpenn/egresskit`，内置固定且经过 SHA-256 校验的官方 Mihomo。请使用明确版本，不要使用浮动的 `latest`。
+镜像发布在 Docker Hub 的 `heyjunpenn/egresskit`，内置固定且经过 SHA-256 校验的官方 Mihomo。请使用明确版本，不要使用浮动的 `latest`。
 
 快速开始中的端口映射只监听宿主机 loopback。需要从局域网或公网访问时，请保留代理认证，并配置防火墙、TLS 终止和管理面访问控制。
 
