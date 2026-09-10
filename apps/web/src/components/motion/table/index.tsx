@@ -96,7 +96,7 @@ export function Table<T>({
   onInsertColumn,
   onDeleteColumn,
   rowHeight = 48,
-  height = 440,
+  height,
   overscan = 10,
   onEndReached,
   loading = false,
@@ -246,8 +246,8 @@ export function Table<T>({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="isolate overflow-auto"
-        style={{ height: Math.min(height, viewportHeight) }}
+        className="isolate overflow-x-auto overflow-y-hidden"
+        style={{ height: height === undefined ? viewportHeight : Math.min(height, viewportHeight) }}
       >
         <table
           className={cn("border-collapse", sized ? "w-max" : undefined)}
@@ -300,7 +300,7 @@ export function Table<T>({
             {pagedRows.length === 0 ? (
               loading ? (
                 <SkeletonRows
-                  count={Math.max(1, Math.ceil(height / rowHeight))}
+                  count={Math.max(1, Math.ceil((height ?? viewportHeight) / rowHeight))}
                   columns={orderedColumns}
                   selectable={selectable}
                   rowHeight={rowHeight}

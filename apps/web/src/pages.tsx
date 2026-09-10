@@ -12,6 +12,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useConsole } from "./App";
 import type {
   ApiClient,
@@ -126,10 +127,6 @@ function StatusBadge({ value }: { value: string }) {
   );
 }
 
-function tableHeight(rows: number): number {
-  return Math.max(144, 48 + rows * 48);
-}
-
 function Modal({
   children,
   onClose,
@@ -182,10 +179,8 @@ export function OverviewPage() {
   const { refresh, snapshot } = useConsole();
   const toast = useToast();
   const { metrics } = snapshot;
-  const activeProxies = snapshot.nodes
-    .filter((node) => node.activeConnections > 0)
-    .sort((left, right) => right.activeConnections - left.activeConnections)
-    .slice(0, 4);
+  const proxyPreview = snapshot.nodes.slice(0, 10);
+  const exitIpPreview = snapshot.exitIps.slice(0, 10);
   const gateway = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
   const [refreshing, setRefreshing] = useState(false);
   const refreshOverview = async () => {
@@ -304,64 +299,70 @@ export function OverviewPage() {
         <section className="rounded-2xl bg-card px-5 py-7 sm:px-6 md:px-8">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <h2 className="font-semibold">活跃代理</h2>
-              <p className="mt-1 text-xs text-muted-foreground">当前正在处理连接的代理节点</p>
+              <h2 className="font-semibold">代理预览</h2>
+              <p className="mt-1 text-xs text-muted-foreground">前 10 个代理节点</p>
             </div>
-            <span className="text-xs text-muted-foreground">{activeProxies.length} 个</span>
+            <Link className="text-xs text-muted-foreground hover:text-foreground" to="/app/proxies">
+              查看全部
+            </Link>
           </div>
           <div className="mt-4 divide-y divide-border">
-            {activeProxies.length ? (
-              activeProxies.map((node) => (
-                <div
-                  className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
+            {proxyPreview.length ? (
+              proxyPreview.map((node) => (
+                <Link
+                  className="flex cursor-pointer items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
                   key={node.id}
+                  to="/app/proxies"
                 >
                   <div className="min-w-0">
                     <strong className="block truncate text-sm">
                       {node.alias ?? nodeDisplayName(node.id)}
                     </strong>
-                    <p className="text-xs text-muted-foreground">当前活动连接</p>
+                    <p className="truncate font-mono text-xs text-muted-foreground">
+                      {node.exitIp ?? "尚未获取出口 IP"}
+                    </p>
                   </div>
-                  <AnimatedBadge status="success" showIcon={false}>
-                    {node.activeConnections} 个
-                  </AnimatedBadge>
-                </div>
+                  <StatusBadge value={node.status} />
+                </Link>
               ))
             ) : (
-              <AnimatedBadge status="neutral">暂无活跃代理</AnimatedBadge>
+              <AnimatedBadge status="neutral">暂无代理</AnimatedBadge>
             )}
           </div>
         </section>
 
         <section className="rounded-2xl bg-card px-5 py-7 sm:px-6 md:px-8">
           <div className="flex items-center justify-between gap-3">
-            <h2 className="font-semibold">最近操作</h2>
-            {snapshot.operations[0] ? (
-              <span className="text-xs text-muted-foreground">
-                {new Date(snapshot.operations[0].updatedAt).toLocaleTimeString()}
-              </span>
-            ) : null}
+            <div>
+              <h2 className="font-semibold">出口 IP 预览</h2>
+              <p className="mt-1 text-xs text-muted-foreground">前 10 个已验证出口</p>
+            </div>
+            <Link className="text-xs text-muted-foreground hover:text-foreground" to="/app/proxies">
+              查看全部
+            </Link>
           </div>
           <div className="mt-4 divide-y divide-border">
-            {snapshot.operations.slice(0, 4).map((operation) => (
-              <div
-                className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
-                key={operation.id}
-              >
-                <div className="min-w-0">
-                  <strong className="block text-sm">
-                    {operation.kind === "force" ? "强制应用订阅" : "同步订阅"}
-                  </strong>
-                  <p className="text-xs text-muted-foreground">
-                    {new Date(operation.updatedAt).toLocaleString()}
-                  </p>
-                </div>
-                <StatusBadge value={operation.status} />
-              </div>
-            ))}
-            {snapshot.operations.length === 0 ? (
-              <AnimatedBadge status="neutral">暂无控制面操作</AnimatedBadge>
-            ) : null}
+            {exitIpPreview.length ? (
+              exitIpPreview.map((exit) => (
+                <Link
+                  className="flex cursor-pointer items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"
+                  key={exit.ip}
+                  to="/app/proxies"
+                >
+                  <div className="min-w-0">
+                    <strong className="block truncate font-mono text-sm">{exit.ip}</strong>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {exit.location ?? "位置未知"}
+                    </p>
+                  </div>
+                  <AnimatedBadge status="neutral" showIcon={false}>
+                    {exit.nodeCount} 个节点
+                  </AnimatedBadge>
+                </Link>
+              ))
+            ) : (
+              <AnimatedBadge status="neutral">暂无出口 IP</AnimatedBadge>
+            )}
           </div>
         </section>
       </div>
@@ -791,7 +792,6 @@ export function SubscriptionsPage() {
             columns={columns}
             getRowId={(item) => item.id}
             rowHeight={48}
-            height={tableHeight(visible.length)}
             emptyState={
               snapshot.subscriptions.length === 0
                 ? "还没有订阅，使用“添加订阅”导入第一个来源。"
@@ -968,6 +968,15 @@ export function ProxiesPage() {
       cell: (node) => <StatusBadge value={node.status} />,
     },
     {
+      key: "exitVerifiedAt",
+      header: "检查时间",
+      width: "11rem",
+      sortable: true,
+      sortValue: (node) => node.exitVerifiedAt ?? 0,
+      cell: (node) =>
+        node.exitVerifiedAt ? new Date(node.exitVerifiedAt).toLocaleString() : "尚未检查",
+    },
+    {
       key: "latencyMs",
       header: "延迟",
       width: "6rem",
@@ -1065,7 +1074,7 @@ export function ProxiesPage() {
           </Button>
           <Button loading={verifyingAll} onClick={() => void verifyAllExits()}>
             <Pulse size={18} />
-            验证全部出口 IP
+            全部出口IP（{exitIpOptions.length}）
           </Button>
         </div>
         <Table
@@ -1073,7 +1082,6 @@ export function ProxiesPage() {
           columns={columns}
           getRowId={(node) => node.id}
           rowHeight={56}
-          height={tableHeight(visible.length)}
           emptyState={
             snapshot.nodes.length === 0
               ? "还没有可调度节点，请先导入并成功应用订阅。"
@@ -1165,7 +1173,6 @@ export function SessionsPage() {
           columns={columns}
           getRowId={(session) => session.id}
           rowHeight={48}
-          height={tableHeight(visible.length)}
           emptyState="当前没有活跃会话。客户端使用 sticky 或 strict 模式建立连接后，会话会显示在这里。"
         />
       </CardContent>

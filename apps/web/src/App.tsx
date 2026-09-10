@@ -80,12 +80,20 @@ export function useConsole(): ConsoleContextValue {
 }
 
 export function App() {
-  const [token, setToken] = useState(() => sessionStorage.getItem(tokenKey) ?? "");
+  const [token, setToken] = useState(() => {
+    const persisted = localStorage.getItem(tokenKey);
+    if (persisted) return persisted;
+    const legacy = sessionStorage.getItem(tokenKey) ?? "";
+    if (legacy) localStorage.setItem(tokenKey, legacy);
+    return legacy;
+  });
   const authenticate = (nextToken: string) => {
-    sessionStorage.setItem(tokenKey, nextToken);
+    localStorage.setItem(tokenKey, nextToken);
+    sessionStorage.removeItem(tokenKey);
     setToken(nextToken);
   };
   const clearAuthentication = useCallback(() => {
+    localStorage.removeItem(tokenKey);
     sessionStorage.removeItem(tokenKey);
     setToken("");
   }, []);
