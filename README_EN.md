@@ -196,3 +196,7 @@ docker logs --tail 100 egresskit
 ## License
 
 EgressKit is licensed under Apache-2.0. Mihomo runs as a separate GPL-3.0 process; the Docker image includes the relevant licenses, attribution, and corresponding-source information.
+
+## Community
+
+- [LINUX DO](https://linux.do) — A community for developers and technology enthusiasts.
