@@ -17,7 +17,7 @@ RUN pnpm --filter @egresskit/app-web build \
 
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends wget \
+    && apt-get install --yes --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 ARG MIHOMO_VERSION=v1.19.30

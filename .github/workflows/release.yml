@@ -66,6 +66,8 @@ jobs:
           image="egresskit:validation-${{ matrix.name }}"
           docker run --rm --entrypoint mihomo "$image" -v | grep -F 'Mihomo Meta v1.19.30'
           docker run --rm --entrypoint sh "$image" -c \
+            'test -s /etc/ssl/certs/ca-certificates.crt && command -v wget >/dev/null'
+          docker run --rm --entrypoint sh "$image" -c \
             'test -r /usr/share/licenses/egresskit/LICENSE && test -r /usr/share/licenses/egresskit/THIRD_PARTY_NOTICES.md && test -r /usr/share/licenses/egresskit/Mihomo-GPL-3.0.txt'
           container=$(docker run --detach --publish 127.0.0.1::8787 \
             --env EGRESSKIT_ADMIN_TOKEN=validation-admin \
