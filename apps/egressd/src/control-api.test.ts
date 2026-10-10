@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { loadConfig } from "./config.js";
 import { startEgressd } from "./daemon.js";
 import type { SessionBindingStore } from "./session.js";
 import { openControlState } from "./state.js";
@@ -686,3 +687,64 @@ function connectProxyStatus(
     socket.on("error", reject);
   });
 }
+
+test("public entry URLs come from bootstrap configuration and cannot be overwritten through settings", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "egresskit-endpoints-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const config = loadConfig({
+    EGRESSKIT_ADMIN_TOKEN: "admin-secret",
+    EGRESSKIT_PUBLIC_PROXY_URL: "http://proxy.example.com:9797",
+    EGRESSKIT_PUBLIC_RELAY_URL: "https://relay.example.com/",
+  });
+  const daemon = await startEgressd({
+    adminToken: config.adminToken,
+    publicProxyUrl: config.publicProxyUrl,
+    publicRelayUrl: config.publicRelayUrl,
+    host: "127.0.0.1",
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => daemon.close());
+  const api = (path: string, body?: unknown) =>
+    fetch(`http://127.0.0.1:${daemon.address.port}${path}`, {
+      method: body === undefined ? "GET" : "PUT",
+      headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  const snapshot = () =>
+    api("/console/snapshot").then((response) => response.json()) as Promise<{
+      gateway: Record<string, unknown>;
+    }>;
+  assert.equal((await snapshot()).gateway.publicProxyUrl, "http://proxy.example.com:9797");
+  assert.equal((await snapshot()).gateway.publicRelayUrl, "https://relay.example.com");
+  const { settings } = (await api("/settings").then((response) => response.json())) as {
+    settings: Record<string, unknown>;
+  };
+  assert.equal("publicProxyUrl" in settings, false);
+  assert.equal("publicRelayUrl" in settings, false);
+  assert.equal(
+    (
+      await api("/settings", {
+        ...settings,
+        publicProxyUrl: "http://ignored.example.com",
+        publicRelayUrl: "https://ignored.example.com",
+      })
+    ).status,
+    200,
+  );
+  assert.equal((await snapshot()).gateway.publicProxyUrl, "http://proxy.example.com:9797");
+  assert.equal((await snapshot()).gateway.publicRelayUrl, "https://relay.example.com");
+  await daemon.close();
+  const restarted = await startEgressd({
+    adminToken: config.adminToken,
+    host: "127.0.0.1",
+    port: 0,
+    stateDirectory,
+  });
+  t.after(() => restarted.close());
+  const reset = (await fetch(`http://127.0.0.1:${restarted.address.port}/console/snapshot`, {
+    headers: { authorization: "Bearer admin-secret" },
+  }).then((response) => response.json())) as { gateway: Record<string, unknown> };
+  assert.equal(reset.gateway.publicProxyUrl, "");
+  assert.equal(reset.gateway.publicRelayUrl, "");
+});

@@ -763,7 +763,7 @@ describe("console router", () => {
   });
 
   it("opens the requested route after validating the token", async () => {
-    const request = vi.fn(async (input: RequestInfo | URL) => {
+    const request = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const path = String(input);
       if (path === "/console/snapshot") {
         return new Response(JSON.stringify(snapshot), {
@@ -859,10 +859,10 @@ describe("console router", () => {
     expect(screen.queryByText("命令已复制")).toBeNull();
     expect(await screen.findByText(/rotate:real-proxy-token/)).toBeTruthy();
 
-    await user.click(screen.getByLabelText("代理模式"));
+    await user.click(screen.getByLabelText("选路模式"));
     await user.click(screen.getByRole("option", { name: "Strict sticky" }));
     expect(screen.getByText(/strict\.session-demo:real-proxy-token/)).toBeTruthy();
-    await user.click(screen.getByLabelText("代理模式"));
+    await user.click(screen.getByLabelText("选路模式"));
     await user.click(screen.getByRole("option", { name: "指定节点" }));
     expect(screen.getByText(/node\.tokyo-a:real-proxy-token/)).toBeTruthy();
 
@@ -878,13 +878,73 @@ describe("console router", () => {
     const requestLog = screen.getByRole("button", { name: /https:\/\/example\.com.*成功/ });
     expect(requestLog.textContent).toContain("HTTP 200");
     await user.click(screen.getByRole("button", { name: "检查出口 IP" }));
-    expect((target as HTMLInputElement).value).toBe("https://ipinfo.io/json");
+    expect((target as HTMLInputElement).value).toBe("https://api.ipify.org");
     await user.click(requestLog);
     expect((target as HTMLInputElement).value).toBe("https://example.com");
     expect(screen.getByText(/203\.0\.113\.1/)).toBeTruthy();
   });
 
-  it("uses the browser origin when the daemon listens on all interfaces", async () => {
+  it("queries the exit IP through URL relay, generates the public URL and restores access from request logs", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    const request = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const path = String(input);
+      const body = path.includes("/playground/config")
+        ? { proxyToken: "real-proxy-token", proxyTokenAvailable: true }
+        : path.includes("/playground/execute")
+          ? { body: "203.0.113.1", durationMs: 42, headers: {}, status: 200 }
+          : {
+              ...snapshot,
+              gateway: { ...snapshot.gateway, publicRelayUrl: "https://relay.example.com" },
+            };
+      return new Response(JSON.stringify(body), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", request);
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/app/playground"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByText(/rotate:real-proxy-token/);
+    await user.click(screen.getByLabelText("接入方式"));
+    await user.click(screen.getByRole("option", { name: "URL 转发" }));
+    expect(
+      screen.getByText(/curl 'https:\/\/relay.example.com\/relay\/rotate\/https\/api.ipify.org\/'/),
+    ).toBeTruthy();
+    expect(screen.getByText(/X-EgressKit-Token: real-proxy-token/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "检查出口 IP" }));
+    await user.click(screen.getByRole("button", { name: "发起请求" }));
+    expect(await screen.findByText("203.0.113.1")).toBeTruthy();
+    const execution = request.mock.calls.find(([path]) => String(path) === "/playground/execute");
+    expect(JSON.parse(String(execution?.[1]?.body))).toEqual({
+      access: "relay",
+      mode: "rotate",
+      target: "https://api.ipify.org",
+    });
+    const log = screen.getByRole("button", { name: /https:\/\/api.ipify.org.*URL 转发.*成功/ });
+    await user.click(screen.getByLabelText("接入方式"));
+    await user.click(screen.getByRole("option", { name: "正向代理" }));
+    expect(screen.getByText(/--proxy-user/)).toBeTruthy();
+    await user.click(log);
+    expect(screen.getByText(/X-EgressKit-Token: real-proxy-token/)).toBeTruthy();
+    await user.click(screen.getByLabelText("选路模式"));
+    await user.click(screen.getByRole("option", { name: "Strict sticky" }));
+    expect(screen.getByText(/\/relay\/strict.session-demo\/https\/api.ipify.org/)).toBeTruthy();
+    const target = screen.getByLabelText("目标 URL");
+    await user.clear(target);
+    await user.type(target, "https://example.com:8443/orders?key=a%2Fb&key=2#ignored");
+    expect(screen.getByText(/example.com:8443\/orders\?key=a%2Fb&key=2'/)).toBeTruthy();
+    await user.clear(target);
+    await user.type(target, "https://");
+    expect(screen.getByText("请输入有效的 HTTP 或 HTTPS 目标 URL。")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "发起请求" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("uses the browser hostname and listener port when the daemon listens on all interfaces", async () => {
     sessionStorage.setItem("egresskit-admin-token", "admin-secret");
     vi.stubGlobal(
       "fetch",
@@ -905,7 +965,8 @@ describe("console router", () => {
     expect(
       (
         await screen.findAllByText(
-          (_, element) => element?.textContent?.includes(window.location.origin) ?? false,
+          (_, element) =>
+            element?.textContent?.includes(`http://${window.location.hostname}:8787`) ?? false,
         )
       ).length,
     ).toBeGreaterThan(0);
@@ -932,14 +993,88 @@ describe("console router", () => {
     expect(command.textContent).not.toContain("\n+");
   });
 
+  it("displays environment-configured public entry addresses without an editing control", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ...snapshot,
+              gateway: {
+                ...snapshot.gateway,
+                publicProxyUrl: "http://proxy.example.com:9797",
+                publicRelayUrl: "https://relay.example.com",
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    render(
+      <MemoryRouter initialEntries={["/app"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText("http://proxy.example.com:9797")).toBeTruthy();
+    expect(screen.getByText("https://relay.example.com")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "配置入口" })).toBeNull();
+  });
+
+  it("uses configured entry addresses in proxy and relay documentation examples", async () => {
+    sessionStorage.setItem("egresskit-admin-token", "admin-secret");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ...snapshot,
+              gateway: {
+                ...snapshot.gateway,
+                publicProxyUrl: "http://proxy.example.com:9797",
+                publicRelayUrl: "https://relay.example.com",
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    render(
+      <MemoryRouter initialEntries={["/app/docs"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(
+      (
+        await screen.findAllByText(
+          (_, element) =>
+            element?.tagName === "CODE" &&
+            element.textContent?.includes("http://proxy.example.com:9797") === true,
+        )
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(
+        (_, element) =>
+          element?.tagName === "CODE" &&
+          element.textContent?.includes("https://relay.example.com/relay/") === true,
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+
   it("normalizes an already bracketed IPv6 gateway host", () => {
     expect(gatewayAddress("[::1]", 8787)).toBe("[::1]:8787");
   });
 
-  it("uses the externally visible origin for a wildcard Docker listener", () => {
+  it("keeps the proxy listener port separate from the console origin and honors configured addresses", () => {
     expect(gatewayUrl("0.0.0.0", 8787, "https://proxy.example.com")).toBe(
-      "https://proxy.example.com",
+      "http://proxy.example.com:8787",
     );
+    expect(
+      gatewayUrl("0.0.0.0", 8787, "https://console.example.com", "http://proxy.example.com:9797"),
+    ).toBe("http://proxy.example.com:9797");
     expect(gatewayUrl("[::1]", 8787, "https://proxy.example.com")).toBe("http://[::1]:8787");
   });
 });

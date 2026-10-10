@@ -96,6 +96,8 @@ test("console snapshot is authenticated and redacts management data", async (t) 
     subscriptions: Array<{ locator: string }>;
   };
   assert.deepEqual(body.gateway, {
+    publicProxyUrl: "",
+    publicRelayUrl: "",
     host: "127.0.0.1",
     port: daemon.address.port,
     ready: true,
@@ -327,6 +329,8 @@ test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) 
     env: {
       ...process.env,
       EGRESSKIT_ADMIN_TOKEN: "cli-admin-token",
+      EGRESSKIT_PUBLIC_PROXY_URL: "http://proxy.example.com:9797",
+      EGRESSKIT_PUBLIC_RELAY_URL: "https://relay.example.com/",
       HOME: homeDirectory,
       PATH: `${binaryDirectory}:${process.env.PATH ?? ""}`,
     },
@@ -359,6 +363,11 @@ test("egressd starts, imports local YAML, and shuts down on SIGTERM", async (t) 
 
     const response = await fetch(`http://${started.host}:${started.port}/live`);
     assert.equal(response.status, 200);
+    const snapshot = (await fetch(`http://${started.host}:${started.port}/console/snapshot`, {
+      headers: { authorization: "Bearer cli-admin-token" },
+    }).then((result) => result.json())) as { gateway: Record<string, unknown> };
+    assert.equal(snapshot.gateway.publicProxyUrl, "http://proxy.example.com:9797");
+    assert.equal(snapshot.gateway.publicRelayUrl, "https://relay.example.com");
 
     const imported = await fetch(`http://${started.host}:${started.port}/subscriptions/local`, {
       method: "POST",

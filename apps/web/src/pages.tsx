@@ -38,7 +38,7 @@ import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Textarea } from "./components/ui/textarea";
 import { useToast } from "./components/ui/toast";
-import { gatewayUrl } from "./lib/gateway-address";
+import { gatewayUrl, relayUrl } from "./lib/gateway-address";
 
 export { gatewayAddress, gatewayUrl } from "./lib/gateway-address";
 
@@ -51,7 +51,9 @@ type PlaygroundResult = {
   headers: Record<string, string | string[]>;
   status: number;
 };
+type PlaygroundAccess = "proxy" | "relay";
 type PlaygroundLog = {
+  access: PlaygroundAccess;
   error?: string;
   id: string;
   mode: string;
@@ -181,7 +183,21 @@ export function OverviewPage() {
   const { metrics } = snapshot;
   const proxyPreview = snapshot.nodes.slice(0, 10);
   const exitIpPreview = snapshot.exitIps.slice(0, 10);
-  const gateway = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
+  const gateway = gatewayUrl(
+    snapshot.gateway.host,
+    snapshot.gateway.port,
+    window.location.origin,
+    snapshot.gateway.publicProxyUrl,
+  );
+  const relay = relayUrl(snapshot.gateway.publicRelayUrl);
+  const copyRelay = async () => {
+    try {
+      await navigator.clipboard?.writeText(relay);
+      toast({ message: "反向代理地址已复制", variant: "success" });
+    } catch (error) {
+      toast({ message: error instanceof Error ? error.message : "复制失败", variant: "error" });
+    }
+  };
   const [refreshing, setRefreshing] = useState(false);
   const refreshOverview = async () => {
     setRefreshing(true);
@@ -250,6 +266,23 @@ export function OverviewPage() {
               <code className="mt-2 block truncate text-xl font-semibold sm:text-2xl">
                 {gateway}
               </code>
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs text-background/65">反向代理地址 · CDN / HTTP 反代</p>
+              <div className="mt-2 flex items-center gap-2">
+                <code className="min-w-0 truncate text-base font-semibold" title={relay}>
+                  {relay}
+                </code>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="shrink-0 text-background/75 hover:bg-background/10 hover:text-background"
+                  aria-label="复制反向代理地址"
+                  onClick={() => void copyRelay()}
+                >
+                  <Copy size={16} />
+                </Button>
+              </div>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -1352,8 +1385,9 @@ export function SettingsPage() {
 export function PlaygroundPage() {
   const { api, snapshot } = useConsole();
   const toast = useToast();
+  const [access, setAccess] = useState<PlaygroundAccess>("proxy");
   const [mode, setMode] = useState("rotate");
-  const [target, setTarget] = useState("https://ipinfo.io/json");
+  const [target, setTarget] = useState("https://api.ipify.org");
   const [node, setNode] = useState(snapshot.nodes[0]?.alias ?? snapshot.nodes[0]?.id ?? "node-id");
   const [proxyToken, setProxyToken] = useState("");
   const [result, setResult] = useState<PlaygroundResult>();
@@ -1369,16 +1403,36 @@ export function PlaygroundPage() {
         setRequestError(error instanceof Error ? error.message : "无法读取 Proxy Token"),
       );
   }, [api]);
-  const proxy = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
+  const proxy = gatewayUrl(
+    snapshot.gateway.host,
+    snapshot.gateway.port,
+    window.location.origin,
+    snapshot.gateway.publicProxyUrl,
+  );
   const username =
     mode === "node"
       ? `node.${encodeProxyUsernameValue(node)}`
       : mode === "rotate"
         ? "rotate"
         : `${mode}.session-demo`;
-  const command = `curl --proxy ${shellQuote(proxy)} --proxy-user "${username}:${proxyToken}" ${shellQuote(target)}`;
+  const relay = relayUrl(snapshot.gateway.publicRelayUrl);
+  let relayTarget: string | undefined;
+  try {
+    const url = new URL(target);
+    if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) {
+      relayTarget = `${relay}/relay/${encodeURIComponent(username)}/${url.protocol.slice(0, -1)}/${url.host}${url.pathname}${url.search}`;
+    }
+  } catch {
+    // Keep editing incomplete URLs without interrupting the page.
+  }
+  const command =
+    access === "relay"
+      ? relayTarget
+        ? `curl ${shellQuote(relayTarget)} -H ${shellQuote(`X-EgressKit-Token: ${proxyToken}`)}`
+        : "请输入有效的 HTTP 或 HTTPS 目标 URL。"
+      : `curl --proxy ${shellQuote(proxy)} --proxy-user ${shellQuote(`${username}:${proxyToken}`)} ${shellQuote(target)}`;
   const examples = [
-    { label: "检查出口 IP", value: "https://ipinfo.io/json" },
+    { label: "检查出口 IP", value: "https://api.ipify.org" },
     { label: "访问网站", value: "https://example.com" },
     { label: "查询隧道", value: "https://httpbin.org/anything" },
     { label: "自定义请求", value: "https://" },
@@ -1394,6 +1448,7 @@ export function PlaygroundPage() {
     setRequestError("");
     const requestSnapshot = {
       id: `${Date.now()}-${requestSequence.current++}`,
+      access,
       mode,
       ...(mode === "node" ? { node } : {}),
       requestedAt: new Date().toISOString(),
@@ -1401,6 +1456,7 @@ export function PlaygroundPage() {
     };
     try {
       const nextResult = await api.send<PlaygroundResult>("/playground/execute", "POST", {
+        access,
         mode,
         ...(mode === "node" ? { node } : {}),
         target,
@@ -1428,9 +1484,29 @@ export function PlaygroundPage() {
         <CardContent className="pt-6">
           <form className="space-y-4" onSubmit={execute}>
             <div>
-              <p className="mb-1.5 px-1 text-sm font-medium">代理模式</p>
+              <p className="mb-1.5 px-1 text-sm font-medium">接入方式</p>
+              <Select
+                value={access}
+                onValueChange={(value) => setAccess(value as PlaygroundAccess)}
+              >
+                <SelectTrigger ariaLabel="接入方式">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="proxy">正向代理</SelectItem>
+                  <SelectItem value="relay">URL 转发</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="mt-2 px-1 text-xs leading-5 text-muted-foreground">
+                {access === "relay"
+                  ? "通过 /relay/ URL 发送普通 HTTP 请求，支持 CDN / HTTP 反代。"
+                  : "通过 HTTP Proxy / CONNECT 接入，需直连代理端口或四层 TCP 转发。"}
+              </p>
+            </div>
+            <div>
+              <p className="mb-1.5 px-1 text-sm font-medium">选路模式</p>
               <Select value={mode} onValueChange={setMode}>
-                <SelectTrigger ariaLabel="代理模式">
+                <SelectTrigger ariaLabel="选路模式">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1460,7 +1536,7 @@ export function PlaygroundPage() {
               type="submit"
               hoverScale={1}
               pressScale={1}
-              disabled={!target}
+              disabled={!target || (access === "relay" && !relayTarget)}
               loading={requesting}
             >
               发起请求
@@ -1478,6 +1554,7 @@ export function PlaygroundPage() {
                   className="flex w-full cursor-pointer items-center justify-between gap-3 py-3 text-left first:pt-0 last:pb-0 hover:text-foreground"
                   key={log.id}
                   onClick={() => {
+                    setAccess(log.access);
                     setMode(log.mode);
                     setTarget(log.target);
                     if (log.node) setNode(log.node);
@@ -1488,7 +1565,7 @@ export function PlaygroundPage() {
                   <span className="min-w-0">
                     <strong className="block truncate text-sm">{log.target}</strong>
                     <span className="mt-1 block text-xs text-muted-foreground">
-                      {log.mode}
+                      {log.access === "relay" ? "URL 转发" : "正向代理"} · {log.mode}
                       {log.result ? ` · HTTP ${log.result.status}` : ""} ·{" "}
                       {new Date(log.requestedAt).toLocaleTimeString()}
                     </span>

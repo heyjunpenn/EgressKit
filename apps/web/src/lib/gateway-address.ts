@@ -9,9 +9,13 @@ export function gatewayUrl(
   host: string,
   port: number,
   browserOrigin = window.location.origin,
+  publicProxyUrl = "",
 ): string {
-  if (host === "0.0.0.0" || host === "::") {
-    return browserOrigin;
-  }
-  return `http://${gatewayAddress(host, port)}`;
+  if (publicProxyUrl) return publicProxyUrl;
+  const displayHost = host === "0.0.0.0" || host === "::" ? new URL(browserOrigin).hostname : host;
+  return `http://${gatewayAddress(displayHost, port)}`;
+}
+
+export function relayUrl(publicRelayUrl = "", browserOrigin = window.location.origin): string {
+  return (publicRelayUrl || browserOrigin).replace(/\/$/, "");
 }

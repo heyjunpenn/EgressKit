@@ -78,11 +78,43 @@ curl --silent --show-error --max-time 30 \
 
 成功响应应包含 `visit_scheme=https`、`tls=`、`http=`、`loc=` 和出口 `ip=`。访问 HTTPS 目标时，curl 会先向 EgressKit 建立 CONNECT 隧道，再由选中的 Mihomo 节点连接目标。
 
-也可以在“快速操作”页面填写目标 URL 并点击“发起请求”，查看请求日志、curl 示例和响应结果。
+也可以在“快速操作”页面选择“正向代理”或“URL 转发”，点击“检查出口 IP”填写 IP 查询目标，再点击“发起请求”，查看请求日志、对应的 curl 示例和响应结果。接入方式与 Rotate / Sticky 等选路模式分别选择。
 
 ![控制台请求成功](docs/images/docker-walkthrough/05-curl-success.png)
 
 > 截图来自隔离验证容器，其中使用了测试端口 `18787`；按本文启动时使用 `8787`，操作方式相同。截图中的订阅地址、节点名称、Token 和出口信息均已遮盖。
+
+## 接入方式
+
+| 接入方式 | 客户端请求 | 认证 | 对外部署 |
+| --- | --- | --- | --- |
+| 正向代理（Forward proxy） | 配置 HTTP 代理，HTTPS 目标使用 CONNECT | 代理用户名选择路由，密码为 Proxy Token | 直连代理端口或四层 TCP 转发 |
+| URL 转发（Relay，反向代理请求） | 请求 `/relay/<路由>/<协议>/<目标主机>/<路径>` | `X-EgressKit-Token` 为 Proxy Token | 可经普通 CDN / HTTP 反代转发 |
+
+接入方式决定客户端如何连接网关；下面的 Rotate / Sticky 等选路模式决定使用哪个出口。
+两种接入方式共用出口 IP 调度与会话绑定规则。
+
+### 查询出口 IP
+
+正向代理：
+
+```sh
+curl --silent --show-error --max-time 30 \
+  --proxy 'http://proxy.example.com:8787' \
+  --proxy-user 'rotate:YOUR_PROXY_TOKEN' \
+  'https://api.ipify.org'
+```
+
+URL 转发：
+
+```sh
+curl --silent --show-error --max-time 30 \
+  'https://egress.example.com/relay/rotate/https/api.ipify.org/' \
+  -H 'X-EgressKit-Token: YOUR_PROXY_TOKEN'
+```
+
+替换示例域名与 Proxy Token。响应正文是所选出口的公网 IP；Rotate 每次新请求可能选择不同出口。
+控制台操作步骤、请求日志和生成示例的说明见 [快速操作指南](docs/playground.md)。
 
 ## 路由模式
 
@@ -121,13 +153,34 @@ await page.goto("https://example.com");
 
 浏览器通常会复用连接。需要重新选择出口时，应创建新的浏览器上下文或连接，而不是依赖页面请求次数。
 
+### URL 转发：经 CDN / HTTP 反代发送请求
+
+客户端可以发送普通 HTTP 请求，无需配置 `--proxy`：
+
+```sh
+curl 'https://egress.example.com/relay/rotate/https/api.ipify.org/' \
+  -H 'X-EgressKit-Token: YOUR_PROXY_TOKEN'
+```
+
+路径格式为 `/relay/<路由模式>/<http|https>/<目标主机及端口>/<目标路径>?查询参数`。
+路由模式沿用 `rotate`、`sticky.session-demo`、`strict.session-demo` 和 `node.<selector>`；每个 relay 请求独立选路。
+SDK 可把 BaseURL 设置为 `https://egress.example.com/relay/sticky.session-demo/https/api.example.com/v1`，
+并添加 `X-EgressKit-Token`。目标服务的 `Authorization`、请求方法和请求体照常发送。
+节点 ID/alias 等路由值放入 URL 时须对整个路由段进行 URL 编码。
+
+请求与响应流式转发，支持 POST 和 SSE；目标重定向会改写为 relay 地址。网关会验证目标 TLS 证书，
+可以读取此模式的业务内容，且不会把网关 Token 转发至目标。它适合 Web API 与抓取请求；
+Playwright 整站浏览、WebSocket 与客户端 TLS 指纹控制继续使用正向代理。
+部署示例见 [CDN / HTTP 反代配置](docs/deployment.md#cdn--http-反代接入)。
+
 ## 工作原理
 
-EgressKit 不直接实现 VLESS。它管理独立的官方 Mihomo 进程，并在其上提供统一的 HTTP 代理入口。
+EgressKit 不直接实现 VLESS。它使用一个独立的官方 Mihomo 进程承载全部节点 listener，并在其上提供统一的 HTTP 代理入口。
 
 ```mermaid
 flowchart LR
-    client["curl / Playwright / HTTP 客户端"] -->|"HTTP proxy / CONNECT"| gateway["EgressKit :8787"]
+    client["curl / Playwright / HTTP 客户端"] -->|"正向代理：HTTP Proxy / CONNECT"| gateway["EgressKit :8787"]
+    relayClient["curl / HTTP SDK"] -->|"URL 转发：/relay/ 普通 HTTP 请求"| gateway
     gateway --> auth["认证与路由模式"]
     auth --> scheduler["按出口 IP 调度"]
     scheduler --> listeners["Mihomo listeners"]
@@ -159,12 +212,27 @@ stateDiagram-v2
 - EgressKit 不提供节点或订阅；当前只从 Clash / Mihomo 订阅中导入 VLESS 节点。
 - `rotate` 按新的 HTTP 请求或 CONNECT 隧道选择出口。客户端复用连接时，隧道内的多个 HTTPS 请求仍使用同一出口。
 - CONNECT 隧道建立后不能无感切换出口或重放请求。上游连接中断时，由客户端重新连接。
-- 公开部署的代理端口必须直接接收 HTTP Proxy / CONNECT 流量。普通 CDN 或只处理网页请求的 HTTP 反向代理不能代替四层 TCP 转发。
+- URL 反向代理入口支持经普通 CDN / HTTP 反代接入，需禁用缓存与自动重试，并确认其支持请求体大小及流式超时要求。标准 HTTP Proxy / CONNECT 接入仍需直连代理端口或四层 TCP 转发。
 - SQLite 会明文保存订阅 URL、节点凭据和 Proxy Token。部署者需要保护状态目录及其备份。
 
 ## 配置与数据
 
-`EGRESSKIT_ADMIN_TOKEN` 是唯一环境变量。其他配置首次启动时写入 SQLite，并通过控制台更新。
+`EGRESSKIT_ADMIN_TOKEN` 为必填环境变量。公开入口可通过以下可选环境变量配置，启动时读取，修改后需重启服务（Docker 需重新创建容器）：
+
+```sh
+export EGRESSKIT_PUBLIC_PROXY_URL=http://proxy.example.com:8787
+export EGRESSKIT_PUBLIC_RELAY_URL=https://egress.example.com
+```
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `EGRESSKIT_PUBLIC_PROXY_URL` | 正向代理入口，更新页面展示和 `curl --proxy` 示例 |
+| `EGRESSKIT_PUBLIC_RELAY_URL` | URL 转发入口，更新页面展示和 `/relay/...` 示例 |
+
+只填写协议、主机和可选端口，不添加 `/relay/`、目标路径、认证信息、查询参数或片段。
+变量用于页面展示、复制及调用示例，不保存到 SQLite，也不修改监听端口或部署转发规则。
+未设置或留空时自动生成；默认地址和 Docker 配置见 [部署指南](docs/deployment.md#配置对外入口地址)。
+其他运行配置首次启动时写入 SQLite，并通过控制台更新。
 
 | 配置 | 默认值 |
 | --- | ---: |

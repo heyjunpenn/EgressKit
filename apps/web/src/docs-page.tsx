@@ -5,12 +5,18 @@ import { Button } from "./components/motion/button/base";
 import { Tooltip } from "./components/motion/tooltip";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { useToast } from "./components/ui/toast";
-import { gatewayUrl } from "./lib/gateway-address";
+import { gatewayUrl, relayUrl } from "./lib/gateway-address";
 
 export function DocsPage() {
   const { snapshot } = useConsole();
   const toast = useToast();
-  const proxy = gatewayUrl(snapshot.gateway.host, snapshot.gateway.port);
+  const proxy = gatewayUrl(
+    snapshot.gateway.host,
+    snapshot.gateway.port,
+    window.location.origin,
+    snapshot.gateway.publicProxyUrl,
+  );
+  const relay = relayUrl(snapshot.gateway.publicRelayUrl);
   const sections = [
     ["1", "配置 Proxy Token", "在服务端设置独立的 Proxy Token，不要复用 Admin Token。"],
     [
@@ -18,7 +24,7 @@ export function DocsPage() {
       "选择路由模式",
       "使用 rotate、sticky.<session>、strict.<session> 或 node.<selector> 作为代理用户名。",
     ],
-    ["3", "发起请求", "通过标准 HTTP_PROXY / HTTPS_PROXY 或 curl --proxy 接入。"],
+    ["3", "发起请求", "通过标准代理接入，或使用 URL 反向代理经 CDN / HTTP 反代请求目标。"],
   ];
 
   return (
@@ -96,6 +102,28 @@ export function DocsPage() {
           </CardContent>
         </Card>
       </div>
+      <Card className="mt-4">
+        <CardHeader>
+          <CardTitle>
+            <h2>经 CDN / HTTP 反代请求目标</h2>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm leading-6 text-muted-foreground">
+            发送普通 HTTP 请求，无需配置代理。路径中的 rotate 可替换为 sticky.session-demo、
+            strict.session-demo 或 node.&lt;selector&gt;；每个请求独立选路。
+          </p>
+          <pre className="overflow-x-auto rounded-lg bg-foreground p-4 text-xs leading-6 text-background">
+            <code>{`curl '${relay}/relay/rotate/https/api.ipify.org/' \\
+  -H 'X-EgressKit-Token: YOUR_PROXY_TOKEN'`}</code>
+          </pre>
+          <p className="text-sm leading-6 text-muted-foreground">
+            SDK 可将上述地址设为 BaseURL，并添加 X-EgressKit-Token。目标服务的 Authorization
+            照常传入；请求和响应支持流式传输。CDN 需禁用缓存与自动重试，并支持所需超时与请求大小。
+            网关可读取此模式的业务内容；整站浏览和 WebSocket 继续使用正向代理。
+          </p>
+        </CardContent>
+      </Card>
       <div className="mt-4 grid gap-4 lg:grid-cols-3">
         <Card>
           <CardHeader>
@@ -104,6 +132,10 @@ export function DocsPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
+            <p className="mb-4 text-sm leading-6 text-muted-foreground">
+              可通过环境变量 EGRESSKIT_PUBLIC_PROXY_URL 和 EGRESSKIT_PUBLIC_RELAY_URL
+              指定公开入口地址。未设置时自动生成，修改后需重新创建容器。
+            </p>
             <pre className="overflow-x-auto rounded-lg bg-foreground p-4 text-xs leading-6 text-background">
               <code>{`docker run --rm \
   -v egresskit-state:/var/lib/egresskit \

@@ -1,6 +1,6 @@
 # EgressKit 产品规格
 
-> 状态：已确认的产品与技术基线，尚未实现  
+> 状态：已确认的产品与技术基线；后续范围决策见 docs/adr/
 > 产品形态：开源、自托管  
 > 核心定位：一个代理入口，动态管理多个出口  
 > 英文定位：One proxy endpoint, many managed exits.
@@ -15,7 +15,7 @@
 
 ## Solution
 
-EgressKit 将作为一个 Node.js 22+、TypeScript 编写的自托管代理网关运行。它对外提供一个完整 HTTP 代理入口，支持普通 HTTP 代理请求和 HTTPS `CONNECT`；对内启动并管理官方 Mihomo 稳定版独立进程。每个活跃 VLESS 节点对应一个仅在本机监听的 Mihomo HTTP listener，listener 固定绑定到一个出站节点。EgressKit 通过选择内部 listener 精确控制每个新代理请求或 CONNECT 隧道的出口。
+EgressKit 将作为一个 Node.js 22+、TypeScript 编写的自托管代理网关运行。它对外提供一个完整 HTTP 代理入口，支持普通 HTTP 代理请求和 HTTPS `CONNECT`；对内启动并管理一个官方 Mihomo 稳定版独立进程，所有 listener 由该进程承载。每个活跃 VLESS 节点对应一个仅在本机监听的 Mihomo HTTP listener，listener 固定绑定到一个出站节点。EgressKit 通过选择内部 listener 精确控制每个新代理请求或 CONNECT 隧道的出口。
 
 ```mermaid
 flowchart LR
@@ -43,7 +43,9 @@ flowchart LR
     listener_c --> node_c["VLESS C"]
 ```
 
-产品的首要使用场景是网页抓取和 Playwright 浏览器自动化。EgressKit 不解密 HTTPS，不查看业务内容，也不在隧道建立后尝试无缝切换出口。透明失败回退仅发生在向客户端确认隧道建立之前；隧道建立后的失败由客户端重新连接，下一条连接再按会话策略选路。
+此外提供 URL 反向代理接入：调用方发送普通 HTTP 请求，服务端通过选中的 listener 请求目标，因此可以部署在支持该请求的 CDN 或 HTTP 反代后。反向代理会终止 HTTP/TLS 并读取转发内容；正向代理 CONNECT 的 TLS 仍保持端到端。
+
+产品的首要使用场景是网页抓取和 Playwright 浏览器自动化。EgressKit 在 CONNECT 模式下不解密 HTTPS、不查看业务内容，也不在隧道建立后尝试无缝切换出口。透明失败回退仅发生在向客户端确认隧道建立之前；隧道建立后的失败由客户端重新连接，下一条连接再按会话策略选路。
 
 EgressKit 默认使用 SQLite 保存控制面状态，包括原始订阅 URL、规范化 VLESS 节点、节点 generation、稳定端口、会话绑定、运行时 revision 和异步 operation。数据明文保存，不使用 SQLCipher，不做字段加密，也不主动收紧 SQLite 文件权限；部署者负责状态目录的本机访问和备份安全。
 
@@ -143,7 +145,7 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 
 - 项目正式命名为 EgressKit；CLI 名称为 `egresskit`，守护进程名称为 `egressd`，环境变量统一使用 `EGRESSKIT_` 前缀。
 - EgressKit 使用 Node.js 22 LTS 或更高版本和 TypeScript strict mode 实现。
-- Mihomo 作为独立 GPL-3.0 进程运行，不作为 Go library 链接，不使用 FFI，不 fork，不修改内核源码。
+- Mihomo 作为单个长期运行的独立 GPL-3.0 进程承载所有 listener，通过私有 Unix socket Controller API 热更新；静态检查使用短暂的 `-t` 子进程。Mihomo 不作为 Go library 链接，不使用 FFI，不 fork，不修改内核源码。
 - v1 只正式支持官方 Mihomo 稳定版。用户可以提供二进制路径，也可以显式执行 runtime 安装命令；npm 安装不得隐式下载二进制。
 - Docker 镜像锁定明确 Mihomo 版本与校验值，不依赖浮动的 latest 或 Alpha。
 - EgressKit 通过 Mihomo CLI、专用配置文件、Controller API 和本机 HTTP listeners 四个边界集成内核。
@@ -152,8 +154,11 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 ### 代理入口和选路
 
 - 对外提供一个完整 HTTP 代理入口，支持普通 HTTP absolute-form 和 HTTPS CONNECT。
+- 同时提供 `/relay/<route>/<http|https>/<authority>/<path>?query` 普通 HTTP 反向代理入口；使用 `X-EgressKit-Token` 认证，复用出口 IP 选路与会话绑定，支持流式请求/响应。代理认证头与逐跳头不转发至目标；目标 Authorization 独立保留。目标 HTTPS 证书必须通过校验。
+- 普通 HTTP 反代/CDN 可转发 relay 请求，须禁用缓存与自动重试；正向代理接入仍要求直接支持 Proxy / CONNECT。
 - 每个活跃 VLESS 节点对应一个独立的本机 Mihomo HTTP listener；listener 的固定 proxy 指向对应出站节点。
 - 内部 listeners 只绑定 loopback，不作为公开接口。
+- 对外 HTTP 代理地址与反向代理地址分别由启动环境变量 `EGRESSKIT_PUBLIC_PROXY_URL` 和 `EGRESSKIT_PUBLIC_RELAY_URL` 指定，用于控制台展示、复制与示例，不保存到 SQLite。修改后需重启服务；留空时，正向代理使用实际监听主机/端口（监听所有网卡时使用控制台主机名），反向代理使用当前控制台 origin。
 - 代理用户名协议表达调度模式和 session key；代理密码承载访问 token。
 - 用户名模式包括 rotate、soft sticky、strict sticky 和指定 node ID/alias。
 - rotate 按新 CONNECT 隧道或普通 HTTP 代理请求轮换出口 IP，不承诺按 HTTPS 隧道内部的每个业务请求轮换。
@@ -227,7 +232,7 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 - 本机 CLI通过 Unix domain socket 管理 API执行读写；它不绕过 daemon 访问 SQLite。
 - HTTP 管理 API和 Unix socket 都要求独立 admin token；admin token 与代理入口 token 不同。
 - Docker 镜像内置同版本 Web 控制台，由 `egressd` 提供静态资源和 SPA 路由。
-- Web 控制台覆盖概览、订阅管理、代理管理、活跃会话、快捷操作 Playground 和使用文档；登录凭据仅保存在浏览器会话中。
+- Web 控制台覆盖概览、订阅管理、代理管理、活跃会话、快捷操作 Playground 和使用文档；登录凭据仅保存在浏览器会话中。快捷操作分别选择“正向代理”或“URL 转发”接入方式和 Rotate / Sticky 等选路模式，支持出口 IP 查询、执行请求、生成 curl 示例及恢复请求日志。
 - 除 `/live` 与 `/ready` 基础设施探针外，Web 控制台发起的全部管理 API 请求都必须携带 admin token；代理数据面继续使用独立的 proxy token。
 - CLI默认可以显示完整订阅 URL，并提供 `--redact`；HTTP API不提供读取完整 URL的能力。
 - CLI支持从标准输入读取订阅 URL，减少 URL进入 shell history 的机会。
@@ -345,7 +350,8 @@ EgressKit 提供 CLI、守护进程、HTTP 管理 API、本机 Unix socket 管�
 - 在 Node.js 中实现 VLESS、Reality、TLS、WebSocket 或 gRPC 代理协议。
 - Fork、修改或进程内链接 Mihomo。
 - 使用 Mihomo Smart Core 或由 Mihomo代替 EgressKit做业务 session 调度。
-- TLS MITM、证书签发、HTTPS 内容读取或响应改写。
+- 正向代理 CONNECT 模式中的 TLS MITM、证书签发、HTTPS 内容读取或响应改写。
+- 反向代理模式中的 WebSocket、任意 TCP 隧道、整站浏览器透明代理与客户端 TLS 指纹保持。
 - 保证每个 HTTPS 内部 HTTP 请求更换出口 IP。
 - 已建立隧道中的无缝出口切换。
 - 网关自动重放 GET、POST 或其他业务请求。

@@ -20,7 +20,13 @@ export interface ConsoleSnapshot {
     nodeCount: number;
   }>;
   generatedAt: string;
-  gateway: { host: string; port: number; ready: boolean };
+  gateway: {
+    host: string;
+    port: number;
+    ready: boolean;
+    publicProxyUrl?: string;
+    publicRelayUrl?: string;
+  };
   metrics: {
     activeSessions: number;
     failedConnections: number;

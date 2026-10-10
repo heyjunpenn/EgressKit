@@ -78,11 +78,50 @@ curl --silent --show-error --max-time 30 \
 
 A successful response includes `visit_scheme=https`, `tls=`, `http=`, `loc=`, and the exit `ip=`. For an HTTPS target, curl first establishes a CONNECT tunnel through EgressKit, and the selected Mihomo node then connects to the target.
 
-You can also enter a target URL on the Playground page and select Send request to inspect the request log, generated curl command, and response.
+The Playground page supports **Forward proxy** and **URL relay** access, independently of Rotate / Sticky routing modes. Use the exit-IP shortcut or enter a target URL, then select Send request to inspect its response, request log and matching curl command.
 
 ![Successful console request](docs/images/docker-walkthrough/05-curl-success.png)
 
 > The screenshots were captured from an isolated verification container on host port `18787`; the documented setup uses `8787`. Subscription URLs, node names, tokens, exit IPs, and locations have been redacted.
+
+## Access methods
+
+| Access method | Client request | Authentication | Public deployment |
+| --- | --- | --- | --- |
+| Forward proxy | Configure an HTTP proxy; HTTPS targets use CONNECT | Routing username and Proxy Token as password | Direct proxy connectivity or Layer 4 TCP forwarding |
+| URL relay | Request `/relay/<route>/<scheme>/<target-authority>/<path>` | Proxy Token in `X-EgressKit-Token` | Ordinary CDN or HTTP reverse proxy |
+
+Access methods determine how the client connects to EgressKit. Rotate / Sticky routing modes determine
+which exit it uses. Both access methods share exit-IP scheduling and session bindings.
+
+### Query the exit IP
+
+Forward proxy:
+
+```sh
+curl --silent --show-error --max-time 30 \
+  --proxy 'http://proxy.example.com:8787' \
+  --proxy-user 'rotate:YOUR_PROXY_TOKEN' \
+  'https://api.ipify.org'
+```
+
+URL relay:
+
+```sh
+curl --silent --show-error --max-time 30 \
+  'https://egress.example.com/relay/rotate/https/api.ipify.org/' \
+  -H 'X-EgressKit-Token: YOUR_PROXY_TOKEN'
+```
+
+Replace the domains and Proxy Token. The response body contains the selected exit's public IP;
+Rotate may select a different exit on each new request. In Playground, select the access method and
+routing mode, click the exit-IP shortcut, then Send request. The matching curl command changes with
+the access method. Request logs retain the latest 20 attempts for the current page session; selecting
+a log restores its access method, route, target and response.
+
+Playground executes GET requests from the daemon through its local proxy or relay entry. To verify
+your public domain, CDN and TLS configuration, run the generated curl command from your client.
+See the [Playground guide (Chinese)](docs/playground.md).
 
 ## Routing modes
 
@@ -121,13 +160,36 @@ await page.goto("https://example.com");
 
 Browsers commonly reuse connections. Create a new browser context or connection when you need a new exit selection; page-request count does not equal rotation count.
 
+### URL relay: send requests through a CDN or HTTP reverse proxy
+
+Send an ordinary HTTP request without configuring `--proxy`:
+
+```sh
+curl 'https://egress.example.com/relay/rotate/https/api.ipify.org/' \
+  -H 'X-EgressKit-Token: YOUR_PROXY_TOKEN'
+```
+
+The path is `/relay/<route>/<http|https>/<target-authority>/<path>?query`.
+Routes use `rotate`, `sticky.session-demo`, `strict.session-demo`, or `node.<selector>`;
+each relay request acquires its own route. An SDK can use
+`https://egress.example.com/relay/sticky.session-demo/https/api.example.com/v1` as its BaseURL
+and add `X-EgressKit-Token`, while keeping the target's Authorization, method and body.
+URL-encode the entire route segment when using selectors with reserved characters.
+
+Request and response bodies stream, including POST and SSE. Redirects are rewritten into relay URLs,
+target TLS certificates are verified, and gateway credentials are stripped before forwarding.
+The gateway can read business content in this mode. Whole-browser proxying, WebSocket and custom
+client TLS fingerprints continue to require forward proxy access.
+See [deployment configuration](docs/deployment.md#cdn--http-反代接入).
+
 ## How it works
 
-EgressKit does not implement VLESS directly. It manages a separate official Mihomo process and exposes a unified HTTP proxy on top of it.
+EgressKit does not implement VLESS directly. It uses one separate official Mihomo process for all node listeners and exposes a unified HTTP proxy on top of it.
 
 ```mermaid
 flowchart LR
-    client["curl / Playwright / HTTP client"] -->|"HTTP proxy / CONNECT"| gateway["EgressKit :8787"]
+    client["curl / Playwright / HTTP client"] -->|"Forward proxy: HTTP Proxy / CONNECT"| gateway["EgressKit :8787"]
+    relayClient["curl / HTTP SDK"] -->|"URL relay: /relay/ HTTP request"| gateway
     gateway --> auth["Authentication and routing mode"]
     auth --> scheduler["Exit-IP scheduler"]
     scheduler --> listeners["Mihomo listeners"]
@@ -159,12 +221,28 @@ For HTTPS, EgressKit can try another exit before returning `200 Connection Estab
 - EgressKit does not provide nodes or subscriptions. It currently imports only VLESS nodes from Clash / Mihomo subscriptions.
 - `rotate` selects an exit for each new HTTP request or CONNECT tunnel. When a client reuses a connection, multiple HTTPS requests inside that tunnel keep the same exit.
 - EgressKit cannot switch an established CONNECT tunnel or replay its requests transparently. The client must reconnect after an upstream connection failure.
-- A public proxy port must receive HTTP Proxy / CONNECT traffic directly. A regular CDN or HTTP reverse proxy that only handles web requests cannot replace Layer 4 TCP forwarding.
+- URL relay access works through ordinary CDNs and HTTP reverse proxies with caching and request replay disabled, subject to their body size and streaming timeout limits. Standard HTTP Proxy / CONNECT access still needs direct proxy connectivity or Layer 4 TCP forwarding.
 - SQLite stores subscription URLs, node credentials, and the Proxy Token in plaintext. Operators must protect the state directory and its backups.
 
 ## Configuration and data
 
-`EGRESSKIT_ADMIN_TOKEN` is the only environment variable. Other settings are initialized in SQLite and updated through the console.
+`EGRESSKIT_ADMIN_TOKEN` is required. Optional public entry addresses are read at startup; restart the daemon (or recreate the Docker container) after changing them:
+
+```sh
+export EGRESSKIT_PUBLIC_PROXY_URL=http://proxy.example.com:8787
+export EGRESSKIT_PUBLIC_RELAY_URL=https://egress.example.com
+```
+
+| Environment variable | Purpose |
+| --- | --- |
+| `EGRESSKIT_PUBLIC_PROXY_URL` | Forward proxy display and `curl --proxy` examples |
+| `EGRESSKIT_PUBLIC_RELAY_URL` | URL relay display and `/relay/...` examples |
+
+Use an HTTP(S) origin with a hostname and optional port; omit `/relay/`, target paths, credentials,
+query parameters and fragments. These addresses are not stored in SQLite and do not change listener
+binding or deployment forwarding rules. Unset or blank values are generated automatically.
+See [deployment configuration](docs/deployment.md#配置对外入口地址) for Docker options and defaults.
+Other runtime settings are initialized in SQLite and updated through the console.
 
 | Setting | Default |
 | --- | ---: |

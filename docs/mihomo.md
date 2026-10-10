@@ -34,3 +34,12 @@ checksum, and executable failures as distinct error codes.
 To use an already installed executable, set its absolute path on the management console Settings
 page and restart the daemon. EgressKit checks that an explicitly configured path is executable
 before starting.
+
+## One serving process
+
+One long-running Mihomo process owns every loopback listener. Each transport generation has an
+immutable listener port and internal proxy name. Updates use `PUT /configs?force=false` over a private
+Unix socket, retain unchanged listeners and draining generations, and remove a generation only after
+its active connections finish. Runtime changes and crash recovery are serialized; a crash restarts
+the whole set. Official `mihomo -t` validation still runs in a short-lived subprocess. See
+[ADR-0003](adr/0003-single-mihomo-and-http-relay.md).

@@ -30,6 +30,7 @@ export default defineConfig({
       "/nodes": "http://127.0.0.1:8787",
       "/operations": "http://127.0.0.1:8787",
       "/playground": "http://127.0.0.1:8787",
+      "/relay": "http://127.0.0.1:8787",
       "/ready": "http://127.0.0.1:8787",
       "/revisions": "http://127.0.0.1:8787",
       "/settings": "http://127.0.0.1:8787",

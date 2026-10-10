@@ -1,6 +1,7 @@
 import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import {
   createServer,
+  Agent as HttpAgent,
   type IncomingHttpHeaders,
   type IncomingMessage,
   request,
@@ -8,7 +9,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { Agent as HttpsAgent, request as requestHttps } from "node:https";
-import { connect, type Socket } from "node:net";
+import { connect, isIP, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { Duplex } from "node:stream";
 import { connect as connectTls } from "node:tls";
@@ -31,6 +32,7 @@ import {
   rejectConnectProxyAuthentication,
   rejectHttpProxyAuthentication,
 } from "./proxy-auth.js";
+import { parseRelayTarget, relayHeaders, relayLocation } from "./relay.js";
 import {
   type RemoteOperationClock,
   RemoteOperationRunner,
@@ -111,6 +113,8 @@ export interface EgressdOptions {
   preconnectAttempts?: number;
   preconnectTimeoutMs?: number;
   proxyAuthentication?: ProxyAuthentication;
+  publicProxyUrl?: string;
+  publicRelayUrl?: string;
   remoteSubscriptionTimeoutMs?: number;
   remoteOperationClock?: RemoteOperationClock;
   remoteSubscriptionRefreshIntervalMs?: number;
@@ -985,6 +989,8 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         writeJson(response, 200, {
           exitIps,
           gateway: {
+            publicProxyUrl: options.publicProxyUrl ?? "",
+            publicRelayUrl: options.publicRelayUrl ?? "",
             host: options.host,
             port: publicPort,
             ready:
@@ -1156,7 +1162,9 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
           return;
         }
         readBody(incoming)
-          .then((body) => parseRuntimeSettings(JSON.parse(body)))
+          .then((body) => {
+            return parseRuntimeSettings(JSON.parse(body));
+          })
           .then((settings) => {
             const previous = state.loadRuntimeSettings(options.adminToken as string);
             state.updateRuntimeSettings(settings);
@@ -1590,6 +1598,41 @@ export async function startEgressd(options: EgressdOptions): Promise<RunningEgre
         return;
       }
 
+      if (incoming.url === "/relay" || incoming.url?.startsWith("/relay/")) {
+        response.setHeader("cache-control", "private, no-store");
+        let parsed: ReturnType<typeof parseRelayTarget>;
+        try {
+          parsed = parseRelayTarget(incoming.url);
+        } catch {
+          writeJson(response, 400, { error: "invalid relay URL" });
+          return;
+        }
+        const token = incoming.headers["x-egresskit-token"];
+        const route = authorizeProxyRequest(
+          typeof token === "string"
+            ? `Basic ${Buffer.from(`${parsed.username}:${token}`).toString("base64")}`
+            : undefined,
+          activeProxyAuthentication,
+        );
+        if (!route) {
+          writeJson(response, 401, { error: "relay authentication failed" });
+          return;
+        }
+        if (incoming.method === "CONNECT" || incoming.headers.upgrade) {
+          writeJson(response, 400, { error: "relay supports HTTP requests only" });
+          return;
+        }
+        void forwardRelayRequest(
+          incoming,
+          response,
+          parsed,
+          route,
+          acquirePreconnectedRoute,
+          options.preconnectTimeoutMs ?? 10_000,
+        );
+        return;
+      }
+
       if (options.webDirectory && incoming.url?.startsWith("/")) {
         void serveStaticWeb(incoming, response, options.webDirectory).then((served) => {
           if (!served) writeJson(response, 404, { error: "management route not found" });
@@ -1901,24 +1944,34 @@ function parseRemoteSubscriptionRequest(body: string): { name: string; url: stri
 }
 
 interface PlaygroundRequest {
+  access: "proxy" | "relay";
   mode: "node" | "rotate" | "sticky" | "strict";
   node?: string;
   target: string;
 }
 
 function parsePlaygroundRequest(body: string): PlaygroundRequest {
-  const document = JSON.parse(body) as { mode?: unknown; node?: unknown; target?: unknown };
+  const document = JSON.parse(body) as {
+    access?: unknown;
+    mode?: unknown;
+    node?: unknown;
+    target?: unknown;
+  };
+  const access = document.access ?? "proxy";
+  if (access !== "proxy" && access !== "relay") throw new Error("接入方式无效");
   if (!["node", "rotate", "sticky", "strict"].includes(String(document.mode))) {
-    throw new Error("代理模式无效");
+    throw new Error("选路模式无效");
   }
   if (typeof document.target !== "string") throw new Error("目标 URL 不能为空");
   const target = new URL(document.target);
   if (!["http:", "https:"].includes(target.protocol))
     throw new Error("目标 URL 必须使用 HTTP 或 HTTPS");
+  if (target.username || target.password) throw new Error("目标 URL 不能包含认证信息");
   if (document.mode === "node" && (typeof document.node !== "string" || !document.node)) {
     throw new Error("指定节点不能为空");
   }
   return {
+    access,
     mode: document.mode as PlaygroundRequest["mode"],
     ...(typeof document.node === "string" ? { node: document.node } : {}),
     target: target.href,
@@ -1944,6 +1997,25 @@ function executePlaygroundRequest(
         : `${input.mode}.playground`;
   const startedAt = Date.now();
   const target = new URL(input.target);
+  if (input.access === "relay") {
+    return new Promise((resolve, reject) => {
+      const relayRequest = request(
+        {
+          host: input.host,
+          port: input.port,
+          method: "GET",
+          path: `/relay/${encodeURIComponent(username)}/${target.protocol.slice(0, -1)}/${target.host}${target.pathname}${target.search}`,
+          headers: input.proxyAuthenticationDisabled
+            ? {}
+            : { "x-egresskit-token": input.proxyToken as string },
+        },
+        (response) => collectPlaygroundResponse(response, startedAt).then(resolve, reject),
+      );
+      relayRequest.setTimeout(15_000, () => relayRequest.destroy(new Error("请求超时")));
+      relayRequest.on("error", reject);
+      relayRequest.end();
+    });
+  }
   const authorizationHeaders = input.proxyAuthenticationDisabled
     ? undefined
     : {
@@ -2281,6 +2353,152 @@ async function forwardHttpProxyRequest(
   });
   response.once("close", lease.release);
   incoming.pipe(upstream);
+}
+
+async function forwardRelayRequest(
+  incoming: IncomingMessage,
+  response: ServerResponse,
+  { target, username }: ReturnType<typeof parseRelayTarget>,
+  route: ProxyRoute,
+  acquirePreconnectedRoute: PreconnectedRouteAcquirer,
+  timeoutMs: number,
+): Promise<void> {
+  const controller = new AbortController();
+  let clientCancelled = false;
+  let upstream: ReturnType<typeof request> | undefined;
+  let connected: PreconnectedRoute | undefined;
+  let targetSocket: Socket | undefined;
+  const cancel = () => {
+    clientCancelled = !response.writableFinished;
+    controller.abort(new ClientCancelledError());
+    upstream?.destroy();
+    targetSocket?.destroy();
+    connected?.socket.destroy();
+    connected?.lease.release();
+  };
+  incoming.once("aborted", cancel);
+  response.once("close", cancel);
+  const authority = `${target.hostname}:${target.port || (target.protocol === "https:" ? 443 : 80)}`;
+  try {
+    const result = await acquirePreconnectedRoute(
+      route,
+      target.href,
+      controller.signal,
+      async (socket) => {
+        const handshake = await performConnectHandshake(
+          socket,
+          authority,
+          timeoutMs,
+          controller.signal,
+        );
+        socket.pause();
+        if (handshake.remaining.length) socket.unshift(handshake.remaining);
+        if (target.protocol === "https:") {
+          const hostname = target.hostname.replace(/^\[|\]$/g, "");
+          const tls = connectTls({
+            socket,
+            host: hostname,
+            ...(isIP(hostname) ? {} : { servername: hostname }),
+          });
+          targetSocket = tls;
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => tls.destroy(new ClientCancelledError());
+            const cleanup = () => {
+              clearTimeout(timer);
+              controller.signal.removeEventListener("abort", abort);
+              tls.off("error", fail);
+              tls.off("close", closed);
+            };
+            const fail = (error: Error) => {
+              cleanup();
+              reject(error);
+            };
+            const closed = () => fail(new Error("target closed during TLS handshake"));
+            const timer = setTimeout(
+              () => tls.destroy(new Error("target TLS handshake timed out")),
+              timeoutMs,
+            );
+            tls.once("error", fail);
+            tls.once("close", closed);
+            tls.once("secureConnect", () => {
+              cleanup();
+              resolve();
+            });
+            controller.signal.addEventListener("abort", abort, { once: true });
+            if (controller.signal.aborted) abort();
+          });
+        } else {
+          targetSocket = socket;
+        }
+      },
+    );
+    if (!result || result === "not-implemented") {
+      response.writeHead(result === "not-implemented" ? 501 : 502);
+      response.end();
+      return;
+    }
+    connected = result;
+    if (controller.signal.aborted) {
+      cancel();
+      return;
+    }
+    const socket = targetSocket as Socket;
+    // A fresh transport per request prevents pooled sockets from bypassing rotation or leases.
+    const agent =
+      target.protocol === "https:"
+        ? new HttpsAgent({ keepAlive: false })
+        : new HttpAgent({ keepAlive: false });
+    agent.createConnection = () => socket;
+    const send = target.protocol === "https:" ? requestHttps : request;
+    upstream = send(
+      target,
+      {
+        agent,
+        method: incoming.method,
+        headers: {
+          ...relayHeaders(incoming.headers),
+          host: target.host,
+          via: appendVia(incoming.headers.via, "1.1 egresskit"),
+        },
+      },
+      (targetResponse) => {
+        result.lease.reportConnectionSuccess(result.latencyMs);
+        const headers = relayHeaders(targetResponse.headers);
+        headers["cache-control"] = "private, no-store";
+        if (targetResponse.headers.location) {
+          const location = relayLocation(targetResponse.headers.location, target, username);
+          if (location) headers.location = location;
+          else delete headers.location;
+        }
+        targetResponse.once("error", () => response.destroy());
+        targetResponse.once("end", result.lease.release);
+        targetResponse.once("close", result.lease.release);
+        response.writeHead(targetResponse.statusCode ?? 502, headers);
+        targetResponse.pipe(response);
+      },
+    );
+    upstream.setTimeout(120_000, () => upstream?.destroy(new Error("relay upstream idle timeout")));
+    upstream.once("error", () => {
+      if (!clientCancelled) result.lease.reportConnectionFailure();
+      result.lease.release();
+      socket.destroy();
+      if (response.headersSent) response.destroy();
+      else {
+        response.writeHead(502);
+        response.end();
+      }
+    });
+    response.once("close", () => agent.destroy());
+    socket.resume();
+    incoming.pipe(upstream);
+  } catch (error) {
+    targetSocket?.destroy();
+    connected?.socket.destroy();
+    connected?.lease.release();
+    if (controller.signal.aborted || error instanceof ClientCancelledError) return;
+    response.writeHead(error instanceof SessionCapacityError ? 429 : 503);
+    response.end();
+  }
 }
 
 async function forwardConnectRequest(

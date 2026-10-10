@@ -1,14 +1,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { stringify } from "yaml";
 
 import type { ImportedVlessRevision } from "./subscription.js";
 
 type MihomoConfig = ImportedVlessRevision["mihomoConfig"];
+type RuntimeListener = { config: MihomoConfig; fingerprint: string };
 
 export interface MihomoStaticCheckOptions {
   binary?: string;
@@ -20,22 +23,19 @@ export interface ManagedMihomoRuntimeOptions {
   directory: string;
 }
 
-interface ManagedProcess {
-  child: ChildProcess | undefined;
-  configPath: string;
-  fingerprint: string;
-  listener: URL;
-}
-
+/** One serving process; immutable per-generation listeners avoid shared-select races. */
 export class ManagedMihomoRuntime {
   readonly #binary: string;
   readonly #directory: string;
   readonly #exitListeners = new Set<() => void>();
   readonly #expectedExits = new WeakSet<ChildProcess>();
-  readonly #failedProcesses = new Set<ManagedProcess>();
-  readonly #processes = new Map<string, ManagedProcess>();
+  readonly #secret = randomBytes(32).toString("hex");
+  #listeners = new Map<string, RuntimeListener>();
+  #child: ChildProcess | undefined;
+  #controllerDirectory: string | undefined;
   #closed = false;
-  #lastApplied = new Set<ManagedProcess>();
+  #failed = false;
+  #queue: Promise<unknown> = Promise.resolve();
 
   constructor(options: ManagedMihomoRuntimeOptions) {
     this.#binary = options.binary ?? "mihomo";
@@ -46,168 +46,213 @@ export class ManagedMihomoRuntime {
     return checkMihomoConfig(config, { binary: this.#binary });
   }
 
-  async apply(
+  apply(
     config: MihomoConfig,
     context: { preserveListeners: readonly URL[] },
   ): Promise<ReadonlyMap<string, URL>> {
-    if (this.#closed) {
-      throw new Error("managed Mihomo runtime is closed");
-    }
-    await mkdir(this.#directory, { mode: 0o700, recursive: true });
-    const started: ManagedProcess[] = [];
-    const next = new Set<ManagedProcess>();
-    const listeners = new Map<string, URL>();
-    try {
-      for (const listenerConfig of config.listeners) {
-        const proxy = config.proxies.find(({ name }) => name === listenerConfig.proxy);
-        if (!proxy) {
-          throw new Error(`Mihomo listener has no proxy: ${listenerConfig.proxy}`);
-        }
-        const listener = new URL(`http://${listenerConfig.listen}:${listenerConfig.port}`);
-        const processConfig: MihomoConfig = { listeners: [listenerConfig], proxies: [proxy] };
-        const fingerprint = configFingerprint(processConfig);
-        const existing = this.#processes.get(listener.href);
-        if (existing && existing.fingerprint !== fingerprint) {
-          throw new Error(`Mihomo listener configuration changed without a new port: ${listener}`);
-        }
-        if (existing && (!existing.child || existing.child.exitCode !== null)) {
-          await this.#start(existing, new AbortController().signal);
-          this.#failedProcesses.delete(existing);
-        }
-        const managed =
-          existing ?? (await this.#createProcess(processConfig, fingerprint, listener));
-        if (!existing) {
-          started.push(managed);
-        }
-        next.add(managed);
-        listeners.set(listenerConfig.proxy, listener);
+    return this.#serialize(async () => {
+      this.#assertOpen();
+      const next = new Map<string, RuntimeListener>();
+      for (const listener of context.preserveListeners) {
+        const existing = this.#listeners.get(listener.href);
+        if (existing) next.set(listener.href, existing);
       }
-    } catch (error) {
-      await Promise.allSettled(started.map((managed) => this.#removeProcess(managed)));
-      throw error;
-    }
-    const preserved = new Set(context.preserveListeners.map(({ href }) => href));
-    const uncommitted = [...this.#lastApplied].filter(
-      (managed) => !next.has(managed) && !preserved.has(managed.listener.href),
-    );
-    await Promise.allSettled(uncommitted.map((managed) => this.#removeProcess(managed)));
-    this.#lastApplied = next;
-    return listeners;
+      const result = new Map<string, URL>();
+      for (const listener of config.listeners) {
+        const proxy = config.proxies.find(({ name }) => name === listener.proxy);
+        if (!proxy) throw new Error("Mihomo listener has no proxy");
+        const url = new URL(`http://${listener.listen}:${listener.port}`);
+        const original = { listeners: [listener], proxies: [proxy] };
+        const fingerprint = configFingerprint(original);
+        const existing = this.#listeners.get(url.href);
+        if (existing && existing.fingerprint !== fingerprint) {
+          throw new Error("Mihomo listener configuration changed without a new port");
+        }
+        // Old and new generations may have the same logical name. Name by immutable port.
+        const name = `egresskit-${listener.port}`;
+        next.set(url.href, {
+          config: {
+            listeners: [{ ...listener, name, proxy: name }],
+            proxies: [{ ...proxy, name }],
+          },
+          fingerprint,
+        });
+        result.set(listener.proxy, url);
+      }
+      await this.#install(next);
+      return result;
+    });
   }
 
   onUnexpectedExit(listener: () => void): () => void {
     this.#exitListeners.add(listener);
     queueMicrotask(() => {
-      if (!this.#closed && this.#failedProcesses.size > 0 && this.#exitListeners.has(listener)) {
-        listener();
-      }
+      if (!this.#closed && this.#failed && this.#exitListeners.has(listener)) listener();
     });
     return () => this.#exitListeners.delete(listener);
   }
 
-  async removeListener(listener: URL): Promise<void> {
-    const managed = this.#processes.get(listener.href);
-    if (!managed) {
-      return;
-    }
-    await this.#removeProcess(managed);
-    this.#lastApplied.delete(managed);
+  removeListener(listener: URL): Promise<void> {
+    return this.#serialize(async () => {
+      this.#assertOpen();
+      if (!this.#listeners.has(listener.href)) return;
+      const next = new Map(this.#listeners);
+      next.delete(listener.href);
+      await this.#install(next);
+    });
   }
 
-  async restart(signal: AbortSignal): Promise<void> {
-    const failed = [...this.#failedProcesses];
-    if (failed.length === 0) {
-      return;
-    }
-    for (const managed of failed) {
-      await this.#start(managed, signal);
-      this.#failedProcesses.delete(managed);
-    }
+  restart(signal: AbortSignal): Promise<void> {
+    return this.#serialize(async () => {
+      this.#assertOpen();
+      if (!this.#failed) return;
+      await this.#start(signal);
+    });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#processes.values()].map((managed) => this.#stop(managed)));
-    this.#processes.clear();
-    this.#failedProcesses.clear();
-    this.#lastApplied.clear();
+    return this.#serialize(async () => {
+      await this.#stop();
+      this.#listeners.clear();
+      if (this.#controllerDirectory)
+        await rm(this.#controllerDirectory, { recursive: true, force: true });
+    });
   }
 
-  async #createProcess(
-    config: MihomoConfig,
-    fingerprint: string,
-    listener: URL,
-  ): Promise<ManagedProcess> {
-    const configPath = join(this.#directory, `${fingerprint}.yaml`);
-    await writeFile(configPath, stringify(config), { encoding: "utf8", mode: 0o600 });
-    const managed: ManagedProcess = {
-      child: undefined,
-      configPath,
-      fingerprint,
-      listener,
-    };
-    this.#processes.set(listener.href, managed);
+  #serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(operation);
+    this.#queue = run.catch(() => undefined);
+    return run;
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("managed Mihomo runtime is closed");
+  }
+
+  #payload(listeners: ReadonlyMap<string, RuntimeListener>): string {
+    return stringify({
+      listeners: [...listeners.values()].flatMap(({ config }) => config.listeners),
+      proxies: [...listeners.values()].flatMap(({ config }) => config.proxies),
+      "external-controller-unix": join(this.#controllerDirectory as string, "controller.sock"),
+      secret: this.#secret,
+      "log-level": "silent",
+    });
+  }
+
+  async #writeConfig(payload: string): Promise<void> {
+    const temporary = join(this.#directory, "runtime.next.yaml");
+    await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, join(this.#directory, "runtime.yaml"));
+  }
+
+  async #install(next: Map<string, RuntimeListener>): Promise<void> {
+    await mkdir(this.#directory, { recursive: true, mode: 0o700 });
+    // Keep the Unix socket path short even when the configured state path is long.
+    this.#controllerDirectory ??= await mkdtemp(join(tmpdir(), "egresskit-ctl-"));
+    const payload = this.#payload(next);
+    const previous = this.#payload(this.#listeners);
+    if (!this.#child) {
+      await this.#writeConfig(payload);
+      try {
+        await this.#start(new AbortController().signal);
+      } catch (error) {
+        await this.#writeConfig(previous);
+        throw error;
+      }
+    } else if (payload !== previous) {
+      try {
+        await this.#control("PUT", "/configs?force=false", JSON.stringify({ payload }));
+        await this.#writeConfig(payload);
+      } catch (error) {
+        // Reload may partially succeed (e.g. a listener cannot bind). Restore the old set.
+        try {
+          await this.#control("PUT", "/configs?force=false", JSON.stringify({ payload: previous }));
+          await this.#writeConfig(previous);
+        } catch {
+          await this.#stop();
+          this.#failed = true;
+          for (const listener of this.#exitListeners) listener();
+        }
+        throw error;
+      }
+    }
+    this.#listeners = next;
+  }
+
+  #control(method: string, path: string, body?: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const operation = request(
+        {
+          socketPath: join(this.#controllerDirectory as string, "controller.sock"),
+          method,
+          path,
+          headers: { authorization: `Bearer ${this.#secret}`, "content-type": "application/json" },
+        },
+        (response) => {
+          response.resume();
+          response.once("error", reject);
+          response.once("end", () => {
+            if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300)
+              resolve();
+            else reject(new Error("Mihomo controller rejected runtime configuration"));
+          });
+        },
+      );
+      operation.setTimeout(5_000, () =>
+        operation.destroy(new Error("Mihomo controller timed out")),
+      );
+      operation.once("error", reject);
+      operation.end(body);
+    });
+  }
+
+  async #start(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const socketPath = join(this.#controllerDirectory as string, "controller.sock");
+    await rm(socketPath, { force: true });
+    const child = spawn(
+      this.#binary,
+      ["-d", this.#directory, "-f", join(this.#directory, "runtime.yaml")],
+      { stdio: "ignore" },
+    );
+    this.#child = child;
+    child.on("error", () => undefined);
+    child.once("exit", () => {
+      if (this.#child === child) this.#child = undefined;
+      if (!this.#expectedExits.has(child) && !this.#closed) {
+        this.#failed = true;
+        for (const listener of this.#exitListeners) listener();
+      }
+    });
     try {
-      await this.#start(managed, new AbortController().signal);
-      return managed;
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("spawn", resolve);
+      });
+      const deadline = Date.now() + 5_000;
+      while (true) {
+        signal.throwIfAborted();
+        if (this.#child !== child) throw new Error("Mihomo exited before controller readiness");
+        try {
+          await this.#control("GET", "/version");
+          break;
+        } catch {
+          if (Date.now() >= deadline) throw new Error("Mihomo controller readiness timed out");
+          await delay(25, undefined, { signal });
+        }
+      }
+      await chmod(socketPath, 0o600);
+      this.#failed = false;
     } catch (error) {
-      this.#processes.delete(listener.href);
+      await this.#stop();
       throw error;
     }
   }
 
-  async #removeProcess(managed: ManagedProcess): Promise<void> {
-    await this.#stop(managed);
-    this.#failedProcesses.delete(managed);
-    if (this.#processes.get(managed.listener.href) === managed) {
-      this.#processes.delete(managed.listener.href);
-    }
-  }
-
-  async #start(managed: ManagedProcess, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) {
-      throw signal.reason;
-    }
-    const child = spawn(this.#binary, ["-d", this.#directory, "-f", managed.configPath], {
-      stdio: "ignore",
-    });
-    managed.child = child;
-    child.once("exit", () => {
-      if (managed.child === child) {
-        managed.child = undefined;
-      }
-      if (!this.#expectedExits.has(child) && !this.#closed) {
-        this.#failedProcesses.add(managed);
-        for (const listener of this.#exitListeners) {
-          listener();
-        }
-      }
-    });
-    await new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        this.#expectedExits.add(child);
-        child.kill("SIGTERM");
-        reject(signal.reason);
-      };
-      const onError = (error: Error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      };
-      child.once("error", onError);
-      child.once("spawn", () => {
-        child.off("error", onError);
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      });
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-
-  async #stop(managed: ManagedProcess): Promise<void> {
-    const child = managed.child;
-    if (!child || child.exitCode !== null) {
-      return;
-    }
+  async #stop(): Promise<void> {
+    const child = this.#child;
+    if (!child) return;
     this.#expectedExits.add(child);
     await new Promise<void>((resolve) => {
       const force = setTimeout(() => child.kill("SIGKILL"), 1_000);
@@ -220,6 +265,7 @@ export class ManagedMihomoRuntime {
         resolve();
       }
     });
+    if (this.#child === child) this.#child = undefined;
   }
 }
 
